@@ -1,0 +1,11 @@
+numpy<2
+pandas
+matplotlib
+seaborn
+scipy
+stdpopsim
+tstrait
+demesdraw
+snakemake
+tskit
+scikit-learn
