@@ -1,126 +1,110 @@
-import argparse
-import stdpopsim
-import demesdraw
-import tstrait
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-
+"""
+Simulate variation (stdpopsim) ➜ phenotypes (tstrait)
+with biallelic-only SNPs and NaN safety checks.
+"""
+from __future__ import annotations
+import argparse, stdpopsim, demesdraw, tstrait
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, seaborn as sns
 sns.set_style("whitegrid")
 
-def main(args):
-    ##############################################
-    # 1) Simulate variation with stdpopsim
-    ##############################################
-    species = stdpopsim.get_species("HomSap")
-    model = species.get_demographic_model("OutOfAfrica_2T12")
 
-    # Visualize demography
+def main(a: argparse.Namespace) -> None:
+    # ───────── 1) simulate genetic variation ─────────
+    sp     = stdpopsim.get_species("HomSap")
+    model  = sp.get_demographic_model("OutOfAfrica_2T12")
+
     fig, ax = plt.subplots()
     demesdraw.tubes(model.model.to_demes(), ax=ax)
-    fig.savefig(args.demography_fig)
-    plt.close(fig)
+    fig.savefig(a.demography_fig); plt.close(fig)
 
-    # Sample diploids from AFR and EUR
-    samples = {"AFR": args.n_individuals, "EUR": args.n_individuals}
-    contig = species.get_contig(length=args.chrom_length, mutation_rate=model.mutation_rate)
-    engine = stdpopsim.get_engine("msprime")
-    ts = engine.simulate(model, contig, samples)
+    samples = {"AFR": a.n_individuals, "EUR": a.n_individuals}
+    contig  = sp.get_contig(length=a.chrom_length,
+                            mutation_rate=model.mutation_rate)
+    ts      = stdpopsim.get_engine("msprime").simulate(model, contig, samples)
 
-    print("Number of segregating sites:", ts.num_sites)
-    print("Number of diploid individuals:", ts.num_individuals)
+    # keep *only* biallelic sites (works on all tskit versions)
+    bial   = [i for i, s in enumerate(ts.sites()) if len(s.alleles) == 2]
+    non_bi = sorted(set(range(ts.num_sites)) - set(bial))
+    if non_bi:                      # safe-guard: only delete if needed
+        ts = ts.delete_sites(non_bi)
 
-    # Save the tree sequence for downstream use
-    ts.dump(args.output_ts)
+    ts.dump(a.output_ts)
+    print(f"Segregating sites   : {ts.num_sites:,}")
+    print(f"Diploid individuals: {ts.num_individuals:,}")
 
-    ##############################################
-    # 2) Simulate phenotypes with tstrait
-    ##############################################
-    trait_model = tstrait.trait_model(distribution="normal", mean=0, var=5)
-    sim_result = tstrait.sim_phenotype(
-        ts=ts,
-        num_causal=args.num_causal,
-        model=trait_model,
-        h2=args.h2,
+    # ───────── 2) simulate quantitative trait ─────────
+    trait_mod = tstrait.trait_model(distribution="normal", mean=0, var=5)
+    sim = tstrait.sim_phenotype(
+        ts=ts,                    # ← still positional is fine, but explicit works too
+        num_causal=a.num_causal,
+        model=trait_mod,
+        h2=a.h2,
         random_seed=295
     )
-    trait_df = sim_result.trait
-    trait_df.to_csv(args.output_trait_df, index=False)
-    phenotype_df = sim_result.phenotype
 
-    ##############################################
-    # 3) Map individuals to populations
-    ##############################################
-    pop_mapping = []
-    for ind in ts.individuals():
-        pop_id = ts.population(ind.population).metadata["id"]
-        pop_mapping.append({"individual_id": ind.id, "population": pop_id})
+    trait_df  = sim.trait
+    pheno_df  = sim.phenotype
 
-    pop_df = pd.DataFrame(pop_mapping)
-    merged = phenotype_df.merge(pop_df, on="individual_id")
+    # --- NaN check #1 ---------------------------------------------------------
+    n0 = pheno_df.phenotype.isna().sum()
+    print(f"NaNs from tstrait        : {n0}")
+    if n0:
+        fill = pheno_df.phenotype.mean()
+        pheno_df.phenotype.fillna(fill, inplace=True)
+        print(f"  filled with mean = {fill:.4f}")
 
-    # Add phenotype shift to EUR
-    eur_mask = (merged["population"] == "EUR")
-    merged.loc[eur_mask, "phenotype"] += 2.0
+    trait_df.to_csv(a.output_trait_df, index=False)
 
-    # Sort for alignment
-    merged_sorted = merged.sort_values(by="individual_id")
-    merged_sorted.to_csv(args.output_csv, index=False)
+    # ───────── 3) attach population labels ─────────
+    pop_df = pd.DataFrame({
+        "individual_id": [ind.id for ind in ts.individuals()],
+        "population"   : [ts.population(ind.population).metadata["id"]
+                          for ind in ts.individuals()]
+    })
+    merged = pop_df.merge(pheno_df, on="individual_id", how="left")
 
-    ##############################################
-    # 4) Save overall effect size histogram
-    ##############################################
-    plt.figure()
-    plt.hist(trait_df["effect_size"], bins=30)
-    plt.title("Distribution of Effect Sizes")
-    plt.xlabel("Effect Size")
-    plt.ylabel("Count")
-    plt.tight_layout()
-    plt.savefig(args.effect_size_fig)
-    plt.close()
+    # --- NaN check #2 ---------------------------------------------------------
+    n1 = merged.phenotype.isna().sum()
+    print(f"NaNs after merge        : {n1}")
 
-    ##############################################
-    # 5) Save population-colored phenotype histogram
-    ##############################################
-    plt.figure(figsize=(8, 6))
-    sns.histplot(
-        data=merged,
-        x="phenotype",
-        hue="population",
-        element="step",
-        stat="count",
-        bins=30,
-        common_norm=False
-    )
-    plt.title("Phenotype Distribution by Population")
-    plt.xlabel("Phenotype")
-    plt.ylabel("Count")
-    plt.tight_layout()
-    plt.savefig(args.phenotype_by_pop_fig)
-    plt.close()
+    # environmental shift
+    merged.loc[merged.population == "EUR", "phenotype"] += 2.0
 
-    print(f"Saved outputs to:\n"
-          f"  - {args.output_ts}\n"
-          f"  - {args.demography_fig}\n"
-          f"  - {args.effect_size_fig}\n"
-          f"  - {args.phenotype_by_pop_fig}\n"
-          f"  - {args.output_csv}")
+    merged.sort_values("individual_id").to_csv(
+        a.output_csv, index=False, float_format="%.8g")
+
+    # --- NaN check #3 ---------------------------------------------------------
+    n2 = pd.read_csv(a.output_csv).phenotype.isna().sum()
+    print(f"NaNs after CSV reload   : {n2}")
+    assert n2 == 0, "Phenotype NaNs survived!"
+
+    # ───────── 4) quick QC plots ─────────
+    plt.figure(); plt.hist(trait_df.effect_size, 30, color="#1f77b4")
+    plt.title("Distribution of causal effect sizes")
+    plt.tight_layout(); plt.savefig(a.effect_size_fig); plt.close()
+
+    plt.figure(figsize=(8,6))
+    sns.histplot(merged, x="phenotype", hue="population",
+                 bins=30, element="step", stat="count", common_norm=False)
+    plt.title("Phenotype distribution by population")
+    plt.tight_layout(); plt.savefig(a.phenotype_by_pop_fig); plt.close()
+
+    print("\nOutputs:")
+    for f in [a.output_ts, a.demography_fig, a.effect_size_fig,
+              a.phenotype_by_pop_fig, a.output_csv, a.output_trait_df]:
+        print(" •", f)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simulate phenotypes and demography with stdpopsim + tstrait")
-    parser.add_argument("--n_individuals", type=int, required=True)
-    parser.add_argument("--num_causal", type=int, required=True)
-    parser.add_argument("--h2", type=float, required=True)
-    parser.add_argument("--chrom_length", type=float, required=True)
-    parser.add_argument("--output_ts", type=str, required=True)
-    parser.add_argument("--demography_fig", type=str, required=True)
-    parser.add_argument("--effect_size_fig", type=str, required=True)
-    parser.add_argument("--phenotype_by_pop_fig", type=str, required=True)
-    parser.add_argument("--output_csv", type=str, required=True)
-    parser.add_argument("--output_trait_df", type=str, required=True)
-
-    args = parser.parse_args()
-    main(args)
+    p = argparse.ArgumentParser()
+    p.add_argument("--n_individuals", type=int, required=True)
+    p.add_argument("--num_causal",   type=int, required=True)
+    p.add_argument("--h2",           type=float, required=True)
+    p.add_argument("--chrom_length", type=float, required=True)
+    p.add_argument("--output_ts",           required=True)
+    p.add_argument("--demography_fig",      required=True)
+    p.add_argument("--effect_size_fig",     required=True)
+    p.add_argument("--phenotype_by_pop_fig",required=True)
+    p.add_argument("--output_csv",          required=True)
+    p.add_argument("--output_trait_df",     required=True)
+    main(p.parse_args())

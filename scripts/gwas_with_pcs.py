@@ -12,7 +12,9 @@ from sklearn.decomposition import PCA
 GWAS + top-k PCs (clean, minimal).
 • PCA is run on a *copy* of the genotype matrix, dropping monomorphic columns **only for the PCA step**.
 • Ridge-stabilised OLS per SNP.
-• Outputs: CSV, Manhattan, AF-diff, QQ, Scree — identical styling to the naïve GWAS, **including the “Spurious Hits” percentage in the title**.
+• Optionally restricts GWAS to a specific population (e.g., EUR).
+• Outputs: CSV, Manhattan, AF-diff, QQ, Scree.
+• Also computes PRS scores for EUR and AFR and saves scatterplots.
 """
 
 # ------------------------------------------------------------------
@@ -20,7 +22,6 @@ GWAS + top-k PCs (clean, minimal).
 # ------------------------------------------------------------------
 
 def safe_ols(X: np.ndarray, y: np.ndarray, ridge: float = 1e-6):
-    """Return (beta, t‑stat, p‑value) for the first column of X using a tiny ridge."""
     XtX = X.T @ X + ridge * np.eye(X.shape[1])
     beta = np.linalg.solve(XtX, X.T @ y)
     resid = y - X @ beta
@@ -39,11 +40,22 @@ def main(a):
     G = np.load(a.genotype_matrix)
     meta = pd.read_csv(a.sorted_phenotype)
     trait = pd.read_csv(a.trait_info)
-    y = meta["phenotype"].to_numpy()
+    y_all = meta["phenotype"].to_numpy()
     n, m = G.shape
 
-    keep = G.std(0) > 0
-    Xpca = (G[:, keep] - G[:, keep].mean(0)) / G[:, keep].std(0)
+    if a.discovery_pop:
+        keep = meta["population"] == a.discovery_pop
+        G_discovery = G[keep]
+        y = y_all[keep]
+        print(f"Running GWAS on discovery population: {a.discovery_pop} ({keep.sum()} individuals)")
+    else:
+        G_discovery = G
+        y = y_all
+        print("Running GWAS across all individuals")
+
+    # PCA on COPY
+    keep_cols = G_discovery.std(0) > 0
+    Xpca = (G_discovery[:, keep_cols] - G_discovery[:, keep_cols].mean(0)) / G_discovery[:, keep_cols].std(0)
     PCs = PCA(a.num_pcs).fit_transform(Xpca)
 
     # scree plot
@@ -51,15 +63,15 @@ def main(a):
     cum = np.cumsum(PCA().fit(Xpca).explained_variance_ratio_) * 100
     plt.plot(range(1, len(cum)+1), cum, marker="o")
     plt.xlabel("# PCs"); plt.ylabel("Cumulative variance (%)")
-    plt.title("Scree plot")
-    plt.tight_layout(); plt.savefig(a.scree_plot); plt.close()
+    plt.title("Scree plot"); plt.tight_layout()
+    plt.savefig(a.scree_plot); plt.close()
 
     Z = (PCs - PCs.mean(0)) / PCs.std(0)
-    design_const = np.hstack([Z, np.ones((n,1))])
+    design_const = np.hstack([Z, np.ones((len(y),1))])
 
     betas = np.empty(m); tvals = np.empty(m); pvals = np.empty(m)
     for j in range(m):
-        g = G[:, j].astype(float)
+        g = G_discovery[:, j].astype(float)
         sd = g.std()
         if sd == 0:
             betas[j] = np.nan; tvals[j] = np.nan; pvals[j] = 1.0; continue
@@ -104,6 +116,7 @@ def main(a):
     pop = meta["population"].to_numpy(); afr = pop=="AFR"; eur = pop=="EUR"
     AF = np.abs(G[afr].sum(0)/(2*afr.sum()) - G[eur].sum(0)/(2*eur.sum()))
     norm = Normalize(vmin=0, vmax=0.5)
+    spearman_r, spearman_p = stats.spearmanr(AF, -np.log10(pvals))
     plt.figure(figsize=(10,5))
     plt.scatter(range(m), -np.log10(pvals), c=AF, cmap="coolwarm", norm=norm,
                 s=4, lw=0, alpha=0.75)
@@ -111,7 +124,7 @@ def main(a):
                 norm=norm, s=18, edgecolors="black", lw=0.3)
     plt.axhline(-np.log10(bonf), ls="--", c="gray")
     plt.colorbar(label="|AF diff| AFR‑EUR")
-    plt.title("GWAS with PCs: AF‑diff colouring")
+    plt.title(f"GWAS with PCs: Allele Frequencies \nSpearman r = {spearman_r:.3f}")
     plt.xlabel("SNP index"); plt.ylabel("-log₁₀(p)")
     plt.tight_layout(); plt.savefig(a.af_diff_plot); plt.close()
 
@@ -126,8 +139,8 @@ def main(a):
     plt.ylabel("Observed -log₁₀(p)")
     plt.tight_layout(); plt.savefig(a.qq_plot); plt.close()
 
-    # Save results
-    pd.DataFrame({
+    # Save GWAS results
+    gwas_df = pd.DataFrame({
         "snp_index": np.arange(m),
         "beta": betas,
         "t_stat": tvals,
@@ -135,7 +148,27 @@ def main(a):
         "is_causal": causal,
         "is_significant": sig,
         "AF_diff": AF
-    }).to_csv(a.output_csv, index=False)
+    })
+    gwas_df.to_csv(a.output_csv, index=False)
+
+    # Compute PRS using valid SNPs only
+    valid = np.isfinite(betas)
+    betas_clean = betas.copy()
+    betas_clean[~valid] = 0
+
+    prs = G @ betas_clean
+    meta["PRS"] = prs
+
+    for group in ["AFR", "EUR"]:
+        sub = meta[meta.population == group]
+        r = np.corrcoef(sub["PRS"], sub["phenotype"])[0, 1]
+        plt.figure()
+        plt.scatter(sub["PRS"], sub["phenotype"], alpha=0.5)
+        plt.xlabel("PRS"); plt.ylabel("Phenotype")
+        plt.title(f"PRS vs. Phenotype in {group} (r = {r:.3f})")
+        plt.tight_layout()
+        plt.savefig(f"results/gwas_pcs/prs_scatter_{group}.png")
+        sub[["individual_id", "PRS", "phenotype"]].to_csv(f"results/gwas_pcs/prs_values_{group}.csv", index=False)
 
 # CLI
 if __name__ == "__main__":
@@ -149,4 +182,5 @@ if __name__ == "__main__":
     p.add_argument("--af_diff_plot", required=True)
     p.add_argument("--qq_plot", required=True)
     p.add_argument("--scree_plot", required=True)
+    p.add_argument("--discovery_pop", default=None, help="Restrict GWAS to one population (e.g. EUR)")
     main(p.parse_args())
