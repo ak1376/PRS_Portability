@@ -1,0 +1,14 @@
+# --- experiment identity ---
+exp_tag: orthogonality             # every run needs a unique tag
+
+# --- model hyper-params ---
+latent:       64
+hidden:       256
+lambda_adv:   0.0
+lr:           1e-3
+batch:        64
+epochs:       10
+recon_wt:     0.0
+mse_wt:       10.0
+beta_kl:      0.0
+warm_adv:     10
