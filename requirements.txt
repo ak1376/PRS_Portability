@@ -9,3 +9,4 @@ demesdraw
 snakemake
 tskit
 scikit-learn
+statsmodels

@@ -1,0 +1,70 @@
+{
+  "genome_length": 1e6,
+  "mutation_rate": 1.5e-08,
+  "recombination_rate": 1.5e-08,
+  "demographic_model": "split_migration",
+  "num_samples": {
+    "YRI": 100,
+    "CEU": 100
+  },
+  "seed": 42,
+  "num_draws": 100,
+  "priors": {
+    "N_anc": [
+      100,
+      30000
+    ],
+    "N_YRI": [
+      100,
+      30000
+    ],
+    "N_CEU": [
+      100,
+      30000
+    ],
+    "m12": [
+      1e-8,
+      1e-4
+    ],
+    "m21": [
+      1e-8,
+      1e-4
+    ],
+    "T_split": [
+      500,
+      2e4
+    ]
+  },
+  "grid_sampling": {
+    "enabled": true,
+    "fixed_params": {
+      "N_anc": 10000,
+      "N_YRI": 10000,
+      "N_CEU": 10000,
+      "m12": 1e-5,
+      "m21": 1e-5,
+      "T_split": 2000
+    },
+    "varying_param": "T_split",
+    "min_value": 500,
+    "max_value": 20000,
+    "scale": "linear"
+  },
+  "num_causal_variants": 100,
+  "heritability": 0.7,
+  "trait_distribution": "normal",
+  "trait_distribution_parameters": {
+    "mean": 0,
+    "std": 1
+  },
+  "selection": {
+    "enabled": true,
+    "species": "HomSap",
+    "dfe_id": "Gamma_K17",
+    "coverage_percent": [
+      0,
+      95
+    ]
+  },
+  "engine": "msprime"
+}

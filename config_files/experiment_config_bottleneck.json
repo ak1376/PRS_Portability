@@ -1,0 +1,37 @@
+{
+    "genome_length": 1e8,
+    "mutation_rate": 1.5e-08,
+    "recombination_rate": 1.5e-08,
+    "demographic_model": "bottleneck",
+    "num_samples": {
+        "ANC": 10
+    }, 
+    "seed": 42, 
+    "num_draws": 10,
+    "priors": {
+    "N0"                : [2000, 20000],
+    "N_bottleneck"      : [100, 1999],
+    "N_recover"         : [2000, 20000],
+    "t_bottleneck_start": [1701, 3000],
+    "t_bottleneck_end"  : [ 100,  1700]
+    }, 
+    "num_causal_variants": 100, 
+    "heritability": 0.7,
+    "trait_distribution": "normal",
+    "trait_distribution_parameters": {
+        "mean": 0,
+        "std": 1
+    },
+    
+    "fixed_parameters": {
+        "N0": "sampled",
+        "N_bottleneck": "sampled"
+    }, 
+    "selection": {
+    "enabled": true,
+    "species": "HomSap",
+    "dfe_id": "Gamma_K17",
+    "coverage_percent": [0, 95]
+    },
+    "engine": "msprime"
+}
