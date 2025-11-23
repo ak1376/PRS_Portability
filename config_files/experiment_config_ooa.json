@@ -1,0 +1,107 @@
+{
+    "genome_length": 1e6,
+    "mutation_rate": 1.5e-08,
+    "recombination_rate": 1.5e-08,
+    "demographic_model": "out_of_africa",
+    "num_samples": {
+        "YRI": 100,
+        "CEU": 100
+    },
+    "num_replicates": 5,
+    "num_draws": 100,
+    "seed": 42,
+    "priors": {
+        "N_A": [
+            7300,
+            7300
+        ],
+        "N_B": [
+            2100,
+            2100
+        ],
+        "N_AF": [
+            12300,
+            12300
+        ],
+        "N_EU0": [
+            1000,
+            1000
+        ],
+        "N_AS0": [
+            510,
+            510
+        ],
+        "r_EU": [
+            0.004,
+            0.004
+        ],
+        "r_AS": [
+            0.0055,
+            0.0055
+        ],
+        "T_AFR_OOA": [
+            5600,
+            5600
+        ],
+        "T_EU_AS": [
+            848,
+            848
+        ],
+        "m_AF_B": [
+            0.00025,
+            0.00025
+        ],
+        "m_AF_EU": [
+            0.00003,
+            0.00003
+        ],
+        "m_AF_AS": [
+            0.000019,
+            0.000019
+        ],
+        "m_EU_AS": [
+            0.000096,
+            0.000096
+        ]
+    },
+    "grid_sampling": {
+        "enabled": true,
+        "fixed_params": {
+            "N_A": 7300,
+            "N_B": 2100,
+            "N_AF": 12300,
+            "N_EU0": 1000,
+            "N_AS0": 510,
+            "r_EU": 0.004,
+            "r_AS": 0.0055,
+            "T_EU_AS": 848,
+            "m_AF_B": 0.0,
+            "m_AF_EU": 0.0,
+            "m_AF_AS": 0.0,
+            "m_EU_AS": 0.0
+        },
+        "varying_param": "T_AFR_OOA",
+        "min_value": 1000,
+        "max_value": 10000,
+        "scale": "linear",
+        "num_grid_points": 100,
+        "replicates_per_value": 10
+    },
+    "num_causal_variants": 100,
+    "heritability": 0.7,
+    "trait_distribution": "normal",
+    "trait_distribution_parameters": {
+        "mean": 0,
+        "std": 1
+    },
+    "selection": {
+        "enabled": true,
+        "species": "HomSap",
+        "dfe_id": "Gamma_K17",
+        "coverage_percent": [
+            0,
+            95
+        ]
+    },
+    "engine": "msprime"
+}

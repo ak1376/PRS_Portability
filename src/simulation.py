@@ -8,11 +8,32 @@ import stdpopsim as sps
 import tskit
 import tstrait
 import moments
+import math
 
 
 # ──────────────────────────────────
 # Minimal helpers
 # ──────────────────────────────────
+
+def _individual_genotype_matrix(ts: tskit.TreeSequence) -> np.ndarray:
+    """
+    Return an (num_individuals, num_sites) genotype matrix with diploid genotypes.
+    """
+    G_hap = ts.genotype_matrix()  # (sites, samples/nodes)
+    if ts.num_individuals == 0:
+        return G_hap.T  # treat haplotypes as individuals
+
+    num_inds = ts.num_individuals
+    num_sites = ts.num_sites
+    G_ind = np.zeros((num_inds, num_sites), dtype=np.float32)
+
+    for i, ind in enumerate(ts.individuals()):
+        nodes = ind.nodes
+        if len(nodes) > 0:
+            G_ind[i] = G_hap[:, nodes].sum(axis=1)  # sum over haplotypes
+
+    return G_ind
+
 
 class _ModelFromDemes(sps.DemographicModel):
     """Wrap a demes.Graph so stdpopsim engines can simulate it (bottleneck, drosophila)."""
@@ -431,6 +452,88 @@ def drosophila_three_epoch(
     )
     return b.resolve()
 
+def out_of_africa_model(
+    sampled: Dict[str, float], cfg: Optional[Dict] = None
+) -> demes.Graph:
+    """
+    Gutenkunst et al. (2009) Out-of-Africa model.
+    Parameters can be overridden by 'sampled' dict.
+    Defaults are from the original paper (converted to generations assuming g=25).
+    """
+    # Default parameters (generations)
+    # Ancestral size
+    N_A = sampled.get("N_A", 7300)
+    
+    # Bottleneck size (OOA)
+    N_B = sampled.get("N_B", 2100)
+    
+    # Modern African size
+    N_AF = sampled.get("N_AF", 12300)
+    
+    # European initial size
+    N_EU0 = sampled.get("N_EU0", 1000)
+    
+    # Asian initial size
+    N_AS0 = sampled.get("N_AS0", 510)
+    
+    # Growth rates
+    r_EU = sampled.get("r_EU", 0.004)
+    r_AS = sampled.get("r_AS", 0.0055)
+    
+    # Times (generations ago)
+    # T_AFR_OOA: Split of African and OOA (Bottleneck)
+    T_AFR_OOA = sampled.get("T_AFR_OOA", 5600) # ~140k years
+    
+    # T_EU_AS: Split of European and Asian
+    T_EU_AS = sampled.get("T_EU_AS", 848) # ~21.2k years
+    
+    # Migration rates
+    m_AF_B = sampled.get("m_AF_B", 25e-5)
+    m_AF_EU = sampled.get("m_AF_EU", 3e-5)
+    m_AF_AS = sampled.get("m_AF_AS", 1.9e-5)
+    m_EU_AS = sampled.get("m_EU_AS", 9.6e-5)
+    
+    b = demes.Builder()
+    
+    # Ancestral population
+    b.add_deme("ANC", epochs=[dict(start_size=N_A, end_time=T_AFR_OOA)])
+    
+    # African population (YRI)
+    # Expands from N_A to N_AF instantly at T_AFR_OOA (in the paper it's instantaneous)
+    b.add_deme("YRI", ancestors=["ANC"], epochs=[dict(start_size=N_AF, end_time=0)])
+    
+    # OOA Bottleneck population
+    b.add_deme("OOA", ancestors=["ANC"], epochs=[dict(start_size=N_B, end_time=T_EU_AS)])
+    
+    # European population (CEU)
+    # Exponential growth from N_EU0
+    # End size = N_EU0 * exp(r_EU * T_EU_AS)
+    N_EU_end = N_EU0 * np.exp(r_EU * T_EU_AS)
+    b.add_deme("CEU", ancestors=["OOA"], epochs=[dict(start_size=N_EU0, end_size=N_EU_end, end_time=0)])
+    
+    # Asian population (CHB)
+    # Exponential growth from N_AS0
+    N_AS_end = N_AS0 * np.exp(r_AS * T_EU_AS)
+    b.add_deme("CHB", ancestors=["OOA"], epochs=[dict(start_size=N_AS0, end_size=N_AS_end, end_time=0)])
+    
+    # Migration
+    # Migration between AFR and OOA (Bottleneck)
+    b.add_migration(source="YRI", dest="OOA", rate=m_AF_B)
+    b.add_migration(source="OOA", dest="YRI", rate=m_AF_B)
+    
+    # Migration between AFR and EUR/ASN
+    b.add_migration(source="YRI", dest="CEU", rate=m_AF_EU)
+    b.add_migration(source="CEU", dest="YRI", rate=m_AF_EU)
+    
+    b.add_migration(source="YRI", dest="CHB", rate=m_AF_AS)
+    b.add_migration(source="CHB", dest="YRI", rate=m_AF_AS)
+    
+    # Migration between EUR and ASN
+    b.add_migration(source="CEU", dest="CHB", rate=m_EU_AS)
+    b.add_migration(source="CHB", dest="CEU", rate=m_EU_AS)
+    
+    return b.resolve()
+
 def define_sps_model(model_type: str, g: demes.Graph, sampled_params: Dict[str, float]) -> sps.DemographicModel:
     """Create appropriate stdpopsim model for SLiM based on model type."""
     if model_type == "split_isolation":
@@ -471,6 +574,10 @@ def define_sps_model(model_type: str, g: demes.Graph, sampled_params: Dict[str, 
             T_split,
             T_EUR_exp,
         )
+    
+    elif model_type == "out_of_africa":
+        # For OOA, we can use the custom demes wrapper since we built it as a demes graph
+        return _ModelFromDemes(g, model_id="custom_ooa", desc="Custom OOA")
 
     else:
         # For bottleneck or any other demes-based custom model
@@ -551,6 +658,8 @@ def simulation(
         g = split_migration_model(sampled_params)  # asymmetric
     elif model_type == "drosophila_three_epoch":
         g = drosophila_three_epoch(sampled_params, experiment_config)
+    elif model_type == "out_of_africa":
+        g = out_of_africa_model(sampled_params, experiment_config)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -596,102 +705,223 @@ def create_SFS(ts: tskit.TreeSequence) -> moments.Spectrum:
 
 def simulate_traits(ts: tskit.TreeSequence, experiment_config: dict) -> Tuple:
     """
-    Simulate a quantitative trait under a normal model
-    using tstrait's trait simulator.
-    
+    Simulate a quantitative trait. Two modes:
+
+    1) Shared architecture (default):
+       - One set of causal SNPs for all individuals (current behavior).
+    2) Population-specific architecture:
+       - discovery_pop and target_pop share only a fraction of causal SNPs,
+         controlled by config["causal_architecture"]["overlap_fraction"].
+
     Returns:
-        Tuple containing:
-        - trait_df: DataFrame with effect sizes from sim_trait (columns: position, site_id, effect_size, etc.)
-        - phenotype_df: DataFrame with phenotypes AND population assignments
+        trait_df: DataFrame of effect sizes for the DISCOVERY trait
+        phenotype_df: DataFrame with phenotypes + population assignments
     """
     import pandas as pd
 
     distribution = experiment_config['trait_distribution']
     mean = experiment_config['trait_distribution_parameters']['mean']
     std = experiment_config['trait_distribution_parameters']['std']
-    num_causal = experiment_config.get('num_causal_variants', 100)
-    heritability = experiment_config.get('heritability', 0.7)
-    random_seed = experiment_config.get('seed', 42)
+    num_causal = int(experiment_config.get('num_causal_variants', 100))
+    heritability = float(experiment_config.get('heritability', 0.7))
+    random_seed = int(experiment_config.get('seed', 42))
+
+    arch_cfg = experiment_config.get("causal_architecture", {}) or {}
+    pop_specific = bool(arch_cfg.get("population_specific_causals", False))
+    discovery_pop = arch_cfg.get("discovery_pop", "CEU")
+    target_pop = arch_cfg.get("target_pop", "YRI")
+    overlap_fraction = float(arch_cfg.get("overlap_fraction", 1.0))
+    overlap_fraction = min(max(overlap_fraction, 0.0), 1.0)
 
     model = tstrait.trait_model(distribution=distribution, mean=mean, var=std**2)
-    
-    # Simulate effect sizes only
+
+    # ------------------------------------------------------------------ #
+    # CASE 1: old behavior (shared causal SNPs)
+    # ------------------------------------------------------------------ #
+    if not pop_specific:
+        # Simulate effect sizes only
+        trait_df = tstrait.sim_trait(
+            ts=ts, num_causal=num_causal, model=model, random_seed=random_seed
+        )
+
+        # Simulate phenotypes (shared architecture)
+        phenotype_result = tstrait.sim_phenotype(
+            ts=ts, num_causal=num_causal, model=model,
+            h2=heritability, random_seed=random_seed
+        )
+        phenotype_df = phenotype_result.phenotype.copy()
+
+        # Add population information
+        population_map = {}
+        for ind in ts.individuals():
+            node_id = ind.nodes[0]
+            pop_id = ts.node(node_id).population
+            pop_meta = ts.population(pop_id).metadata
+            if isinstance(pop_meta, dict):
+                pop_name = pop_meta.get("name", f"pop{pop_id}")
+            else:
+                pop_name = f"pop{pop_id}"
+            population_map[ind.id] = pop_name
+
+        phenotype_df["population"] = phenotype_df["individual_id"].map(population_map)
+        cols = list(phenotype_df.columns)
+        cols.remove("population")
+        idx = cols.index("individual_id")
+        cols.insert(idx + 1, "population")
+        phenotype_df = phenotype_df[cols]
+
+        return trait_df, phenotype_df
+
+    # ------------------------------------------------------------------ #
+    # CASE 2: population-specific causal SNPs
+    # ------------------------------------------------------------------ #
+
+    # 1) Discovery trait: a single tstrait.sim_trait call defines the CEU architecture
     trait_df = tstrait.sim_trait(
         ts=ts, num_causal=num_causal, model=model, random_seed=random_seed
     )
-    
-    # Simulate complete phenotypes (effect sizes + genetic values + environmental noise)
-    phenotype_result = tstrait.sim_phenotype(
-        ts=ts, num_causal=num_causal, model=model, h2=heritability, random_seed=random_seed
-    )
-    
-    # Add population information to phenotype DataFrame
-    phenotype_df = phenotype_result.phenotype.copy()
-    
-    # Extract population assignment for each individual from tree sequence
+    # trait_df must at least have columns ["site_id", "effect_size"]
+    discovery_site_ids = trait_df["site_id"].to_numpy()
+    discovery_betas = trait_df["effect_size"].to_numpy()
+    num_sites = ts.num_sites
+
+    # 2) Build mapping individual_id -> population
     population_map = {}
+    indiv_pops = []  # parallel to individual index in ts.individuals()
     for ind in ts.individuals():
-        # Get the population ID for this individual's first node
         node_id = ind.nodes[0]
         pop_id = ts.node(node_id).population
-        # Get population name from metadata
-        pop_metadata = ts.population(pop_id).metadata
-        if isinstance(pop_metadata, dict):
-            pop_name = pop_metadata.get('name', f'pop{pop_id}')
+        pop_meta = ts.population(pop_id).metadata
+        if isinstance(pop_meta, dict):
+            pop_name = pop_meta.get("name", f"pop{pop_id}")
         else:
-            pop_name = f'pop{pop_id}'
+            pop_name = f"pop{pop_id}"
         population_map[ind.id] = pop_name
-    
-    # Add population column to phenotype DataFrame
-    phenotype_df['population'] = phenotype_df['individual_id'].map(population_map)
-    
-    # Reorder columns to put population after individual_id
-    cols = list(phenotype_df.columns)
-    # Move 'population' to be right after 'individual_id'
-    cols.remove('population')
-    individual_id_idx = cols.index('individual_id')
-    cols.insert(individual_id_idx + 1, 'population')
+        indiv_pops.append(pop_name)
+    indiv_pops = np.array(indiv_pops)
+
+    # 3) Build individual genotype matrix
+    G = _individual_genotype_matrix(ts)  # (num_inds, num_sites)
+    num_inds = G.shape[0]
+
+    # 4) Discovery population architecture: betas over ALL sites
+    beta_disc = np.zeros(num_sites, dtype=float)
+    beta_disc[discovery_site_ids] = discovery_betas
+
+    # 5) Target population architecture: overlap + unique causal sites
+    rng = np.random.default_rng(random_seed + 12345)
+
+    k = num_causal
+    n_shared = int(round(overlap_fraction * k))
+    n_shared = min(n_shared, len(discovery_site_ids))
+    shared_idx = rng.choice(len(discovery_site_ids), size=n_shared, replace=False)
+    shared_sites = discovery_site_ids[shared_idx]
+
+    # pool of candidate sites not already used in discovery trait
+    all_sites = np.arange(num_sites, dtype=int)
+    mask_not_disc = np.ones(num_sites, dtype=bool)
+    mask_not_disc[discovery_site_ids] = False
+    available_sites = all_sites[mask_not_disc]
+
+    n_unique_target = max(k - n_shared, 0)
+    if n_unique_target > len(available_sites):
+        n_unique_target = len(available_sites)
+
+    if n_unique_target > 0:
+        target_unique_sites = rng.choice(available_sites, size=n_unique_target, replace=False)
+    else:
+        target_unique_sites = np.array([], dtype=int)
+
+    target_sites = np.concatenate([shared_sites, target_unique_sites])
+
+    # effect sizes for target population
+    # shared sites reuse discovery betas; unique sites get fresh draws
+    beta_target = np.zeros(num_sites, dtype=float)
+    beta_target[shared_sites] = beta_disc[shared_sites]
+
+    # draw new effect sizes for target-unique sites
+    if len(target_unique_sites) > 0:
+        # same marginal distribution as discovery betas
+        beta_target[target_unique_sites] = rng.normal(loc=mean, scale=std, size=len(target_unique_sites))
+
+    # 6) Compute genetic values for each individual
+    g_values = np.zeros(num_inds, dtype=float)
+    for i in range(num_inds):
+        pop_name = indiv_pops[i]
+        if pop_name == discovery_pop:
+            g_values[i] = G[i] @ beta_disc
+        elif pop_name == target_pop:
+            g_values[i] = G[i] @ beta_target
+        else:
+            # default: discovery architecture for other pops
+            g_values[i] = G[i] @ beta_disc
+
+    # 7) Add environmental noise to match desired heritability
+    var_g = np.var(g_values, ddof=1)
+    if var_g <= 0:
+        sigma_e = 1.0
+    else:
+        sigma_e = math.sqrt(var_g * (1 - heritability) / max(heritability, 1e-8))
+
+    rng_env = np.random.default_rng(random_seed + 54321)
+    env_noise = rng_env.normal(loc=0.0, scale=sigma_e, size=num_inds)
+    phenotypes = g_values + env_noise
+
+    # 8) Build phenotype_df to mirror original structure
+    phenotype_df = pd.DataFrame({
+        "individual_id": np.arange(num_inds, dtype=int),
+        "population": indiv_pops,
+        "genetic_value": g_values,
+        "environmental_noise": env_noise,
+        "phenotype": phenotypes,
+    })
+
+    # Keep column order consistent
+    cols = ["individual_id", "population", "genetic_value", "environmental_noise", "phenotype"]
     phenotype_df = phenotype_df[cols]
 
-    # Return both: trait effect sizes and complete phenotype simulation with population info
+    # trait_df is *discovery* trait (CEU) used as "true causal" in GWAS
     return trait_df, phenotype_df
 
 
 
 def calculate_fst(ts: tskit.TreeSequence) -> float:
-    """
-    Calculate Fst between two populations (YRI and CEU) if they exist.
-    Returns the mean Fst.
-    """
-    # Identify sample sets for YRI and CEU
-    sample_sets = []
-    pop_names = []
-    
-    # Map common names
-    target_pops = ["YRI", "CEU", "AFR", "EUR"]
-    
+    import numpy as np
+
+    pop_to_samps = {}
+    pop_to_name = {}
+
     for pop in ts.populations():
         samps = ts.samples(population=pop.id)
-        if len(samps) > 0:
-            meta = pop.metadata if isinstance(pop.metadata, dict) else {}
-            name = meta.get("name", f"pop{pop.id}")
-            
-            # If we find specific target pops, prioritize them
-            # Otherwise just take the first two we find
-            if name in target_pops or len(sample_sets) < 2:
-                 # Only add if we haven't already added this population (by ID)
-                 # But here we iterate by population so it's unique
-                 sample_sets.append(samps)
-                 pop_names.append(name)
-    
-    if len(sample_sets) < 2:
-        return 0.0 # Not enough pops for Fst
-        
-    # Calculate Fst genome-wide (windows=None)
-    # indexes=[(0, 1)] compares the first two sample sets found
+        if len(samps) == 0:
+            continue
+        meta = pop.metadata if isinstance(pop.metadata, dict) else {}
+        name = meta.get("name", f"pop{pop.id}")
+        pop_to_samps[name] = samps
+        pop_to_name[pop.id] = name
+
+    # Choose pair in preferred order
+    if "YRI" in pop_to_samps and "CEU" in pop_to_samps:
+        s1, s2 = pop_to_samps["YRI"], pop_to_samps["CEU"]
+    elif "AFR" in pop_to_samps and "EUR" in pop_to_samps:
+        s1, s2 = pop_to_samps["AFR"], pop_to_samps["EUR"]
+    else:
+        # fallback: first two
+        if len(pop_to_samps) < 2:
+            return 0.0
+        names = list(pop_to_samps.keys())
+        s1, s2 = pop_to_samps[names[0]], pop_to_samps[names[1]]
+
     try:
-        fst_val = ts.Fst(sample_sets, indexes=[(0, 1)], windows=None, mode='site', span_normalise=True)
+        fst_val = ts.Fst(
+            sample_sets=[s1, s2],
+            indexes=[(0, 1)],
+            windows=None,
+            mode="site",
+            span_normalise=True,
+        )
         return float(fst_val[0])
     except Exception as e:
         print(f"Warning: Fst calculation failed: {e}")
         return 0.0
+

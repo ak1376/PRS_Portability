@@ -81,7 +81,10 @@ def run_simulation(
     experiment_config: Path,
     model_type: str,
     simulation_number: Optional[str] = None,
+    replicate: int = 0,
+    output_dir: Optional[Path] = None,
 ):
+
     # Load config and inspect engine
     cfg: Dict[str, object] = json.loads(experiment_config.read_text())
     engine = cfg["engine"]  # "msprime" or "slim"
@@ -89,18 +92,27 @@ def run_simulation(
     sel_cfg = cfg.get("selection") or {}
     
     # decide destination folder name
-    if simulation_number is None:
-        existing = {int(p.name) for p in simulation_dir.glob("[0-9]*") if p.is_dir()}
-        simulation_number = f"{max(existing, default=0) + 1:04d}"
-    out_dir = simulation_dir / simulation_number
+    if output_dir is not None:
+        out_dir = output_dir
+        # If simulation_number is not provided but we need it for logic, we might need to infer or require it.
+        # But here simulation_number is passed from CLI usually.
+        if simulation_number is None:
+             # fallback if needed, but usually provided
+             simulation_number = "0000" 
+    else:
+        if simulation_number is None:
+            existing = {int(p.name) for p in simulation_dir.glob("[0-9]*") if p.is_dir()}
+            simulation_number = f"{max(existing, default=0) + 1:04d}"
+        out_dir = simulation_dir / simulation_number
+    
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate unique seed for this simulation
     base_seed = cfg.get("seed")
     if base_seed is not None:
-        # Create a unique seed for each simulation using base_seed + simulation_number
-        simulation_seed = int(base_seed) + int(simulation_number)
-        print(f"• Using seed {simulation_seed} (base: {base_seed} + sim: {simulation_number})")
+        # Use simulation_number (grid index) + replicate to make a unique seed
+        simulation_seed = int(base_seed) + int(simulation_number) * 1000 + int(replicate)
+        print(f"• Using seed {simulation_seed} (base: {base_seed}, grid: {simulation_number}, rep: {replicate})")
         rng = np.random.default_rng(simulation_seed)
     else:
         simulation_seed = None
@@ -110,39 +122,36 @@ def run_simulation(
     # Sample demographic params
     grid_cfg = cfg.get("grid_sampling", {})
     if grid_cfg.get("enabled", False):
-        # Grid mode
         fixed = grid_cfg["fixed_params"]
         var_param = grid_cfg["varying_param"]
-        
+
         min_val = float(grid_cfg["min_value"])
         max_val = float(grid_cfg["max_value"])
         scale = grid_cfg.get("scale", "linear")
-        
-        # We need to know the total number of draws to generate the grid
-        total_draws = int(cfg["num_draws"])
-        
-        idx = int(simulation_number)
-        if idx >= total_draws:
-             raise ValueError(f"Simulation number {idx} exceeds num_draws {total_draws}")
+
+        num_grid = int(grid_cfg.get("num_grid_points", 1))
+
+        # simulation_number is now the grid index (0 .. num_grid-1)
+        grid_idx = int(simulation_number)
+        if grid_idx < 0 or grid_idx >= num_grid:
+            raise ValueError(f"Simulation number {grid_idx} out of range [0, {num_grid}).")
 
         if scale == "linear":
-            if total_draws == 1:
-                 val = min_val
-            else:
-                 val = np.linspace(min_val, max_val, total_draws)[idx]
+            grid_vals = np.linspace(min_val, max_val, num_grid)
         elif scale == "log":
-             if total_draws == 1:
-                 val = min_val
-             else:
-                 val = np.geomspace(min_val, max_val, total_draws)[idx]
+            grid_vals = np.geomspace(min_val, max_val, num_grid)
         else:
-             raise ValueError(f"Unknown scale: {scale}")
-             
+            raise ValueError(f"Unknown scale: {scale}")
+
+        val = float(grid_vals[grid_idx])
         sampled_params = dict(fixed)
-        sampled_params[var_param] = float(val)
-        print(f"• Grid mode: {var_param} = {sampled_params[var_param]} (Index {idx}/{total_draws})")
+        sampled_params[var_param] = val
+
+        print(f"• Grid mode: {var_param} = {val:.2f} "
+              f"(grid index {grid_idx}/{num_grid-1}, replicate {replicate})")
     else:
         sampled_params = sample_params(cfg["priors"], rng=rng)
+
 
     # Decide coverage based on engine
     if engine == "slim":
@@ -291,6 +300,7 @@ def main():
             "split_isolation",
             "split_migration",
             "drosophila_three_epoch",
+            "out_of_africa",
         ],
         help="Which demographic model to simulate",
     )
@@ -299,13 +309,30 @@ def main():
         type=str,
         help="Folder name to create (e.g. '0005'). If omitted, the next free index is used.",
     )
+
+    cli.add_argument(
+        "--replicate",
+        type=int,
+        default=0,
+        help="Replicate index for this parameter setting (used only for the seed).",
+    )
+    
+    cli.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Exact output directory (overrides --simulation-dir nesting behavior).",
+    )
+
     args = cli.parse_args()
     run_simulation(
         args.simulation_dir,
         args.experiment_config,
         args.model_type,
         args.simulation_number,
+        args.replicate,
+        args.output_dir,
     )
+
 
 
 if __name__ == "__main__":
