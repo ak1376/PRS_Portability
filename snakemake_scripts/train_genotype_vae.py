@@ -56,6 +56,9 @@ def make_loader(base_ds, idx, batch_size, shuffle):
 
 
 def train_epoch(model, loader, optimizer, device, beta):
+    """
+    One training epoch using BCE + β * KL (implemented inside model.loss_function).
+    """
     model.train()
     total_loss = 0.0
     total_recon = 0.0
@@ -86,6 +89,9 @@ def train_epoch(model, loader, optimizer, device, beta):
 
 
 def eval_epoch(model, loader, device, beta):
+    """
+    Evaluation epoch (no gradient) using BCE + β * KL.
+    """
     model.eval()
     total_loss = 0.0
     total_recon = 0.0
@@ -158,7 +164,46 @@ def main():
     # -------------------------------------------------------------
     # Load data
     # -------------------------------------------------------------
-    geno = np.load(args.genotype)  # (individuals, SNPs)
+    # Expect raw diploid genotypes as 0/1/2 in the .npy file.
+    geno_raw = np.load(args.genotype)  # (individuals, SNPs)
+    geno_raw = geno_raw.astype(np.float32)
+
+    # Sanity check raw values
+    raw_min = float(np.nanmin(geno_raw))
+    raw_max = float(np.nanmax(geno_raw))
+    print(f"Raw genotype stats: min={raw_min}, max={raw_max}")
+
+    # If there are NaNs, replace with 0 for now (or you can choose a better imputation)
+    if np.isnan(geno_raw).any():
+        print("Warning: NaNs found in genotype array; replacing with 0.")
+        geno_raw = np.nan_to_num(geno_raw, nan=0.0)
+
+    # If any values are outside [0, 2], clip them to [0, 2].
+    # This avoids BCE crashing, and keeps things in a sensible range.
+    bad_mask = (geno_raw < 0.0) | (geno_raw > 2.0)
+    if np.any(bad_mask):
+        num_bad = int(np.sum(bad_mask))
+        frac_bad = num_bad / geno_raw.size
+        print(
+            f"Warning: found {num_bad} genotype entries ({frac_bad:.4%}) "
+            "outside [0,2]. Clipping them into [0,2]."
+        )
+        geno_raw = np.clip(geno_raw, 0.0, 2.0)
+
+    # Always scale to [0,1] like popVAE: 0,1,2 → 0,0.5,1
+    geno_scaled = geno_raw / 2.0
+
+    # Final safety check for BCE: everything must be in [0,1].
+    scaled_min = float(np.min(geno_scaled))
+    scaled_max = float(np.max(geno_scaled))
+    print(f"Scaled genotype stats (for BCE): min={scaled_min}, max={scaled_max}")
+
+    if scaled_min < 0.0 or scaled_max > 1.0:
+        raise ValueError(
+            f"Scaled genotype values are outside [0,1]: min={scaled_min}, max={scaled_max}"
+        )
+
+
     with open(args.meta, "rb") as f:
         meta = pickle.load(f)
     pops = np.array(meta["population"])
@@ -166,7 +211,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    X = torch.tensor(geno, dtype=torch.float32)
+    X = torch.tensor(geno_scaled, dtype=torch.float32)  # scaled genotypes in [0,1]
     base_ds = TensorDataset(X)
     N = X.shape[0]
 
@@ -199,7 +244,7 @@ def main():
     for beta in beta_grid:
         print(f"\n=== Tuning for beta={beta} ===")
         model = GenotypeVAE(
-            input_dim=geno.shape[1],
+            input_dim=geno_scaled.shape[1],
             width=args.hidden_dim,
             depth=args.depth,
             latent_dim=args.latent_dim,
@@ -251,7 +296,6 @@ def main():
     #   - train on (train + tune)
     #   - validate on val
     # -------------------------------------------------------------
-    # merge train + tune indices for final training
     final_train_idx = np.concatenate([train_idx, tune_idx])
     final_train_loader = make_loader(
         base_ds, final_train_idx, args.batch_size, shuffle=True
@@ -261,7 +305,7 @@ def main():
     )
 
     model = GenotypeVAE(
-        input_dim=geno.shape[1],
+        input_dim=geno_scaled.shape[1],
         width=args.hidden_dim,
         depth=args.depth,
         latent_dim=args.latent_dim,
@@ -320,7 +364,7 @@ def main():
     # Latent PCA plot using full dataset (best beta)
     # -------------------------------------------------------------
     model.eval()
-    X_full = X.to(device)
+    X_full = X.to(device)  # scaled genotypes
     with torch.no_grad():
         mu, logvar = model.encode(X_full)
     latent = mu.cpu().numpy()
@@ -334,13 +378,20 @@ def main():
     # ---------------------
     # Save reconstructions for LD diagnostics
     # ---------------------
+    # We want reconstructed genotypes back on the 0/1/2 scale for LD, so unscale.
     model.eval()
-    X = torch.tensor(geno, dtype=torch.float32).to(device)
     with torch.no_grad():
-        recon, mu, logvar = model(X)
-    recon_np = recon.cpu().numpy()
-    np.save(outdir / "recon_all.npy", recon_np)
+        recon_scaled, mu, logvar = model(X_full.to(device))  # in [0,1]
+    recon_scaled_np = recon_scaled.cpu().numpy()
 
+    # Unscale back to 0/1/2-ish dosage
+    recon_unscaled_np = recon_scaled_np * 2.0
+
+    # Save *unscaled* reconstructions as before (for LD analysis)
+    np.save(outdir / "recon_all.npy", recon_unscaled_np)
+
+    # Optionally, if you ever want the scaled version:
+    # np.save(outdir / "recon_all_scaled.npy", recon_scaled_np)
 
 
 if __name__ == "__main__":

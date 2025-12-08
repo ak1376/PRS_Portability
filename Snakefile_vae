@@ -48,7 +48,7 @@ rule all:
         # VAE LD evaluation outputs
         f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
         f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
-        f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png",
+        f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png"
 
 ##############################################################################
 # RULE simulate – one big simulation for VAE                                 #
@@ -137,7 +137,7 @@ rule train_vae:
             --lr 1e-4 \
             --tune-fraction 0.2 \
             --val-fraction 0.1 \
-            --beta-grid "0.0,0.001,0.01,0.1,1.0" \
+            --beta-grid "1.0" \
             --seed 42
         """
 
