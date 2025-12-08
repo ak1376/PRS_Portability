@@ -1,0 +1,181 @@
+import json
+from pathlib import Path
+from snakemake.io import protected
+
+SIM_SCRIPT          = "snakemake_scripts/simulation.py"
+BUILD_VAE_INPUTS    = "snakemake_scripts/build_genotypes_for_vae.py"
+TRAIN_VAE_SCRIPT    = "snakemake_scripts/train_genotype_vae.py"
+
+# Separate config for the VAE experiment (lots of CEU/YRI samples)
+EXP_CFG = "config_files/experiment_config_vae.json"
+
+CFG   = json.loads(Path(EXP_CFG).read_text())
+MODEL = CFG["demographic_model"]
+
+# Here we’ll just do one sid and one rep for the VAE
+NUM_GRID = int(CFG.get("num_draws", 1))
+REPS     = int(CFG.get("num_replicates", 1))
+
+SID_RANGE = range(NUM_GRID)
+REP_RANGE = range(REPS)
+
+# Directories for this VAE experiment
+SIM_BASEDIR   = f"experiments/{MODEL}/vae_sims"
+GENO_BASEDIR  = f"experiments/{MODEL}/genotypes"
+VAE_BASEDIR   = f"experiments/{MODEL}/vae"
+
+# Save the config for record-keeping
+config_path = Path(f"{SIM_BASEDIR}/config.json")
+config_path.parent.mkdir(parents=True, exist_ok=True)
+config_path.write_text(json.dumps(CFG, indent=4))
+
+##############################################################################
+# RULE all – final targets                                                   #
+##############################################################################
+rule all:
+    input:
+        # single big sim (sid=0, rep=0) tree + phenotype
+        f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
+        f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
+        # VAE inputs
+        f"{GENO_BASEDIR}/all_individuals.npy",
+        f"{GENO_BASEDIR}/meta.pkl",
+        # VAE training outputs
+        f"{VAE_BASEDIR}/genotype_vae.pt",
+        f"{VAE_BASEDIR}/vae_losses.csv",
+        f"{VAE_BASEDIR}/vae_loss_curves.png",
+        f"{VAE_BASEDIR}/latent_pca_by_population.png",
+        # VAE LD evaluation outputs
+        f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
+        f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
+        f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png",
+
+##############################################################################
+# RULE simulate – one big simulation for VAE                                 #
+##############################################################################
+rule simulate:
+    output:
+        sfs       = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/SFS.pkl",
+        params    = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/sampled_params.pkl",
+        tree      = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/tree_sequence.trees",
+        fig       = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/demes.png",
+        meta      = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/bgs.meta.json",
+        trait     = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/effect_sizes.pkl",
+        phenotype = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/phenotype.pkl",
+        done      = protected(f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/.done"),
+    params:
+        sim_dir = SIM_BASEDIR,
+        cfg     = EXP_CFG,
+        model   = MODEL,
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+
+        python "{SIM_SCRIPT}" \
+          --simulation-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}" \
+          --experiment-config "{params.cfg}" \
+          --model-type "{params.model}" \
+          --simulation-number {wildcards.sid} \
+          --replicate {wildcards.rep} \
+          --output-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}"
+
+        test -f "{output.meta}"
+        touch "{output.done}"
+        """
+
+##############################################################################
+# RULE build_genotypes_for_vae – .trees -> all_individuals.npy + meta.pkl   #
+##############################################################################
+rule build_genotypes_for_vae:
+    input:
+        tree   = f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
+        pheno  = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
+    output:
+        geno = f"{GENO_BASEDIR}/all_individuals.npy",
+        meta = f"{GENO_BASEDIR}/meta.pkl",
+    params:
+        outdir = GENO_BASEDIR,
+    threads: 1
+    shell:
+        r"""
+        python "{BUILD_VAE_INPUTS}" \
+            --tree {input.tree} \
+            --phenotype {input.pheno} \
+            --outdir {params.outdir}
+        """
+
+##############################################################################
+# RULE train_vae – train genotype VAE                                       #
+##############################################################################
+rule train_vae:
+    input:
+        geno = f"{GENO_BASEDIR}/all_individuals.npy",
+        meta = f"{GENO_BASEDIR}/meta.pkl",
+    output:
+        model     = f"{VAE_BASEDIR}/genotype_vae.pt",
+        losses    = f"{VAE_BASEDIR}/vae_losses.csv",
+        loss_plot = f"{VAE_BASEDIR}/vae_loss_curves.png",
+        pca_plot  = f"{VAE_BASEDIR}/latent_pca_by_population.png",
+    params:
+        outdir = VAE_BASEDIR,
+    threads: 1
+    resources:
+        gpus = 1
+    shell:
+        r"""
+        python "{TRAIN_VAE_SCRIPT}" \
+            --genotype {input.geno} \
+            --meta {input.meta} \
+            --outdir {params.outdir} \
+            --latent-dim 32 \
+            --hidden-dim 512 \
+            --depth 6 \
+            --batch-size 128 \
+            --epochs 100 \
+            --epochs-tune 40 \
+            --lr 1e-4 \
+            --tune-fraction 0.2 \
+            --val-fraction 0.1 \
+            --beta-grid "0.0,0.001,0.01,0.1,1.0" \
+            --seed 42
+        """
+
+##############################################################################
+# RULE evaluate_vae_ld – Does the VAE preserve LD structure?                 #
+##############################################################################
+rule evaluate_vae_ld:
+    input:
+        geno  = f"{GENO_BASEDIR}/all_individuals.npy",
+        meta  = f"{GENO_BASEDIR}/meta.pkl",
+        model = f"{VAE_BASEDIR}/genotype_vae.pt",
+    output:
+        summary   = f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
+        scatter   = f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
+        diff_hist = f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png",
+    params:
+        outdir     = f"{VAE_BASEDIR}/ld_eval",
+        latent_dim = 32,
+        hidden_dim = 512,
+        depth      = 6,
+        beta       = 0.0,
+        max_snps   = 500,
+        seed       = 42,
+    threads: 1
+    resources:
+        gpus = 1
+    shell:
+        r"""
+        python snakemake_scripts/evaluate_vae_ld.py \
+            --genotype {input.geno} \
+            --meta {input.meta} \
+            --model {input.model} \
+            --outdir {params.outdir} \
+            --latent-dim {params.latent_dim} \
+            --hidden-dim {params.hidden_dim} \
+            --depth {params.depth} \
+            --beta {params.beta} \
+            --max-snps {params.max_snps} \
+            --seed {params.seed}
+        """
+
