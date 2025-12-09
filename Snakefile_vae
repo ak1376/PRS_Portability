@@ -118,7 +118,8 @@ rule train_vae:
         loss_plot = f"{VAE_BASEDIR}/vae_loss_curves.png",
         pca_plot  = f"{VAE_BASEDIR}/latent_pca_by_population.png",
     params:
-        outdir = VAE_BASEDIR,
+        outdir     = VAE_BASEDIR,
+        model_cfg  = "config_files/vae_model_config.yaml",
     threads: 1
     resources:
         gpus = 1
@@ -128,18 +129,9 @@ rule train_vae:
             --genotype {input.geno} \
             --meta {input.meta} \
             --outdir {params.outdir} \
-            --latent-dim 32 \
-            --hidden-dim 512 \
-            --depth 6 \
-            --batch-size 128 \
-            --epochs 100 \
-            --epochs-tune 40 \
-            --lr 1e-4 \
-            --tune-fraction 0.2 \
-            --val-fraction 0.1 \
-            --beta-grid "1.0" \
-            --seed 42
+            --model-config {params.model_cfg}
         """
+
 
 ##############################################################################
 # RULE evaluate_vae_ld – Does the VAE preserve LD structure?                 #

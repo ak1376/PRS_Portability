@@ -1,0 +1,19 @@
+model:
+  latent_dim: 32
+  hidden_dim: 512
+  depth: 6
+  # optional knobs if your GenotypeVAE supports them
+  # activation: "relu"
+  # use_batchnorm: false
+  # dropout: 0.0
+  # deterministic_latent: false  # if you add this later
+
+training:
+  batch_size: 128
+  epochs: 100
+  epochs_tune: 40
+  lr: 1e-4
+  tune_fraction: 0.2
+  val_fraction: 0.1
+  beta_grid: [0.0]    # or [0.0, 0.001, 0.01, 0.1, 1.0]
+  seed: 42

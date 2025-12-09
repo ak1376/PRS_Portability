@@ -1,17 +1,18 @@
-# snakemake_scripts/train_genotype_vae.py
-
+#!/usr/bin/env python3
 import argparse
 import csv
 import json
-import numpy as np
 import pickle
 import sys
 from pathlib import Path
 
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, Subset
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset, TensorDataset
+import yaml  # NEW: for YAML config
 
 # --- make sure we can import src.* no matter where Snakemake runs from ---
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,219 +49,360 @@ def make_splits(N, tune_fraction, val_fraction, seed=42):
 
 
 def make_loader(base_ds, idx, batch_size, shuffle):
+    """
+    Build a DataLoader from a TensorDataset and an index array.
+    """
     if len(idx) == 0:
         # Empty dataset
-        return DataLoader(TensorDataset(base_ds.tensors[0][:0]), batch_size=batch_size)
+        return DataLoader(
+            TensorDataset(base_ds.tensors[0][:0]),
+            batch_size=batch_size,
+            shuffle=False,
+        )
     subset = Subset(base_ds, idx)
     return DataLoader(subset, batch_size=batch_size, shuffle=shuffle)
 
 
-def train_epoch(model, loader, optimizer, device, beta):
+def train_interleaved_epoch(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    beta,
+    phase,
+    epoch,
+    batch_csv_path=None,
+):
     """
-    One training epoch using BCE + β * KL (implemented inside model.loss_function).
+    Interleaved train + val per batch.
+
+    For each *training* batch:
+      1) Do a train step (backprop) on that batch.
+      2) Immediately evaluate on one validation batch (no grad).
+
+    If batch_csv_path is not None, append one row per batch to that CSV:
+      phase, epoch, batch_idx, split, loss, recon, kl, mse
+
+    Returns epoch-averaged:
+        train_loss, train_recon, train_kl, train_mse,
+        val_loss,   val_recon,   val_kl,   val_mse
     """
     model.train()
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    n_samples = 0
+    train_loss_sum = train_recon_sum = train_kl_sum = 0.0
+    val_loss_sum = val_recon_sum = val_kl_sum = 0.0
+    train_mse_sum = 0.0
+    val_mse_sum = 0.0
+    n_train = 0
+    n_val = 0
 
-    for batch in loader:
-        x = batch[0].to(device)
-        bs = x.size(0)
-        n_samples += bs
+    val_iter = iter(val_loader)
+    batch_idx = 0
 
-        optimizer.zero_grad()
-        recon, mu, logvar = model(x)
-        loss, recon_loss, kl_loss = model.loss_function(
-            recon, x, mu, logvar, beta=beta
-        )
-        loss.backward()
-        optimizer.step()
+    csv_writer = None
+    f_csv = None
+    if batch_csv_path is not None:
+        f_csv = batch_csv_path.open("a", newline="")
+        csv_writer = csv.writer(f_csv)
 
-        total_loss += loss.item() * bs
-        total_recon += recon_loss.item() * bs
-        total_kl += kl_loss.item() * bs
+    try:
+        for batch in train_loader:
+            x_train = batch[0].to(device)  # scaled genotypes ∈ [0,1]
+            bs = x_train.size(0)
+            n_train += bs
 
-    if n_samples == 0:
-        return 0.0, 0.0, 0.0
-
-    return total_loss / n_samples, total_recon / n_samples, total_kl / n_samples
-
-
-def eval_epoch(model, loader, device, beta):
-    """
-    Evaluation epoch (no gradient) using BCE + β * KL.
-    """
-    model.eval()
-    total_loss = 0.0
-    total_recon = 0.0
-    total_kl = 0.0
-    n_samples = 0
-
-    with torch.no_grad():
-        for batch in loader:
-            x = batch[0].to(device)
-            bs = x.size(0)
-            n_samples += bs
-
-            recon, mu, logvar = model(x)
+            # ---- train step ----
+            optimizer.zero_grad()
+            recon, mu, logvar = model(x_train)
             loss, recon_loss, kl_loss = model.loss_function(
-                recon, x, mu, logvar, beta=beta
+                recon, x_train, mu, logvar, beta=beta
             )
+            mse = F.mse_loss(recon, x_train, reduction="mean")
 
-            total_loss += loss.item() * bs
-            total_recon += recon_loss.item() * bs
-            total_kl += kl_loss.item() * bs
+            loss.backward()
+            optimizer.step()
 
-    if n_samples == 0:
-        return 0.0, 0.0, 0.0
+            train_loss_sum += loss.item() * bs
+            train_recon_sum += recon_loss.item() * bs
+            train_kl_sum += kl_loss.item() * bs
+            train_mse_sum += mse.item() * bs
 
-    return total_loss / n_samples, total_recon / n_samples, total_kl / n_samples
+            if csv_writer is not None:
+                csv_writer.writerow(
+                    [
+                        phase,
+                        epoch,
+                        batch_idx,
+                        "train",
+                        loss.item(),
+                        recon_loss.item(),
+                        kl_loss.item(),
+                        mse.item(),
+                    ]
+                )
+
+            # ---- one validation batch (no grad) ----
+            try:
+                vbatch = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                try:
+                    vbatch = next(val_iter)
+                except StopIteration:
+                    # empty val_loader
+                    batch_idx += 1
+                    continue
+
+            x_val = vbatch[0].to(device)
+            vbs = x_val.size(0)
+            if vbs > 0:
+                model.eval()
+                with torch.no_grad():
+                    v_recon, v_mu, v_logvar = model(x_val)
+                    v_loss, v_recon_loss, v_kl_loss = model.loss_function(
+                        v_recon, x_val, v_mu, v_logvar, beta=beta
+                    )
+                    v_mse = F.mse_loss(v_recon, x_val, reduction="mean")
+
+                model.train()
+
+                val_loss_sum += v_loss.item() * vbs
+                val_recon_sum += v_recon_loss.item() * vbs
+                val_kl_sum += v_kl_loss.item() * vbs
+                val_mse_sum += v_mse.item() * vbs
+                n_val += vbs
+
+                if csv_writer is not None:
+                    csv_writer.writerow(
+                        [
+                            phase,
+                            epoch,
+                            batch_idx,
+                            "val",
+                            v_loss.item(),
+                            v_recon_loss.item(),
+                            v_kl_loss.item(),
+                            v_mse.item(),
+                        ]
+                    )
+
+            batch_idx += 1
+    finally:
+        if f_csv is not None:
+            f_csv.close()
+
+    # Aggregate to means “per individual”
+    if n_train == 0:
+        mean_train_loss = mean_train_recon = mean_train_kl = mean_train_mse = 0.0
+    else:
+        mean_train_loss = train_loss_sum / n_train
+        mean_train_recon = train_recon_sum / n_train
+        mean_train_kl = train_kl_sum / n_train
+        mean_train_mse = train_mse_sum / n_train
+
+    if n_val == 0:
+        mean_val_loss = mean_val_recon = mean_val_kl = mean_val_mse = 0.0
+    else:
+        mean_val_loss = val_loss_sum / n_val
+        mean_val_recon = val_recon_sum / n_val
+        mean_val_kl = val_kl_sum / n_val
+        mean_val_mse = val_mse_sum / n_val
+
+    return (
+        mean_train_loss,
+        mean_train_recon,
+        mean_train_kl,
+        mean_train_mse,
+        mean_val_loss,
+        mean_val_recon,
+        mean_val_kl,
+        mean_val_mse,
+    )
 
 
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--genotype", required=True)
-    p.add_argument("--meta", required=True)
-    p.add_argument("--outdir", required=True)
-
-    # model size
-    p.add_argument("--latent-dim", type=int, default=32)
-    p.add_argument("--hidden-dim", type=int, default=512)
-    p.add_argument("--depth", type=int, default=6)
-
-    # training
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--epochs-tune", type=int, default=40)
-    p.add_argument("--lr", type=float, default=1e-4)
-
-    # data splits
-    p.add_argument("--tune-fraction", type=float, default=0.2)
-    p.add_argument("--val-fraction", type=float, default=0.1)
-
-    # beta grid (for hyperparameter search)
-    p.add_argument(
-        "--beta-grid",
-        type=str,
-        default="0.0,0.001,0.01,0.1,1.0",
-        help="Comma-separated list of beta values to try.",
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--genotype", required=True)
+    parser.add_argument("--meta", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument(
+        "--model-config",
+        required=True,
+        help="YAML file with 'model' and 'training' sections.",
     )
-
-    p.add_argument("--seed", type=int, default=42)
-
-    args = p.parse_args()
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    args = parser.parse_args()
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------------------
-    # Load data
+    # Load YAML config
     # -------------------------------------------------------------
-    # Expect raw diploid genotypes as 0/1/2 in the .npy file.
-    geno_raw = np.load(args.genotype)  # (individuals, SNPs)
-    geno_raw = geno_raw.astype(np.float32)
+    with open(args.model_config) as f:
+        cfg = yaml.safe_load(f)
 
-    # Sanity check raw values
-    raw_min = float(np.nanmin(geno_raw))
-    raw_max = float(np.nanmax(geno_raw))
-    print(f"Raw genotype stats: min={raw_min}, max={raw_max}")
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("training", {})
 
-    # If there are NaNs, replace with 0 for now (or you can choose a better imputation)
-    if np.isnan(geno_raw).any():
-        print("Warning: NaNs found in genotype array; replacing with 0.")
-        geno_raw = np.nan_to_num(geno_raw, nan=0.0)
+    latent_dim = int(model_cfg.get("latent_dim", 32))
+    hidden_dim = int(model_cfg.get("hidden_dim", 512))
+    depth = int(model_cfg.get("depth", 6))
+    # If you later add more knobs (activation, batchnorm, dropout), read them here.
 
-    # If any values are outside [0, 2], clip them to [0, 2].
-    # This avoids BCE crashing, and keeps things in a sensible range.
-    bad_mask = (geno_raw < 0.0) | (geno_raw > 2.0)
-    if np.any(bad_mask):
-        num_bad = int(np.sum(bad_mask))
-        frac_bad = num_bad / geno_raw.size
-        print(
-            f"Warning: found {num_bad} genotype entries ({frac_bad:.4%}) "
-            "outside [0,2]. Clipping them into [0,2]."
+    batch_size = int(train_cfg.get("batch_size", 128))
+    epochs = int(train_cfg.get("epochs", 100))
+    epochs_tune = int(train_cfg.get("epochs_tune", 40))
+    lr = float(train_cfg.get("lr", 1e-4))
+    tune_fraction = float(train_cfg.get("tune_fraction", 0.2))
+    val_fraction = float(train_cfg.get("val_fraction", 0.1))
+    seed = int(train_cfg.get("seed", 42))
+
+    raw_beta_grid = train_cfg.get("beta_grid", [0.0, 0.001, 0.01, 0.1, 1.0])
+    if isinstance(raw_beta_grid, str):
+        beta_grid = [float(x) for x in raw_beta_grid.split(",") if x.strip() != ""]
+    else:
+        beta_grid = [float(x) for x in raw_beta_grid]
+
+    print("=== Loaded VAE config ===")
+    print("Model:", model_cfg)
+    print("Training:", train_cfg)
+    print(f"Using beta_grid: {beta_grid}")
+
+    # -------------------------------------------------------------
+    # Reproducibility-ish
+    # -------------------------------------------------------------
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Prepare CSV for per-batch logging (tuning + final)
+    batch_csv_path = outdir / "vae_batch_losses.csv"
+    with batch_csv_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "phase",  # "tune" or "final"
+                "epoch",  # 1-based epoch index
+                "batch_idx",  # 0,1,2,...
+                "split",  # "train" or "val"
+                "loss",
+                "recon",
+                "kl",
+                "mse",
+            ]
         )
-        geno_raw = np.clip(geno_raw, 0.0, 2.0)
 
-    # Always scale to [0,1] like popVAE: 0,1,2 → 0,0.5,1
-    geno_scaled = geno_raw / 2.0
-
-    # Final safety check for BCE: everything must be in [0,1].
-    scaled_min = float(np.min(geno_scaled))
-    scaled_max = float(np.max(geno_scaled))
-    print(f"Scaled genotype stats (for BCE): min={scaled_min}, max={scaled_max}")
-
-    if scaled_min < 0.0 or scaled_max > 1.0:
-        raise ValueError(
-            f"Scaled genotype values are outside [0,1]: min={scaled_min}, max={scaled_max}"
-        )
-
-
+    # -------------------------------------------------------------
+    # Load data: genotypes + metadata
+    #   Expect diploid genotypes ~ {0,1,2}.
+    #   We always internally scale to [0,1] by /2 for training,
+    #   mirroring popVAE's 0, 0.5, 1 representation.
+    # -------------------------------------------------------------
+    geno = np.load(args.genotype)  # shape: (individuals, SNPs)
     with open(args.meta, "rb") as f:
         meta = pickle.load(f)
     pops = np.array(meta["population"])
 
+    g_min = float(np.nanmin(geno))
+    g_max = float(np.nanmax(geno))
+    print(f"Raw genotype stats: min={g_min}, max={g_max}")
+
+    # If things are already in [0,1], assume upstream scaling and bring back to ~{0,1,2}
+    if g_max <= 1.0 + 1e-6:
+        print("Detected genotypes scaled to [0,1]; rescaling back to ~{0,1,2} by *2.")
+        geno = np.clip(geno, 0.0, 1.0) * 2.0
+        g_min = float(np.nanmin(geno))
+        g_max = float(np.nanmax(geno))
+        print(f"Post-rescale genotype stats: min={g_min}, max={g_max}")
+    else:
+        print("Assuming raw diploid genotypes (0,1,2) or close.")
+
+    # Clip any stray garbage (e.g. rare 3/4 from upstream bugs)
+    if g_min < 0.0 or g_max > 2.0:
+        bad = np.sum((geno < 0.0) | (geno > 2.0))
+        frac_bad = bad / geno.size
+        print(
+            f"Warning: found {bad} genotype entries ({frac_bad:.4%}) "
+            "outside [0,2]. Clipping them into [0,2]."
+        )
+        geno = np.clip(geno, 0.0, 2.0)
+        g_min = float(np.nanmin(geno))
+        g_max = float(np.nanmax(geno))
+        print(f"Post-clip genotype stats: min={g_min}, max={g_max}")
+
+    # Define dosage and scaled versions:
+    # - geno_dosage: 0/1/2 (used for interpretation / LD)
+    # - geno_scaled: in [0,1] via /2 (used for training)
+    geno_dosage = geno.astype(np.float32)
+    geno_scaled = geno_dosage / 2.0
+    print(
+        f"Scaled genotype stats (dosage/2): "
+        f"min={float(geno_scaled.min()):.4f}, max={float(geno_scaled.max()):.4f}"
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    X = torch.tensor(geno_scaled, dtype=torch.float32)  # scaled genotypes in [0,1]
-    base_ds = TensorDataset(X)
-    N = X.shape[0]
+    # TensorDataset uses scaled genotypes for training (targets in [0,1])
+    X_scaled = torch.tensor(geno_scaled, dtype=torch.float32)
+    base_ds = TensorDataset(X_scaled)
+    N = X_scaled.shape[0]
 
     # -------------------------------------------------------------
     # Make train / tune / val splits (by indices)
     # -------------------------------------------------------------
     train_idx, tune_idx, val_idx = make_splits(
-        N, args.tune_fraction, args.val_fraction, seed=args.seed
+        N, tune_fraction, val_fraction, seed=seed
     )
     print(
         f"Split sizes -> train: {len(train_idx)}, "
         f"tune: {len(tune_idx)}, val: {len(val_idx)}"
     )
 
-    train_loader_tune = make_loader(
-        base_ds, train_idx, args.batch_size, shuffle=True
-    )
-    tune_loader = make_loader(
-        base_ds, tune_idx, args.batch_size, shuffle=False
-    )
+    train_loader_tune = make_loader(base_ds, train_idx, batch_size, shuffle=True)
+    tune_loader = make_loader(base_ds, tune_idx, batch_size, shuffle=False)
 
     # -------------------------------------------------------------
     # Hyperparameter search over beta on the tuning set
     # -------------------------------------------------------------
-    beta_grid = [float(x) for x in args.beta_grid.split(",") if x.strip() != ""]
     beta_results = []
-
     print(f"Hyperparameter search over beta values: {beta_grid}")
 
     for beta in beta_grid:
         print(f"\n=== Tuning for beta={beta} ===")
         model = GenotypeVAE(
             input_dim=geno_scaled.shape[1],
-            width=args.hidden_dim,
-            depth=args.depth,
-            latent_dim=args.latent_dim,
+            width=hidden_dim,
+            depth=depth,
+            latent_dim=latent_dim,
             beta=beta,
         ).to(device)
 
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
+        optimizer = optim.Adam(model.parameters(), lr=lr)
         best_tune_loss = float("inf")
 
-        for epoch in range(args.epochs_tune):
-            train_loss, _, _ = train_epoch(
-                model, train_loader_tune, optimizer, device, beta
-            )
-            tune_loss, _, _ = eval_epoch(
-                model, tune_loader, device, beta
+        for epoch in range(epochs_tune):
+            (
+                train_loss,
+                train_rec,
+                train_kl,
+                train_mse,
+                tune_loss,
+                tune_rec,
+                tune_kl,
+                tune_mse,
+            ) = train_interleaved_epoch(
+                model,
+                train_loader_tune,
+                tune_loader,
+                optimizer,
+                device,
+                beta,
+                phase="tune",
+                epoch=epoch + 1,
+                batch_csv_path=batch_csv_path,
             )
 
             if tune_loss < best_tune_loss:
@@ -268,7 +410,10 @@ def main():
 
             print(
                 f"[tune][beta={beta:.4g}][epoch={epoch+1:03d}] "
-                f"train={train_loss:.4f} | tune={tune_loss:.4f}"
+                f"train_loss={train_loss:.4f}, train_rec={train_rec:.4f}, "
+                f"train_KL={train_kl:.4f}, train_MSE={train_mse:.6f} | "
+                f"tune_loss={tune_loss:.4f}, tune_rec={tune_rec:.4f}, "
+                f"tune_KL={tune_kl:.4f}, tune_MSE={tune_mse:.6f}"
             )
 
         beta_results.append({"beta": beta, "best_tune_loss": best_tune_loss})
@@ -284,8 +429,8 @@ def main():
             {
                 "beta_results": beta_results,
                 "best_beta": best_beta,
-                "tune_fraction": args.tune_fraction,
-                "val_fraction": args.val_fraction,
+                "tune_fraction": tune_fraction,
+                "val_fraction": val_fraction,
             },
             f,
             indent=2,
@@ -297,39 +442,64 @@ def main():
     #   - validate on val
     # -------------------------------------------------------------
     final_train_idx = np.concatenate([train_idx, tune_idx])
-    final_train_loader = make_loader(
-        base_ds, final_train_idx, args.batch_size, shuffle=True
-    )
-    final_val_loader = make_loader(
-        base_ds, val_idx, args.batch_size, shuffle=False
-    )
+    final_train_loader = make_loader(base_ds, final_train_idx, batch_size, shuffle=True)
+    final_val_loader = make_loader(base_ds, val_idx, batch_size, shuffle=False)
 
     model = GenotypeVAE(
         input_dim=geno_scaled.shape[1],
-        width=args.hidden_dim,
-        depth=args.depth,
-        latent_dim=args.latent_dim,
+        width=hidden_dim,
+        depth=depth,
+        latent_dim=latent_dim,
         beta=best_beta,
     ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    history = {"train_loss": [], "val_loss": []}
+    history = {
+        "train_loss": [],
+        "train_recon": [],
+        "train_kl": [],
+        "train_mse": [],
+        "val_loss": [],
+        "val_recon": [],
+        "val_kl": [],
+        "val_mse": [],
+    }
 
-    for epoch in range(args.epochs):
-        train_loss, train_rec, train_kl = train_epoch(
-            model, final_train_loader, optimizer, device, beta=best_beta
-        )
-        val_loss, val_rec, val_kl = eval_epoch(
-            model, final_val_loader, device, beta=best_beta
+    for epoch in range(epochs):
+        (
+            train_loss,
+            train_rec,
+            train_kl,
+            train_mse,
+            val_loss,
+            val_rec,
+            val_kl,
+            val_mse,
+        ) = train_interleaved_epoch(
+            model,
+            final_train_loader,
+            final_val_loader,
+            optimizer,
+            device,
+            beta=best_beta,
+            phase="final",
+            epoch=epoch + 1,
+            batch_csv_path=batch_csv_path,
         )
 
         history["train_loss"].append(train_loss)
+        history["train_recon"].append(train_rec)
+        history["train_kl"].append(train_kl)
+        history["train_mse"].append(train_mse)
         history["val_loss"].append(val_loss)
+        history["val_recon"].append(val_rec)
+        history["val_kl"].append(val_kl)
+        history["val_mse"].append(val_mse)
 
         print(
             f"[final][epoch={epoch+1:03d}] "
-            f"Train={train_loss:.4f} (rec={train_rec:.4f}, KL={train_kl:.4f}) | "
-            f"Val={val_loss:.4f} (rec={val_rec:.4f}, KL={val_kl:.4f})"
+            f"Train: loss={train_loss:.4f}, rec={train_rec:.4f}, KL={train_kl:.4f}, MSE={train_mse:.6f} | "
+            f"Val: loss={val_loss:.4f}, rec={val_rec:.4f}, KL={val_kl:.4f}, MSE={val_mse:.6f}"
         )
 
     # -------------------------------------------------------------
@@ -338,11 +508,33 @@ def main():
     loss_csv = outdir / "vae_losses.csv"
     with loss_csv.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss"])
-        for i, (tr, va) in enumerate(
-            zip(history["train_loss"], history["val_loss"]), start=1
-        ):
-            writer.writerow([i, tr, va])
+        writer.writerow(
+            [
+                "epoch",
+                "train_loss",
+                "train_recon",
+                "train_kl",
+                "train_mse",
+                "val_loss",
+                "val_recon",
+                "val_kl",
+                "val_mse",
+            ]
+        )
+        for i in range(len(history["train_loss"])):
+            writer.writerow(
+                [
+                    i + 1,
+                    history["train_loss"][i],
+                    history["train_recon"][i],
+                    history["train_kl"][i],
+                    history["train_mse"][i],
+                    history["val_loss"][i],
+                    history["val_recon"][i],
+                    history["val_kl"][i],
+                    history["val_mse"][i],
+                ]
+            )
 
     plt.figure(figsize=(8, 6))
     plt.plot(history["train_loss"], label="Train Loss")
@@ -364,7 +556,7 @@ def main():
     # Latent PCA plot using full dataset (best beta)
     # -------------------------------------------------------------
     model.eval()
-    X_full = X.to(device)  # scaled genotypes
+    X_full = X_scaled.to(device)  # scaled genotypes in [0,1]
     with torch.no_grad():
         mu, logvar = model.encode(X_full)
     latent = mu.cpu().numpy()
@@ -375,22 +567,20 @@ def main():
         outdir / "latent_pca_by_population.png",
     )
 
-    # ---------------------
+    # -------------------------------------------------------------
     # Save reconstructions for LD diagnostics
-    # ---------------------
-    # We want reconstructed genotypes back on the 0/1/2 scale for LD, so unscale.
+    #   - Input is scaled genotypes X_scaled ∈ [0,1]
+    #   - Decoder outputs recon_scaled ∈ [0,1]
+    #   - We rescale to 0/1/2 dosages by *2 for LD evaluation.
+    # -------------------------------------------------------------
     model.eval()
     with torch.no_grad():
-        recon_scaled, mu, logvar = model(X_full.to(device))  # in [0,1]
+        recon_scaled, mu, logvar = model(X_full)  # recon_scaled ∈ [0,1]
     recon_scaled_np = recon_scaled.cpu().numpy()
 
-    # Unscale back to 0/1/2-ish dosage
-    recon_unscaled_np = recon_scaled_np * 2.0
-
-    # Save *unscaled* reconstructions as before (for LD analysis)
-    np.save(outdir / "recon_all.npy", recon_unscaled_np)
-
-    # Optionally, if you ever want the scaled version:
+    recon_dosage_np = recon_scaled_np * 2.0
+    np.save(outdir / "recon_all.npy", recon_dosage_np)
+    # Optionally also save scaled:
     # np.save(outdir / "recon_all_scaled.npy", recon_scaled_np)
 
 

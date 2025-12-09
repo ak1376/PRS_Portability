@@ -7,20 +7,23 @@ import torch.nn.functional as F
 
 class GenotypeVAE(nn.Module):
     """
-    Fully-connected β-VAE for genotype *dosages* scaled to [0, 1].
+    Fully-connected VAE for diploid genotype reconstruction.
 
-    Assumptions:
-      - Input X is (batch_size, num_snps) with values in [0, 1]
-        e.g. genotypes 0/1/2 scaled as 0, 0.5, 1.0.
-      - Decoder outputs are in (0,1) via sigmoid.
-      - Reconstruction loss is binary cross-entropy (BCE) over SNPs.
-      - KL term is weighted by beta (β-VAE).
+    Data:
+      - Input x: diploid genotypes per SNP, ideally in {0,1,2}.
+        (We allow small numerical noise; values are clamped into [0,2].)
 
     Architecture:
       - Encoder: depth 'depth', width 'width', ELU activations
-      - Latent: mean + logvar of size latent_dim
-      - Decoder: mirrored MLP with ELU, final sigmoid
-      - Loss: BCE reconstruction + beta * KL
+      - Latent: mean + logvar, dim = latent_dim
+      - Decoder: mirrored MLP with ELU, final sigmoid giving p in (0,1)
+      - Likelihood: Binomial(2, p)
+      - Loss: NLL_binomial(2,p | x) + beta * KL
+
+    Notes:
+      - This is *not* Bernoulli; we are modeling diploid counts correctly.
+      - You should *not* standardize x for this model; keep them as 0/1/2
+        (or 0,0.5,1 scaled that we rescale back internally).
     """
 
     def __init__(self, input_dim, width=128, depth=6, latent_dim=32, beta=1.0):
@@ -53,79 +56,79 @@ class GenotypeVAE(nn.Module):
         self.decoder_net = nn.Sequential(*dec_layers)
 
         self.out_layer = nn.Linear(width, input_dim)
-        # sigmoid at the end since *scaled* genotypes are in [0,1]
+        # output allele prob p in (0,1)
         self.out_act = nn.Sigmoid()
 
-    # -------------------------
-    # Core VAE ops
-    # -------------------------
+    # ----- core VAE pieces -----
+
     def encode(self, x):
-        """
-        x: (batch, input_dim) in [0,1]
-        returns:
-          mu, logvar: (batch, latent_dim)
-        """
         h = self.encoder_net(x)
         mu = self.mu_layer(h)
         logvar = self.logvar_layer(h)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
-        """
-        Reparameterization trick:
-          z = mu + eps * exp(0.5 * logvar)
-        """
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def decode(self, z):
-        """
-        z: (batch, latent_dim)
-        returns:
-          recon: (batch, input_dim) in (0,1)
-        """
         h = self.decoder_net(z)
-        out = self.out_act(self.out_layer(h))
-        return out
+        p = self.out_act(self.out_layer(h))  # allele probs
+        return p
 
     def forward(self, x):
-        """
-        x: (batch, input_dim) in [0,1]
-        returns:
-          recon, mu, logvar
-        """
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, mu, logvar
+        p = self.decode(z)
+        return p, mu, logvar
 
-    # -------------------------
-    # Loss (BCE + β * KL)
-    # -------------------------
-    def loss_function(self, recon, x, mu, logvar, beta=None):
+    # ----- Binomial(2,p) loss -----
+
+    @staticmethod
+    def _binomial_nll(x, p, n: float = 2.0, eps: float = 1e-7):
         """
-        Reconstruction + beta * KL.
+        Negative log-likelihood for Binomial(n=2, p) up to an additive constant.
 
-        x, recon: (batch, input_dim) in [0,1]
+        x: (batch, D)  diploid genotype counts, ideally 0,1,2.
+        p: (batch, D)  allele probabilities in (0,1) from decoder.
 
-        - Reconstruction: binary cross-entropy over all SNPs,
-          summed over features and averaged over batch.
-        - KL: standard VAE KL(q(z|x) || N(0, I)), averaged over batch.
+        We compute:
+            -log P(x | p) ∝ -[ x log p + (n - x) log(1-p) ]
+
+        The combinatorial term log C(n, x) is dropped since it does not
+        depend on p, so it does not affect gradients.
+        """
+        # clamp probabilities for numerical stability
+        p = p.clamp(eps, 1.0 - eps)
+
+        # clamp genotypes into [0, n]
+        x = x.clamp(0.0, n)
+
+        nll = -(x * torch.log(p) + (n - x) * torch.log(1.0 - p))
+        # sum over features, average over batch
+        return nll.sum(dim=1).mean()
+
+    def loss_function(self, recon_p, x, mu, logvar, beta=None):
+        """
+        Binomial(2,p) NLL + beta * KL.
+
+        Inputs:
+          recon_p: decoder output (batch, D), allele probabilities in (0,1)
+          x:       raw diploid genotypes (batch, D), expected ~ {0,1,2}
+          mu, logvar: latent parameters
+
+        Returns:
+          loss, recon_nll, kl
         """
         if beta is None:
             beta = self.beta
 
-        # BCE over all SNPs, summed over features, averaged over batch
-        # (same spirit as popVAE: per-site BCE scaled by num_snps)
-        recon_loss = F.binary_cross_entropy(
-            recon, x, reduction="sum"
-        ) / x.size(0)
+        # Reconstruction: Binomial(2,p) NLL
+        recon_nll = self._binomial_nll(x, recon_p, n=2.0)
 
-        # KL divergence term (per-sample, averaged over batch)
-        kl = -0.5 * torch.sum(
-            1 + logvar - mu.pow(2) - logvar.exp()
-        ) / x.size(0)
+        # KL divergence term (standard VAE)
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
-        loss = recon_loss + beta * kl
-        return loss, recon_loss, kl
+        loss = recon_nll + beta * kl
+        return loss, recon_nll, kl
