@@ -103,5 +103,7 @@
             95
         ]
     },
-    "engine": "msprime"
+    "engine": "msprime", 
+    "subset_snps": 5000, 
+    "subset_mode": "middle"
 }

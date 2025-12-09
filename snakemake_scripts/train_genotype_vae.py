@@ -266,6 +266,10 @@ def main():
     else:
         beta_grid = [float(x) for x in raw_beta_grid]
 
+    # ---- NEW: early stopping settings ----
+    es_patience = int(train_cfg.get("early_stopping_patience", 0))  # 0 => disabled
+    es_min_delta = float(train_cfg.get("early_stopping_min_delta", 0.0))
+
     print("=== Loaded VAE config ===")
     print("Model:", model_cfg)
     print("Training:", train_cfg)
@@ -296,9 +300,6 @@ def main():
 
     # -------------------------------------------------------------
     # Load data: genotypes + metadata
-    #   Expect diploid genotypes ~ {0,1,2}.
-    #   We always internally scale to [0,1] by /2 for training,
-    #   mirroring popVAE's 0, 0.5, 1 representation.
     # -------------------------------------------------------------
     geno = np.load(args.genotype)  # shape: (individuals, SNPs)
     with open(args.meta, "rb") as f:
@@ -333,8 +334,6 @@ def main():
         print(f"Post-clip genotype stats: min={g_min}, max={g_max}")
 
     # Define dosage and scaled versions:
-    # - geno_dosage: 0/1/2 (used for interpretation / LD)
-    # - geno_scaled: in [0,1] via /2 (used for training)
     geno_dosage = geno.astype(np.float32)
     geno_scaled = geno_dosage / 2.0
     print(
@@ -360,6 +359,11 @@ def main():
         f"Split sizes -> train: {len(train_idx)}, "
         f"tune: {len(tune_idx)}, val: {len(val_idx)}"
     )
+
+    # Save split indices for reuse (e.g., LD eval)
+    np.save(outdir / "train_idx.npy", train_idx)
+    np.save(outdir / "tune_idx.npy", tune_idx)
+    np.save(outdir / "val_idx.npy", val_idx)
 
     train_loader_tune = make_loader(base_ds, train_idx, batch_size, shuffle=True)
     tune_loader = make_loader(base_ds, tune_idx, batch_size, shuffle=False)
@@ -465,6 +469,11 @@ def main():
         "val_mse": [],
     }
 
+    # ---- NEW: early stopping state ----
+    best_val_metric = float("inf")
+    best_state_dict = None
+    epochs_no_improve = 0
+
     for epoch in range(epochs):
         (
             train_loss,
@@ -501,6 +510,25 @@ def main():
             f"Train: loss={train_loss:.4f}, rec={train_rec:.4f}, KL={train_kl:.4f}, MSE={train_mse:.6f} | "
             f"Val: loss={val_loss:.4f}, rec={val_rec:.4f}, KL={val_kl:.4f}, MSE={val_mse:.6f}"
         )
+
+        # ---- early stopping check on val_loss ----
+        if val_loss + es_min_delta < best_val_metric:
+            best_val_metric = val_loss
+            epochs_no_improve = 0
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+
+        if es_patience > 0 and epochs_no_improve >= es_patience:
+            print(
+                f"Early stopping at epoch {epoch+1} "
+                f"(best val_loss={best_val_metric:.4f}, patience={es_patience})"
+            )
+            break
+
+    # ---- restore best model before saving / downstream analyses ----
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
 
     # -------------------------------------------------------------
     # Save loss curves (CSV + PNG)
@@ -569,9 +597,6 @@ def main():
 
     # -------------------------------------------------------------
     # Save reconstructions for LD diagnostics
-    #   - Input is scaled genotypes X_scaled ∈ [0,1]
-    #   - Decoder outputs recon_scaled ∈ [0,1]
-    #   - We rescale to 0/1/2 dosages by *2 for LD evaluation.
     # -------------------------------------------------------------
     model.eval()
     with torch.no_grad():

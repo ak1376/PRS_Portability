@@ -1,4 +1,5 @@
 import json
+import yaml
 from pathlib import Path
 from snakemake.io import protected
 
@@ -8,8 +9,10 @@ TRAIN_VAE_SCRIPT    = "snakemake_scripts/train_genotype_vae.py"
 
 # Separate config for the VAE experiment (lots of CEU/YRI samples)
 EXP_CFG = "config_files/experiment_config_vae.json"
+VAE_MODEL_CFG = "config_files/vae_model_config.yaml"
 
 CFG   = json.loads(Path(EXP_CFG).read_text())
+VAE_CFG = yaml.safe_load(Path(VAE_MODEL_CFG).read_text())
 MODEL = CFG["demographic_model"]
 
 # Here we’ll just do one sid and one rep for the VAE
@@ -96,13 +99,18 @@ rule build_genotypes_for_vae:
         meta = f"{GENO_BASEDIR}/meta.pkl",
     params:
         outdir = GENO_BASEDIR,
+        subset_snps = CFG.get("subset_snps", 10000),
+        subset_mode = CFG.get("subset_mode", "random"),
+
     threads: 1
     shell:
         r"""
         python "{BUILD_VAE_INPUTS}" \
             --tree {input.tree} \
             --phenotype {input.pheno} \
-            --outdir {params.outdir}
+            --outdir {params.outdir} \
+            --subset-snps {params.subset_snps} \
+            --subset-mode {params.subset_mode}
         """
 
 ##############################################################################
@@ -112,6 +120,7 @@ rule train_vae:
     input:
         geno = f"{GENO_BASEDIR}/all_individuals.npy",
         meta = f"{GENO_BASEDIR}/meta.pkl",
+        model_cfg = "config_files/vae_model_config.yaml"
     output:
         model     = f"{VAE_BASEDIR}/genotype_vae.pt",
         losses    = f"{VAE_BASEDIR}/vae_losses.csv",
@@ -119,7 +128,6 @@ rule train_vae:
         pca_plot  = f"{VAE_BASEDIR}/latent_pca_by_population.png",
     params:
         outdir     = VAE_BASEDIR,
-        model_cfg  = "config_files/vae_model_config.yaml",
     threads: 1
     resources:
         gpus = 1
@@ -129,7 +137,7 @@ rule train_vae:
             --genotype {input.geno} \
             --meta {input.meta} \
             --outdir {params.outdir} \
-            --model-config {params.model_cfg}
+            --model-config {input.model_cfg}
         """
 
 
@@ -141,18 +149,19 @@ rule evaluate_vae_ld:
         geno  = f"{GENO_BASEDIR}/all_individuals.npy",
         meta  = f"{GENO_BASEDIR}/meta.pkl",
         model = f"{VAE_BASEDIR}/genotype_vae.pt",
+        config_file = VAE_MODEL_CFG
     output:
         summary   = f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
         scatter   = f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
         diff_hist = f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png",
     params:
         outdir     = f"{VAE_BASEDIR}/ld_eval",
-        latent_dim = 32,
-        hidden_dim = 512,
-        depth      = 6,
-        beta       = 0.0,
-        max_snps   = 500,
-        seed       = 42,
+        latent_dim = VAE_CFG["model"].get("latent_dim", 32),
+        hidden_dim = VAE_CFG["model"].get("hidden_dim", 512),
+        depth      = VAE_CFG["model"].get("depth", 6),
+        beta       = VAE_CFG["model"].get("beta", 0.0),
+        max_snps   = VAE_CFG["model"].get("max_snps", 5000),
+        seed       = VAE_CFG["model"].get("seed", 42),
     threads: 1
     resources:
         gpus = 1

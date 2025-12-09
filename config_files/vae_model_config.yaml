@@ -1,7 +1,11 @@
 model:
-  latent_dim: 32
+  latent_dim: 64
   hidden_dim: 512
-  depth: 6
+  depth: 3
+  beta: 1.0
+  max_snps: 5000
+  seed: 42
+
   # optional knobs if your GenotypeVAE supports them
   # activation: "relu"
   # use_batchnorm: false
@@ -10,10 +14,12 @@ model:
 
 training:
   batch_size: 128
-  epochs: 100
-  epochs_tune: 40
+  epochs: 2000
+  epochs_tune: 100
   lr: 1e-4
   tune_fraction: 0.2
   val_fraction: 0.1
-  beta_grid: [0.0]    # or [0.0, 0.001, 0.01, 0.1, 1.0]
+  beta_grid: [1.0]    # or [0.0, 0.001, 0.01, 0.1, 1.0]
   seed: 42
+  early_stopping_patience: 50   # 0 = disabled
+  early_stopping_min_delta: 0.0 # optional
