@@ -147,17 +147,20 @@ class GenotypeVAE(nn.Module):
         return x_dosage
 
     @staticmethod
-    def _binomial_nll(x_dosage: torch.Tensor, p: torch.Tensor, n: float = 2.0, eps: float = 1e-7):
+    def _binomial_nll(
+        x_dosage: torch.Tensor,
+        p: torch.Tensor,
+        n: float = 2.0,
+        eps: float = 1e-7,
+        mask: torch.Tensor | None = None,
+    ):
         """
-        Negative log-likelihood for Binomial(n=2, p) up to an additive constant.
+        Negative log-likelihood for Binomial(n=2, p).
 
         x_dosage: (batch, D)  diploid genotype counts (0,1,2)
         p:        (batch, D)  allele probabilities in (0,1) from decoder.
-
-        We compute (dropping log C(n,x) term):
-            -log P(x | p) ∝ -[ x log p + (n - x) log(1-p) ]
-
-        Returns scalar NLL averaged over batch.
+        mask:     optional boolean tensor (batch, D). If provided, NLL is
+                  averaged only over entries where mask == True.
         """
         # clamp probabilities for numerical stability
         p = p.clamp(eps, 1.0 - eps)
@@ -165,11 +168,29 @@ class GenotypeVAE(nn.Module):
         # clamp x for safety
         x_dosage = x_dosage.clamp(0.0, n)
 
+        # elementwise NLL
         nll = -(x_dosage * torch.log(p) + (n - x_dosage) * torch.log(1.0 - p))
+
+        if mask is not None:
+            # restrict to masked positions only
+            mask_f = mask.to(dtype=nll.dtype)
+            total = mask_f.sum()
+            if total > 0:
+                return (nll * mask_f).sum() / total
+            # if no masked entries (edge case), fall back to full loss
+
         # sum over features, average over batch
         return nll.sum(dim=1).mean()
 
-    def loss_function(self, recon_p: torch.Tensor, x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, beta=None):
+    def loss_function(
+        self,
+        recon_p: torch.Tensor,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        beta=None,
+        mask: torch.Tensor | None = None,
+    ):
         """
         Binomial(2,p) NLL + beta * KL.
 
@@ -179,6 +200,9 @@ class GenotypeVAE(nn.Module):
                      - raw dosages ~ {0,1,2}, OR
                      - scaled dosages ~ {0.0,0.5,1.0}
           mu, logvar: latent parameters
+          mask:    optional boolean tensor (batch, D). If provided, the
+                   reconstruction term is computed **only** on entries where
+                   mask == True (i.e., masked positions).
 
         Returns:
           loss, recon_nll, kl
@@ -189,11 +213,14 @@ class GenotypeVAE(nn.Module):
         # Make sure x is in dosage units
         x_dosage = self._prepare_dosage(x, n=2.0)
 
-        # Reconstruction: Binomial(2,p) NLL
-        recon_nll = self._binomial_nll(x_dosage, recon_p, n=2.0)
+        # Reconstruction: Binomial(2,p) NLL (optionally masked)
+        recon_nll = self._binomial_nll(x_dosage, recon_p, n=2.0, mask=mask)
 
         # KL divergence term (standard VAE)
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        kl = -0.5 * torch.sum(
+            1 + logvar - mu.pow(2) - logvar.exp(),
+            dim=1,
+        ).mean()
 
         loss = recon_nll + beta * kl
         return loss, recon_nll, kl

@@ -62,6 +62,37 @@ def make_loader(base_ds, idx, batch_size, shuffle):
     subset = Subset(base_ds, idx)
     return DataLoader(subset, batch_size=batch_size, shuffle=shuffle)
 
+def apply_mask(x, mask_perc: float, mask_value: float = 0.5):
+    """
+    Randomly mask a fraction `mask_perc` of entries in x.
+
+    x: (batch, D) scaled genotypes in [0,1]
+    Returns:
+      x_in:  masked input  (same shape as x)
+      mask:  boolean tensor (batch, D) where True = masked position
+
+    If mask_perc <= 0, returns (x, None).
+    """
+    if mask_perc <= 0.0:
+        return x, None
+
+    # same shape as x; True with probability mask_perc
+    mask = (torch.rand_like(x) < mask_perc)
+    x_in = x.clone()
+    x_in[mask] = mask_value  # e.g., 0.5 (heterozygote / "average" value)
+    return x_in, mask
+
+def masked_mse(pred, target, mask=None):
+    """
+    MSE, optionally restricted to positions where mask == True.
+    """
+    if mask is not None and mask.any():
+        diff = pred[mask] - target[mask]
+        return (diff ** 2).mean()
+    else:
+        return F.mse_loss(pred, target, reduction="mean")
+
+
 
 def train_interleaved_epoch(
     model,
@@ -73,6 +104,7 @@ def train_interleaved_epoch(
     phase,
     epoch,
     batch_csv_path=None,
+    mask_perc: float = 0.0,
 ):
     """
     Interleaved train + val per batch.
@@ -107,17 +139,22 @@ def train_interleaved_epoch(
 
     try:
         for batch in train_loader:
-            x_train = batch[0].to(device)  # scaled genotypes ∈ [0,1]
-            bs = x_train.size(0)
+            x_orig = batch[0].to(device)  # scaled genotypes ∈ [0,1]
+            bs = x_orig.size(0)
             n_train += bs
+
+            # ---- apply masking to inputs ----
+            x_in, mask = apply_mask(x_orig, mask_perc)
 
             # ---- train step ----
             optimizer.zero_grad()
-            recon, mu, logvar = model(x_train)
+            recon, mu, logvar = model(x_in)
+
+            # loss is computed **against the original x**, but only on masked entries if mask_perc > 0
             loss, recon_loss, kl_loss = model.loss_function(
-                recon, x_train, mu, logvar, beta=beta
+                recon, x_orig, mu, logvar, beta=beta, mask=mask
             )
-            mse = F.mse_loss(recon, x_train, reduction="mean")
+            mse = masked_mse(recon, x_orig, mask=mask)
 
             loss.backward()
             optimizer.step()
@@ -153,16 +190,17 @@ def train_interleaved_epoch(
                     batch_idx += 1
                     continue
 
-            x_val = vbatch[0].to(device)
-            vbs = x_val.size(0)
+            x_val_orig = vbatch[0].to(device)
+            vbs = x_val_orig.size(0)
             if vbs > 0:
                 model.eval()
                 with torch.no_grad():
-                    v_recon, v_mu, v_logvar = model(x_val)
+                    x_val_in, vmask = apply_mask(x_val_orig, mask_perc)
+                    v_recon, v_mu, v_logvar = model(x_val_in)
                     v_loss, v_recon_loss, v_kl_loss = model.loss_function(
-                        v_recon, x_val, v_mu, v_logvar, beta=beta
+                        v_recon, x_val_orig, v_mu, v_logvar, beta=beta, mask=vmask
                     )
-                    v_mse = F.mse_loss(v_recon, x_val, reduction="mean")
+                    v_mse = masked_mse(v_recon, x_val_orig, mask=vmask)
 
                 model.train()
 
@@ -233,6 +271,11 @@ def main():
         required=True,
         help="YAML file with 'model' and 'training' sections.",
     )
+    # Individual parameter overrides for grid search
+    parser.add_argument("--latent-dim", type=int, help="Override latent_dim from config")
+    parser.add_argument("--hidden-dim", type=int, help="Override hidden_dim from config") 
+    parser.add_argument("--depth", type=int, help="Override depth from config")
+    parser.add_argument("--beta", type=float, help="Override beta from config")
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -247,9 +290,11 @@ def main():
     model_cfg = cfg.get("model", {})
     train_cfg = cfg.get("training", {})
 
-    latent_dim = int(model_cfg.get("latent_dim", 32))
-    hidden_dim = int(model_cfg.get("hidden_dim", 512))
-    depth = int(model_cfg.get("depth", 6))
+    # Use command-line overrides if provided, otherwise fall back to config
+    latent_dim = args.latent_dim if args.latent_dim is not None else int(model_cfg.get("latent_dim", 32))
+    hidden_dim = args.hidden_dim if args.hidden_dim is not None else int(model_cfg.get("hidden_dim", 512))
+    depth = args.depth if args.depth is not None else int(model_cfg.get("depth", 6))
+    beta_override = args.beta if args.beta is not None else None
     # If you later add more knobs (activation, batchnorm, dropout), read them here.
 
     batch_size = int(train_cfg.get("batch_size", 128))
@@ -269,11 +314,15 @@ def main():
     # ---- NEW: early stopping settings ----
     es_patience = int(train_cfg.get("early_stopping_patience", 0))  # 0 => disabled
     es_min_delta = float(train_cfg.get("early_stopping_min_delta", 0.0))
+    mask_perc = float(train_cfg.get("mask_perc", 0.0))
+
 
     print("=== Loaded VAE config ===")
     print("Model:", model_cfg)
     print("Training:", train_cfg)
     print(f"Using beta_grid: {beta_grid}")
+    print(f"Masking fraction (mask_perc): {mask_perc}")
+
 
     # -------------------------------------------------------------
     # Reproducibility-ish
@@ -407,6 +456,7 @@ def main():
                 phase="tune",
                 epoch=epoch + 1,
                 batch_csv_path=batch_csv_path,
+                mask_perc=mask_perc,
             )
 
             if tune_loss < best_tune_loss:
@@ -494,6 +544,8 @@ def main():
             phase="final",
             epoch=epoch + 1,
             batch_csv_path=batch_csv_path,
+            # IMPORTANT: pass mask_perc here too
+            mask_perc=mask_perc,
         )
 
         history["train_loss"].append(train_loss)

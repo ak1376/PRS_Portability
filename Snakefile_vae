@@ -2,6 +2,7 @@ import json
 import yaml
 from pathlib import Path
 from snakemake.io import protected
+from itertools import product
 
 SIM_SCRIPT          = "snakemake_scripts/simulation.py"
 BUILD_VAE_INPUTS    = "snakemake_scripts/build_genotypes_for_vae.py"
@@ -21,6 +22,26 @@ REPS     = int(CFG.get("num_replicates", 1))
 
 SID_RANGE = range(NUM_GRID)
 REP_RANGE = range(REPS)
+
+# Grid parameters for hyperparameter search
+LATENT_DIMS = VAE_CFG["model"]["latent_dim_grid"]
+HIDDEN_DIMS = VAE_CFG["model"]["hidden_dim_grid"] 
+DEPTHS = VAE_CFG["model"]["depth_grid"]
+BETAS = VAE_CFG["training"]["beta_grid"]
+
+# Generate all parameter combinations
+PARAM_COMBINATIONS = list(product(LATENT_DIMS, HIDDEN_DIMS, DEPTHS, BETAS))
+PARAM_IDS = [f"ld{ld}_hd{hd}_d{d}_b{str(b).replace('.', 'p')}" 
+             for ld, hd, d, b in PARAM_COMBINATIONS]
+
+# Helper function to parse parameter ID back to values
+def parse_param_id(param_id):
+    parts = param_id.split('_')
+    latent_dim = int(parts[0][2:])  # remove 'ld'
+    hidden_dim = int(parts[1][2:])  # remove 'hd' 
+    depth = int(parts[2][1:])       # remove 'd'
+    beta = float(parts[3][1:].replace('p', '.'))  # remove 'b' and replace 'p' with '.'
+    return latent_dim, hidden_dim, depth, beta
 
 # Directories for this VAE experiment
 SIM_BASEDIR   = f"experiments/{MODEL}/vae_sims"
@@ -43,20 +64,22 @@ rule all:
         # VAE inputs
         f"{GENO_BASEDIR}/all_individuals.npy",
         f"{GENO_BASEDIR}/meta.pkl",
-        # VAE training outputs
-        f"{VAE_BASEDIR}/genotype_vae.pt",
-        f"{VAE_BASEDIR}/vae_losses.csv",
-        f"{VAE_BASEDIR}/vae_loss_curves.png",
-        f"{VAE_BASEDIR}/latent_pca_by_population.png",
-        # VAE LD evaluation outputs
-        f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
-        f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
-        f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png"
+        # VAE training outputs for all parameter combinations
+        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png", param_id=PARAM_IDS),
+        # VAE LD evaluation outputs for all parameter combinations
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png", param_id=PARAM_IDS)
 
 ##############################################################################
 # RULE simulate – one big simulation for VAE                                 #
 ##############################################################################
 rule simulate:
+    input:
+        cfg = EXP_CFG
     output:
         sfs       = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/SFS.pkl",
         params    = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/sampled_params.pkl",
@@ -68,8 +91,7 @@ rule simulate:
         done      = protected(f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/.done"),
     params:
         sim_dir = SIM_BASEDIR,
-        cfg     = EXP_CFG,
-        model   = MODEL,
+        model   = MODEL
     threads: 1
     shell:
         r"""
@@ -77,7 +99,7 @@ rule simulate:
 
         python "{SIM_SCRIPT}" \
           --simulation-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}" \
-          --experiment-config "{params.cfg}" \
+          --experiment-config "{input.cfg}" \
           --model-type "{params.model}" \
           --simulation-number {wildcards.sid} \
           --replicate {wildcards.rep} \
@@ -99,8 +121,8 @@ rule build_genotypes_for_vae:
         meta = f"{GENO_BASEDIR}/meta.pkl",
     params:
         outdir = GENO_BASEDIR,
-        subset_snps = CFG.get("subset_snps", 10000),
-        subset_mode = CFG.get("subset_mode", "random"),
+        subset_snps = VAE_CFG.get("subset_snps", 10000),
+        subset_mode = VAE_CFG.get("subset_mode", "random"),
 
     threads: 1
     shell:
@@ -122,12 +144,16 @@ rule train_vae:
         meta = f"{GENO_BASEDIR}/meta.pkl",
         model_cfg = "config_files/vae_model_config.yaml"
     output:
-        model     = f"{VAE_BASEDIR}/genotype_vae.pt",
-        losses    = f"{VAE_BASEDIR}/vae_losses.csv",
-        loss_plot = f"{VAE_BASEDIR}/vae_loss_curves.png",
-        pca_plot  = f"{VAE_BASEDIR}/latent_pca_by_population.png",
+        model     = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
+        losses    = f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv",
+        loss_plot = f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png",
+        pca_plot  = f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png",
     params:
-        outdir     = VAE_BASEDIR,
+        outdir     = f"{VAE_BASEDIR}/{{wildcards.param_id}}",
+        latent_dim = lambda wildcards: parse_param_id(wildcards.param_id)[0],
+        hidden_dim = lambda wildcards: parse_param_id(wildcards.param_id)[1],
+        depth      = lambda wildcards: parse_param_id(wildcards.param_id)[2],
+        beta       = lambda wildcards: parse_param_id(wildcards.param_id)[3],
     threads: 1
     resources:
         gpus = 1
@@ -137,7 +163,11 @@ rule train_vae:
             --genotype {input.geno} \
             --meta {input.meta} \
             --outdir {params.outdir} \
-            --model-config {input.model_cfg}
+            --model-config {input.model_cfg} \
+            --latent-dim {params.latent_dim} \
+            --hidden-dim {params.hidden_dim} \
+            --depth {params.depth} \
+            --beta {params.beta}
         """
 
 
@@ -148,20 +178,18 @@ rule evaluate_vae_ld:
     input:
         geno  = f"{GENO_BASEDIR}/all_individuals.npy",
         meta  = f"{GENO_BASEDIR}/meta.pkl",
-        model = f"{VAE_BASEDIR}/genotype_vae.pt",
+        model = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
         config_file = VAE_MODEL_CFG
     output:
-        summary   = f"{VAE_BASEDIR}/ld_eval/ld_comparison_summary.txt",
-        scatter   = f"{VAE_BASEDIR}/ld_eval/ld_scatter_orig_vs_recon.png",
-        diff_hist = f"{VAE_BASEDIR}/ld_eval/ld_difference_hist.png",
+        summary   = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt",
+        scatter   = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png",
+        diff_hist = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png",
     params:
-        outdir     = f"{VAE_BASEDIR}/ld_eval",
-        latent_dim = VAE_CFG["model"].get("latent_dim", 32),
-        hidden_dim = VAE_CFG["model"].get("hidden_dim", 512),
-        depth      = VAE_CFG["model"].get("depth", 6),
-        beta       = VAE_CFG["model"].get("beta", 0.0),
-        max_snps   = VAE_CFG["model"].get("max_snps", 5000),
-        seed       = VAE_CFG["model"].get("seed", 42),
+        outdir     = f"{VAE_BASEDIR}/{{wildcards.param_id}}/ld_eval",
+        latent_dim = lambda wildcards: parse_param_id(wildcards.param_id)[0],
+        hidden_dim = lambda wildcards: parse_param_id(wildcards.param_id)[1],
+        depth      = lambda wildcards: parse_param_id(wildcards.param_id)[2],
+        beta       = lambda wildcards: parse_param_id(wildcards.param_id)[3],
     threads: 1
     resources:
         gpus = 1
@@ -176,7 +204,7 @@ rule evaluate_vae_ld:
             --hidden-dim {params.hidden_dim} \
             --depth {params.depth} \
             --beta {params.beta} \
-            --max-snps {params.max_snps} \
-            --seed {params.seed}
+            --max-snps 5000 \
+            --seed 42
         """
 
