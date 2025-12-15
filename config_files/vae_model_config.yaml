@@ -1,15 +1,28 @@
 model:
-  latent_dim_grid: [2, 8, 16, 32]
-  hidden_dim_grid: [256, 512, 1024]
-  depth_grid: [1, 3, 6]
+  arch: cnn   # <-- "mlp" or "cnn"
+
+  # common knobs
   max_snps: 1200
   seed: 42
+  subset_snps: 10000
+  subset_mode: random
+  deterministic_latent: false
 
-  # optional knobs if your GenotypeVAE supports them
-  # activation: "relu"
-  # use_batchnorm: false
-  # dropout: 0.0
-  # deterministic_latent: false  # if you add this later
+  # grid (keep using your param_id grid if you want)
+  latent_dim_grid: [16]  # Single latent dimension
+
+  # ---- MLP-specific (only used if arch: mlp) ----
+  mlp:
+    hidden_dim_grid: [512]
+    depth_grid: [3]
+
+  # ---- CNN-specific (only used if arch: cnn) ----
+  cnn:
+    channels_grid:
+      - [32, 64, 128]      # Single medium network
+    kernel_size_grid: [5]   # Single kernel size
+    dropout_grid: [0.1]     # Single dropout rate
+    use_batchnorm: [true]   # can also be a grid if you want
 
 training:
   batch_size: 64
@@ -18,8 +31,8 @@ training:
   lr: 1e-4
   tune_fraction: 0.2
   val_fraction: 0.1
-  beta_grid: [0.0, 0.001, 0.01, 0.1, 1.0]
+  beta_grid: [0.01]  # Single beta value
   seed: 42
-  early_stopping_patience: 50   # 0 = disabled
-  early_stopping_min_delta: 0.0 # optional
+  early_stopping_patience: 50
+  early_stopping_min_delta: 0.0
   mask_perc: 0.0

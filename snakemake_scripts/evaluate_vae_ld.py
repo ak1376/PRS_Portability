@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.genotype_vae import GenotypeVAE  # type: ignore
+from src.genotype_vae import GenotypeVAE, GenotypeCNNVAE  # type: ignore
 
 
 def compute_ld_matrix(G: np.ndarray) -> np.ndarray:
@@ -48,6 +48,11 @@ def main():
     p.add_argument("--hidden-dim", type=int, default=512)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--beta", type=float, default=0.0)
+    p.add_argument("--arch", type=str, default="mlp", choices=["mlp", "cnn"], help="Architecture type")
+    p.add_argument("--channels", type=str, default="32,64,128", help="CNN channel configuration (comma-separated)")
+    p.add_argument("--kernel-size", type=int, default=5, help="CNN kernel size")
+    p.add_argument("--dropout", type=float, default=0.0, help="CNN dropout rate")
+    p.add_argument("--use-batchnorm", type=int, default=1, help="CNN use batch normalization (1=True, 0=False)")
 
     # NOTE: kept only for Snakemake compatibility; we do NOT use this
     p.add_argument(
@@ -167,13 +172,27 @@ def main():
     # -----------------------------
     # Build same architecture as in training
     # -----------------------------
-    model = GenotypeVAE(
-        input_dim=M,
-        width=args.hidden_dim,
-        depth=args.depth,
-        latent_dim=args.latent_dim,
-        beta=args.beta,
-    ).to(device)
+    if args.arch == "cnn":
+        # Parse channel configuration
+        channels = tuple(int(c) for c in args.channels.split(","))
+        model = GenotypeCNNVAE(
+            input_dim=M,
+            latent_dim=args.latent_dim,
+            channels=channels,
+            kernel_size=args.kernel_size,
+            dropout=args.dropout,
+            use_batchnorm=bool(args.use_batchnorm),
+            beta=args.beta,
+        ).to(device)
+    else:
+        # MLP architecture
+        model = GenotypeVAE(
+            input_dim=M,
+            width=args.hidden_dim,
+            depth=args.depth,
+            latent_dim=args.latent_dim,
+            beta=args.beta,
+        ).to(device)
 
     state = torch.load(args.model, map_location=device)
     model.load_state_dict(state)

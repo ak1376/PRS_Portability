@@ -1,0 +1,6 @@
+.snakemake/
+results/
+lightning_logs/
+archived/
+experiments/
+__pycache__/

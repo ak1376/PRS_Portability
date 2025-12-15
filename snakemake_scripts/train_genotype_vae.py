@@ -5,6 +5,7 @@ import json
 import pickle
 import sys
 from pathlib import Path
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.genotype_vae import GenotypeVAE
+from src.genotype_vae import GenotypeVAE, GenotypeCNNVAE
+
 from src.plotting_helpers import plot_latent_pca
 
 
@@ -257,6 +259,69 @@ def train_interleaved_epoch(
         mean_val_mse,
     )
 
+def _parse_channels(s):
+    """
+    Accepts:
+      - "32-64-128-256"
+      - "32,64,128,256"
+      - "[32, 64, 128, 256]"  (YAML-ish string)
+    Returns tuple[int,...] or None if s is empty/None.
+    """
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "" or s.lower() == "none":
+        return None
+    s = s.strip("[]()")
+    parts = re.split(r"[,\- \t]+", s)
+    parts = [p for p in parts if p != ""]
+    return tuple(int(p) for p in parts)
+
+
+def build_model(
+    arch: str,
+    input_dim: int,
+    latent_dim: int,
+    beta: float,
+    deterministic_latent: bool,
+    # MLP
+    hidden_dim: int | None = None,
+    depth: int | None = None,
+    # CNN
+    channels: tuple[int, ...] | None = None,
+    kernel_size: int = 7,
+    dropout: float = 0.0,
+    use_batchnorm: bool = True,
+):
+    arch = arch.lower()
+    if arch in ("mlp", "fc", "dense"):
+        if hidden_dim is None or depth is None:
+            raise ValueError("MLP VAE requires hidden_dim and depth.")
+        return GenotypeVAE(
+            input_dim=input_dim,
+            width=hidden_dim,
+            depth=depth,
+            latent_dim=latent_dim,
+            beta=beta,
+            deterministic_latent=deterministic_latent,
+        )
+
+    if arch in ("cnn", "conv", "conv1d"):
+        if channels is None:
+            channels = (32, 64, 128, 256)
+        return GenotypeCNNVAE(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            beta=beta,
+            deterministic_latent=deterministic_latent,
+            channels=channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
+        )
+
+    raise ValueError(f"Unknown arch='{arch}'. Use 'mlp' or 'cnn'.")
+
 
 # ---------------------------------------------------------------------
 # Main
@@ -276,6 +341,14 @@ def main():
     parser.add_argument("--hidden-dim", type=int, help="Override hidden_dim from config") 
     parser.add_argument("--depth", type=int, help="Override depth from config")
     parser.add_argument("--beta", type=float, help="Override beta from config")
+
+    parser.add_argument("--arch", choices=["mlp", "cnn"], help="Override model.arch from YAML")
+    parser.add_argument("--channels", type=str, help='CNN channels, e.g. "32-64-128-256"')
+    parser.add_argument("--kernel-size", type=int, help="CNN kernel size (odd recommended)")
+    parser.add_argument("--dropout", type=float, help="CNN dropout")
+    parser.add_argument("--use-batchnorm", type=int, choices=[0, 1], help="CNN batchnorm (1/0)")
+    parser.add_argument("--deterministic-latent", type=int, choices=[0, 1], help="Use z=mu (1) or sample (0)")
+
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -291,10 +364,41 @@ def main():
     train_cfg = cfg.get("training", {})
 
     # Use command-line overrides if provided, otherwise fall back to config
+    # Which architecture?
+    arch = args.arch if args.arch is not None else str(model_cfg.get("arch", "mlp")).lower()
+
+    deterministic_latent = bool(model_cfg.get("deterministic_latent", False))
+    if args.deterministic_latent is not None:
+        deterministic_latent = bool(args.deterministic_latent)
+
+    # Common
     latent_dim = args.latent_dim if args.latent_dim is not None else int(model_cfg.get("latent_dim", 32))
-    hidden_dim = args.hidden_dim if args.hidden_dim is not None else int(model_cfg.get("hidden_dim", 512))
-    depth = args.depth if args.depth is not None else int(model_cfg.get("depth", 6))
     beta_override = args.beta if args.beta is not None else None
+
+    # MLP-only defaults (for backward compat with your old YAML)
+    hidden_dim = None
+    depth = None
+    if arch == "mlp":
+        hidden_dim = args.hidden_dim if args.hidden_dim is not None else int(model_cfg.get("hidden_dim", 512))
+        depth = args.depth if args.depth is not None else int(model_cfg.get("depth", 6))
+
+    # CNN-only defaults (pull from model_cfg["cnn"] if you follow the nested YAML suggested earlier)
+    cnn_cfg = model_cfg.get("cnn", {}) if isinstance(model_cfg.get("cnn", {}), dict) else {}
+    channels = _parse_channels(args.channels) if args.channels is not None else _parse_channels(cnn_cfg.get("channels", None))
+    kernel_size = args.kernel_size if args.kernel_size is not None else int(cnn_cfg.get("kernel_size", 7))
+    dropout = args.dropout if args.dropout is not None else float(cnn_cfg.get("dropout", 0.0))
+    use_batchnorm = bool(cnn_cfg.get("use_batchnorm", True))
+    if args.use_batchnorm is not None:
+        use_batchnorm = bool(args.use_batchnorm)
+
+    print(f"Using architecture: {arch}")
+    if arch == "cnn":
+        print(f"CNN params: channels={channels}, kernel_size={kernel_size}, dropout={dropout}, use_batchnorm={use_batchnorm}")
+    else:
+        print(f"MLP params: hidden_dim={hidden_dim}, depth={depth}")
+    print(f"latent_dim={latent_dim}, deterministic_latent={deterministic_latent}")
+
+
     # If you later add more knobs (activation, batchnorm, dropout), read them here.
 
     batch_size = int(train_cfg.get("batch_size", 128))
@@ -425,13 +529,20 @@ def main():
 
     for beta in beta_grid:
         print(f"\n=== Tuning for beta={beta} ===")
-        model = GenotypeVAE(
+        model = build_model(
+            arch=arch,
             input_dim=geno_scaled.shape[1],
-            width=hidden_dim,
-            depth=depth,
             latent_dim=latent_dim,
             beta=beta,
+            deterministic_latent=deterministic_latent,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            channels=channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
         ).to(device)
+
 
         optimizer = optim.Adam(model.parameters(), lr=lr)
         best_tune_loss = float("inf")
@@ -499,13 +610,21 @@ def main():
     final_train_loader = make_loader(base_ds, final_train_idx, batch_size, shuffle=True)
     final_val_loader = make_loader(base_ds, val_idx, batch_size, shuffle=False)
 
-    model = GenotypeVAE(
+    model = build_model(
+        arch=arch,
         input_dim=geno_scaled.shape[1],
-        width=hidden_dim,
-        depth=depth,
         latent_dim=latent_dim,
         beta=best_beta,
+        deterministic_latent=deterministic_latent,
+        hidden_dim=hidden_dim,
+        depth=depth,
+        channels=channels,
+        kernel_size=kernel_size,
+        dropout=dropout,
+        use_batchnorm=use_batchnorm,
     ).to(device)
+
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     history = {
