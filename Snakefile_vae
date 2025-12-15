@@ -104,14 +104,23 @@ rule all:
         f"{GENO_BASEDIR}/all_individuals.npy",
         f"{GENO_BASEDIR}/meta.pkl",
         # VAE training outputs for all parameter combinations
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt", param_id=PARAM_IDS),
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv", param_id=PARAM_IDS),
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png", param_id=PARAM_IDS),
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png", param_id=PARAM_IDS),
         # # VAE LD evaluation outputs for all parameter combinations
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt", param_id=PARAM_IDS),
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png", param_id=PARAM_IDS),
-        # expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png", param_id=PARAM_IDS)
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png", param_id=PARAM_IDS),
+        # LD diagnostics with heatmaps and decay plots
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_metrics.json", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_decay.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_real.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_recon.png", param_id=PARAM_IDS),
+        # Genotype reconstruction diagnostics
+        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_metrics.json", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_heatmaps.png", param_id=PARAM_IDS),
+        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/reconstruction_metrics.png", param_id=PARAM_IDS)
 
 ##############################################################################
 # RULE simulate – one big simulation for VAE                                 #
@@ -277,5 +286,101 @@ rule evaluate_vae_ld:
             --outdir "{VAE_BASEDIR}/{wildcards.param_id}/ld_eval" \
             --max-snps 5000 \
             --seed 42
+        """
+
+##############################################################################
+# RULE generate_reconstructed_genotypes – Generate full recon matrix for LD #
+##############################################################################
+rule generate_reconstructed_genotypes:
+    input:
+        geno  = f"{GENO_BASEDIR}/all_individuals.npy",
+        meta  = f"{GENO_BASEDIR}/meta.pkl", 
+        model = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
+        config_file = VAE_MODEL_CFG
+    output:
+        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
+    params:
+        latent_dim = lambda wildcards: parse_param_id(wildcards.param_id)["latent_dim"],
+        arch       = lambda wildcards: parse_param_id(wildcards.param_id)["arch"],
+        beta       = lambda wildcards: parse_param_id(wildcards.param_id)["beta"],
+        hidden_dim = lambda wc: parse_param_id(wc.param_id).get("hidden_dim", 512),
+        depth      = lambda wc: parse_param_id(wc.param_id).get("depth", 6),
+        channels   = lambda wc: ",".join(map(str, parse_param_id(wc.param_id).get("channels", [32, 64, 128]))),
+        kernel_size = lambda wc: parse_param_id(wc.param_id).get("kernel_size", 5),
+        dropout    = lambda wc: parse_param_id(wc.param_id).get("dropout", 0.0),
+        use_batchnorm = lambda wc: "1",
+    threads: 1
+    resources:
+        gpus = 1
+    shell:
+        r"""
+        python snakemake_scripts/generate_reconstructed_genotypes.py \
+            --genotype {input.geno} \
+            --meta {input.meta} \
+            --model {input.model} \
+            --output {output.recon} \
+            --arch {params.arch} \
+            --latent-dim {params.latent_dim} \
+            --hidden-dim {params.hidden_dim} \
+            --depth {params.depth} \
+            --channels {params.channels} \
+            --kernel-size {params.kernel_size} \
+            --dropout {params.dropout} \
+            --use-batchnorm {params.use_batchnorm}
+        """
+
+##############################################################################
+# RULE ld_diagnostics_heatmaps – Generate LD heatmaps and decay plots      #  
+##############################################################################
+rule ld_diagnostics_heatmaps:
+    input:
+        real  = f"{GENO_BASEDIR}/all_individuals.npy",
+        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
+    output:
+        metrics = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_metrics.json",
+        decay   = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_decay.png", 
+        heatmap_real = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_real.png",
+        heatmap_recon = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_recon.png"
+    params:
+        window_size = 500,
+        max_snps_heatmap = 500,
+        seed = 42
+    threads: 1
+    shell:
+        r"""
+        python -m src.ld_diagnostics \
+            --real {input.real} \
+            --recon {input.recon} \
+            --outdir "{VAE_BASEDIR}/{wildcards.param_id}/ld_diagnostics" \
+            --window-size {params.window_size} \
+            --max-snps-heatmap {params.max_snps_heatmap} \
+            --seed {params.seed}
+        """
+
+##############################################################################
+# RULE genotype_reconstruction_diagnostics – Genotype heatmaps and error analysis
+##############################################################################
+rule genotype_reconstruction_diagnostics:
+    input:
+        real  = f"{GENO_BASEDIR}/all_individuals.npy",
+        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
+    output:
+        metrics = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_metrics.json",
+        heatmaps = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_heatmaps.png",
+        reconstruction_metrics = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/reconstruction_metrics.png"
+    params:
+        max_individuals = 100,
+        max_snps = 1000,
+        seed = 42
+    threads: 1
+    shell:
+        r"""
+        python -m src.genotype_diagnostics \
+            --real {input.real} \
+            --recon {input.recon} \
+            --outdir "{VAE_BASEDIR}/{wildcards.param_id}/genotype_diagnostics" \
+            --max-individuals {params.max_individuals} \
+            --max-snps {params.max_snps} \
+            --seed {params.seed}
         """
 
