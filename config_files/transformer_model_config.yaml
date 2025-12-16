@@ -1,0 +1,30 @@
+grid:
+  embed_dim: [128]
+  n_heads: [8]
+  n_layers: [4]
+  ff_dim: [256]
+  dropout: [0.1]
+  pool: ["mean"]
+  lr: [1e-4]
+
+base:
+  model:
+    vocab_size: 3
+  training:
+    batch_size: 64
+    epochs: 100
+    seed: 42
+    weight_decay: 0.0
+    grad_clip: 0.0
+    num_workers: 2
+    amp: true
+  masking:
+    p_mask_site: 0.75
+    mask_both_prob: 0.5
+    mask_id: 2
+  data:
+    subset_snps: 10000
+    subset_mode: "random"
+    window_len: 512
+    window_mode: "random"
+    fixed_start: 0

@@ -5,125 +5,182 @@ from snakemake.io import protected
 from itertools import product
 import re
 
-SIM_SCRIPT          = "snakemake_scripts/simulation.py"
-BUILD_VAE_INPUTS    = "snakemake_scripts/build_genotypes_for_vae.py"
-TRAIN_VAE_SCRIPT    = "snakemake_scripts/train_genotype_vae.py"
+##############################################################################
+# Scripts
+##############################################################################
+SIM_SCRIPT       = "snakemake_scripts/simulation.py"
+BUILD_INPUTS     = "snakemake_scripts/build_genotypes_for_vae.py"
+TRAIN_TX_SCRIPT  = "snakemake_scripts/train_transformer.py"
+RECON_TX_SCRIPT  = "snakemake_scripts/reconstruct_transformer.py"
+EMB_TX_SCRIPT    = "snakemake_scripts/extract_transformer_embeddings.py"
 
-# Separate config for the VAE experiment (lots of CEU/YRI samples)
-EXP_CFG = "config_files/experiment_config_vae.json"
-VAE_MODEL_CFG = "config_files/vae_model_config.yaml"
+##############################################################################
+# Configs
+##############################################################################
+EXP_CFG     = "config_files/experiment_config_vae.json"
+TX_CFG_FILE = "config_files/transformer_model_config.yaml"
 
-CFG   = json.loads(Path(EXP_CFG).read_text())
-VAE_CFG = yaml.safe_load(Path(VAE_MODEL_CFG).read_text())
+CFG    = json.loads(Path(EXP_CFG).read_text())
+TX_CFG = yaml.safe_load(Path(TX_CFG_FILE).read_text()) or {}
+
 MODEL = CFG["demographic_model"]
 
-# Here we’ll just do one sid and one rep for the VAE
+##############################################################################
+# Expect transformer_model_config.yaml to have:
+#   grid: {...}
+#   base: {...}
+##############################################################################
+if "grid" not in TX_CFG or "base" not in TX_CFG:
+    raise ValueError(
+        f"{TX_CFG_FILE} must have top-level keys: 'grid' and 'base'. "
+        f"Found keys: {list(TX_CFG.keys())}"
+    )
+
+GRID = TX_CFG["grid"] or {}
+BASE = TX_CFG["base"] or {}
+
+# Convenience accessors
+BASE_DATA = BASE.get("data", {}) or {}
+BASE_MODEL = BASE.get("model", {}) or {}
+BASE_TRAIN = BASE.get("training", {}) or {}
+BASE_MASK  = BASE.get("masking", {}) or {}
+
+##############################################################################
+# Simulation ranges (you said one sim is enough)
+##############################################################################
 NUM_GRID = int(CFG.get("num_draws", 1))
 REPS     = int(CFG.get("num_replicates", 1))
 
 SID_RANGE = range(NUM_GRID)
 REP_RANGE = range(REPS)
 
-# Grid parameters for hyperparameter search
-ARCH = VAE_CFG["model"]["arch"]
-LATENT_DIMS = VAE_CFG["model"]["latent_dim_grid"]
+##############################################################################
+# Transformer hyperparameter grid -> param_id
+##############################################################################
+EMBED_DIMS = GRID.get("embed_dim", [128])
+N_HEADS    = GRID.get("n_heads", [8])
+N_LAYERS   = GRID.get("n_layers", [6])
+FF_DIMS    = GRID.get("ff_dim", [512])
+DROPOUTS   = GRID.get("dropout", [0.1])
+POOLS      = GRID.get("pool", ["mean"])
+LRS        = GRID.get("lr", [1e-4])
 
-if ARCH == "mlp":
-    HIDDEN_DIMS = VAE_CFG["model"]["mlp"]["hidden_dim_grid"] 
-    DEPTHS = VAE_CFG["model"]["mlp"]["depth_grid"]
-elif ARCH == "cnn":
-    # For CNN, we'll use channel configurations instead of hidden_dims
-    CHANNEL_CONFIGS = VAE_CFG["model"]["cnn"]["channels_grid"]
-    KERNEL_SIZES = VAE_CFG["model"]["cnn"]["kernel_size_grid"]
-    DROPOUTS = VAE_CFG["model"]["cnn"]["dropout_grid"]
-else:
-    raise ValueError(f"Unknown architecture: {ARCH}")
+PARAM_COMBINATIONS = list(product(EMBED_DIMS, N_HEADS, N_LAYERS, FF_DIMS, DROPOUTS, POOLS, LRS))
 
-BETAS = VAE_CFG["training"]["beta_grid"]
+PARAM_IDS = [
+    f"tx_e{e}_h{h}_L{L}_ff{ff}_do{str(do).replace('.','p')}_pool{pool}_lr{str(lr).replace('.','p')}"
+    for (e, h, L, ff, do, pool, lr) in PARAM_COMBINATIONS
+]
 
-# Generate all parameter combinations based on architecture
-if ARCH == "mlp":
-    PARAM_COMBINATIONS = list(product(LATENT_DIMS, HIDDEN_DIMS, DEPTHS, BETAS))
-    PARAM_IDS = [f"mlp_ld{ld}_h{hd}_d{d}_b{str(b).replace('.', 'p')}" 
-                 for ld, hd, d, b in PARAM_COMBINATIONS]
-elif ARCH == "cnn":
-    PARAM_COMBINATIONS = list(product(LATENT_DIMS, CHANNEL_CONFIGS, KERNEL_SIZES, DROPOUTS, BETAS))
-    PARAM_IDS = [f"cnn_ld{ld}_ch{'-'.join(map(str, ch))}_k{ks}_do{str(dr).replace('.', 'p')}_b{str(b).replace('.', 'p')}" 
-                 for ld, ch, ks, dr, b in PARAM_COMBINATIONS]
-
-# Helper function to parse parameter ID back to values
 def parse_param_id(param_id: str) -> dict:
-    # MLP: mlp_ld32_h512_d6_b0p1
-    m = re.match(r"mlp_ld(\d+)_h(\d+)_d(\d+)_b([0-9ep\-]+)$", param_id)
-    if m:
-        beta_str = m.group(4).replace('p', '.')
-        return {
-            "arch": "mlp",
-            "latent_dim": int(m.group(1)),
-            "hidden_dim": int(m.group(2)),
-            "depth": int(m.group(3)),
-            "beta": float(beta_str),
-        }
+    m = re.match(
+        r"tx_e(\d+)_h(\d+)_L(\d+)_ff(\d+)_do([0-9ep\-]+)_pool([A-Za-z0-9]+)_lr([0-9ep\-]+)$",
+        param_id,
+    )
+    if not m:
+        raise ValueError(f"Unrecognized param_id: {param_id}")
 
-    # CNN: cnn_ld32_ch32-64-128-256_k7_do0p1_b0p1
-    m = re.match(r"cnn_ld(\d+)_ch([\d\-]+)_k(\d+)_do([0-9ep\-]+)_b([0-9ep\-]+)$", param_id)
-    if m:
-        ch = tuple(int(x) for x in m.group(2).split("-"))
-        dropout_str = m.group(4).replace('p', '.')
-        beta_str = m.group(5).replace('p', '.')
-        return {
-            "arch": "cnn",
-            "latent_dim": int(m.group(1)),
-            "channels": ch,
-            "kernel_size": int(m.group(3)),
-            "dropout": float(dropout_str),
-            "beta": float(beta_str),
-        }
+    dropout = float(m.group(5).replace("p", "."))
+    pool = m.group(6)
+    lr = float(m.group(7).replace("p", "."))
 
-    raise ValueError(f"Unrecognized param_id format: {param_id}")
-
-# Directories for this VAE experiment
-SIM_BASEDIR   = f"experiments/{MODEL}/vae_sims"
-GENO_BASEDIR  = f"experiments/{MODEL}/genotypes"
-VAE_BASEDIR   = f"experiments/{MODEL}/vae"
-
-# Save the config for record-keeping
-config_path = Path(f"{SIM_BASEDIR}/config.json")
-config_path.parent.mkdir(parents=True, exist_ok=True)
-config_path.write_text(json.dumps(CFG, indent=4))
+    return dict(
+        embed_dim=int(m.group(1)),
+        n_heads=int(m.group(2)),
+        n_layers=int(m.group(3)),
+        ff_dim=int(m.group(4)),
+        dropout=dropout,
+        pool=pool,
+        lr=lr,
+    )
 
 ##############################################################################
-# RULE all – final targets                                                   #
+# Directories
+##############################################################################
+SIM_BASEDIR  = f"experiments/{MODEL}/vae_sims"
+GENO_BASEDIR = f"experiments/{MODEL}/genotypes"
+TX_BASEDIR   = f"experiments/{MODEL}/transformer"
+
+Path(SIM_BASEDIR).mkdir(parents=True, exist_ok=True)
+Path(GENO_BASEDIR).mkdir(parents=True, exist_ok=True)
+Path(TX_BASEDIR).mkdir(parents=True, exist_ok=True)
+Path(f"{SIM_BASEDIR}/config.json").write_text(json.dumps(CFG, indent=4))
+
+##############################################################################
+# RULE all
 ##############################################################################
 rule all:
     input:
-        # single big sim (sid=0, rep=0) tree + phenotype
+        # One sim (sid=0 rep=0)
         f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
         f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
-        # VAE inputs
+
+        # Build genotype inputs
         f"{GENO_BASEDIR}/all_individuals.npy",
+        f"{GENO_BASEDIR}/hap1.npy",
+        f"{GENO_BASEDIR}/hap2.npy",
         f"{GENO_BASEDIR}/meta.pkl",
-        # VAE training outputs for all parameter combinations
-        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png", param_id=PARAM_IDS),
-        # # VAE LD evaluation outputs for all parameter combinations
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png", param_id=PARAM_IDS),
-        # LD diagnostics with heatmaps and decay plots
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_metrics.json", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_decay.png", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_real.png", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_recon.png", param_id=PARAM_IDS),
-        # Genotype reconstruction diagnostics
-        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_metrics.json", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_heatmaps.png", param_id=PARAM_IDS),
-        expand(f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/reconstruction_metrics.png", param_id=PARAM_IDS)
+        f"{GENO_BASEDIR}/snp_index.npy",
+        f"{GENO_BASEDIR}/ts_individual_ids.npy",
+
+        # Per-param resolved config
+        expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
+
+        # Train transformer for all hyperparam combos
+        expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
+
+        # Uncomment if you want these computed for every param_id
+        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png", param_id=PARAM_IDS),
 
 ##############################################################################
-# RULE simulate – one big simulation for VAE                                 #
+# RULE make_tx_config – write per-param resolved YAML
+##############################################################################
+rule make_tx_config:
+    input:
+        base = TX_CFG_FILE
+    output:
+        cfg = f"{TX_BASEDIR}/{{param_id}}/config.yaml"
+    params:
+        embed_dim = lambda wc: parse_param_id(wc.param_id)["embed_dim"],
+        n_heads   = lambda wc: parse_param_id(wc.param_id)["n_heads"],
+        n_layers  = lambda wc: parse_param_id(wc.param_id)["n_layers"],
+        ff_dim    = lambda wc: parse_param_id(wc.param_id)["ff_dim"],
+        dropout   = lambda wc: parse_param_id(wc.param_id)["dropout"],
+        pool      = lambda wc: parse_param_id(wc.param_id)["pool"],
+        lr        = lambda wc: parse_param_id(wc.param_id)["lr"],
+    run:
+        tx = yaml.safe_load(Path(input.base).read_text()) or {}
+        base = tx.get("base", {}) or {}
+
+        # Deep-ish copy so we don't mutate base across jobs
+        cfg = yaml.safe_load(yaml.safe_dump(base)) or {}
+
+        cfg.setdefault("model", {})
+        cfg.setdefault("training", {})
+        cfg.setdefault("data", {})
+        cfg.setdefault("masking", {})
+
+        # Inject grid-chosen params into resolved config
+        cfg["model"]["d_model"]  = int(params.embed_dim)
+        cfg["model"]["n_heads"]  = int(params.n_heads)
+        cfg["model"]["n_layers"] = int(params.n_layers)
+        cfg["model"]["ff_dim"]   = int(params.ff_dim)
+        cfg["model"]["dropout"]  = float(params.dropout)
+        cfg["model"]["pool"]     = str(params.pool)
+
+        cfg["training"]["lr"] = float(params.lr)
+
+        Path(output.cfg).parent.mkdir(parents=True, exist_ok=True)
+        Path(output.cfg).write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+##############################################################################
+# RULE simulate
 ##############################################################################
 rule simulate:
     input:
@@ -138,13 +195,11 @@ rule simulate:
         phenotype = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/phenotype.pkl",
         done      = protected(f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/.done"),
     params:
-        sim_dir = SIM_BASEDIR,
-        model   = MODEL
+        model = MODEL
     threads: 1
     shell:
         r"""
         set -euo pipefail
-
         python "{SIM_SCRIPT}" \
           --simulation-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}" \
           --experiment-config "{input.cfg}" \
@@ -158,229 +213,124 @@ rule simulate:
         """
 
 ##############################################################################
-# RULE build_genotypes_for_vae – .trees -> all_individuals.npy + meta.pkl   #
+# RULE build_inputs – trees -> diploid + haplotype matrices + meta
 ##############################################################################
-rule build_genotypes_for_vae:
+rule build_inputs:
     input:
-        tree   = f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
-        pheno  = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
+        tree  = f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
+        pheno = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
     output:
-        geno = f"{GENO_BASEDIR}/all_individuals.npy",
-        meta = f"{GENO_BASEDIR}/meta.pkl",
+        geno    = f"{GENO_BASEDIR}/all_individuals.npy",
+        hap1    = f"{GENO_BASEDIR}/hap1.npy",
+        hap2    = f"{GENO_BASEDIR}/hap2.npy",
+        meta    = f"{GENO_BASEDIR}/meta.pkl",
+        snp_idx = f"{GENO_BASEDIR}/snp_index.npy",
+        ts_ids  = f"{GENO_BASEDIR}/ts_individual_ids.npy",
     params:
-        outdir = GENO_BASEDIR,
-        subset_snps = VAE_CFG.get("subset_snps", 10000),
-        subset_mode = VAE_CFG.get("subset_mode", "random"),
-
+        outdir      = GENO_BASEDIR,
+        subset_snps = BASE_DATA.get("subset_snps", 10000),
+        subset_mode = BASE_DATA.get("subset_mode", "random"),
     threads: 1
     shell:
         r"""
-        python "{BUILD_VAE_INPUTS}" \
-            --tree {input.tree} \
-            --phenotype {input.pheno} \
-            --outdir {params.outdir} \
-            --subset-snps {params.subset_snps} \
-            --subset-mode {params.subset_mode}
+        set -euo pipefail
+        python "{BUILD_INPUTS}" \
+            --tree "{input.tree}" \
+            --phenotype "{input.pheno}" \
+            --outdir "{params.outdir}" \
+            --subset-snps "{params.subset_snps}" \
+            --subset-mode "{params.subset_mode}"
         """
 
 ##############################################################################
-# RULE train_vae – train genotype VAE                                       #
+# RULE train_transformer – YAML-only trainer
 ##############################################################################
-rule train_vae:
+rule train_transformer:
     input:
-        geno = f"{GENO_BASEDIR}/all_individuals.npy",
-        meta = f"{GENO_BASEDIR}/meta.pkl",
-        model_cfg = "config_files/vae_model_config.yaml"
+        hap1 = f"{GENO_BASEDIR}/hap1.npy",
+        hap2 = f"{GENO_BASEDIR}/hap2.npy",
+        cfg  = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
     output:
-        model     = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
-        losses    = f"{VAE_BASEDIR}/{{param_id}}/vae_losses.csv",
-        loss_plot = f"{VAE_BASEDIR}/{{param_id}}/vae_loss_curves.png",
-        pca_plot  = f"{VAE_BASEDIR}/{{param_id}}/latent_pca_by_population.png",
-    params:
-        arch       = lambda wc: parse_param_id(wc.param_id)["arch"],
-        latent_dim = lambda wc: parse_param_id(wc.param_id)["latent_dim"],
-        beta       = lambda wc: parse_param_id(wc.param_id)["beta"],
-
-        # MLP-only
-        hidden_dim = lambda wc: parse_param_id(wc.param_id).get("hidden_dim", ""),
-        depth      = lambda wc: parse_param_id(wc.param_id).get("depth", ""),
-
-        # CNN-only (stringify nicely)
-        channels   = lambda wc: "-".join(map(str, parse_param_id(wc.param_id).get("channels", []))),
-        kernel     = lambda wc: parse_param_id(wc.param_id).get("kernel_size", ""),
-        dropout    = lambda wc: parse_param_id(wc.param_id).get("dropout", ""),
+        model  = f"{TX_BASEDIR}/{{param_id}}/model.pt",
+        losses = f"{TX_BASEDIR}/{{param_id}}/train_losses.csv",
+        plot   = f"{TX_BASEDIR}/{{param_id}}/loss_curves.png",
     threads: 1
     resources:
         gpus = 1
     shell:
         r"""
-        if [ "{params.arch}" = "mlp" ]; then
-            python "{TRAIN_VAE_SCRIPT}" \
-                --genotype {input.geno} \
-                --meta {input.meta} \
-                --outdir "{VAE_BASEDIR}/{wildcards.param_id}" \
-                --model-config {input.model_cfg} \
-                --arch {params.arch} \
-                --latent-dim {params.latent_dim} \
-                --beta {params.beta} \
-                --hidden-dim {params.hidden_dim} \
-                --depth {params.depth}
-        else
-            python "{TRAIN_VAE_SCRIPT}" \
-                --genotype {input.geno} \
-                --meta {input.meta} \
-                --outdir "{VAE_BASEDIR}/{wildcards.param_id}" \
-                --model-config {input.model_cfg} \
-                --arch {params.arch} \
-                --latent-dim {params.latent_dim} \
-                --beta {params.beta} \
-                --channels "{params.channels}" \
-                --kernel-size {params.kernel} \
-                --dropout {params.dropout}
-        fi
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+
+        python "{TRAIN_TX_SCRIPT}" \
+            --config "{input.cfg}" \
+            --hap1 "{input.hap1}" \
+            --hap2 "{input.hap2}" \
+            --out_model "{output.model}" \
+            --out_losses "{output.losses}" \
+            --out_plot "{output.plot}"
+        """
+
+rule reconstruct_transformer:
+    input:
+        hap1  = f"{GENO_BASEDIR}/hap1.npy",
+        hap2  = f"{GENO_BASEDIR}/hap2.npy",
+        cfg   = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
+        model = f"{TX_BASEDIR}/{{param_id}}/model.pt",
+    output:
+        rh1 = f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy",
+        rh2 = f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy",
+        rg  = f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy",
+    params:
+        outdir = lambda wc: f"{TX_BASEDIR}/{wc.param_id}/recon",
+    threads: 1
+    resources:
+        gpus = 1
+    shell:
+        r"""
+        set -euo pipefail
+        python "{RECON_TX_SCRIPT}" \
+            --config "{input.cfg}" \
+            --model "{input.model}" \
+            --hap1 "{input.hap1}" \
+            --hap2 "{input.hap2}" \
+            --outdir "{params.outdir}" \
+            --out-hap1 "{output.rh1}" \
+            --out-hap2 "{output.rh2}" \
+            --out-geno "{output.rg}"
         """
 
 
-
 ##############################################################################
-# RULE evaluate_vae_ld – Does the VAE preserve LD structure?                 #
+# RULE extract_embeddings – uses per-param config.yaml
 ##############################################################################
-rule evaluate_vae_ld:
+rule extract_embeddings:
     input:
         geno  = f"{GENO_BASEDIR}/all_individuals.npy",
+        hap1  = f"{GENO_BASEDIR}/hap1.npy",
+        hap2  = f"{GENO_BASEDIR}/hap2.npy",
         meta  = f"{GENO_BASEDIR}/meta.pkl",
-        model = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
-        config_file = VAE_MODEL_CFG
+        cfg   = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
+        model = f"{TX_BASEDIR}/{{param_id}}/model.pt",
     output:
-        summary   = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_comparison_summary.txt",
-        scatter   = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_scatter_orig_vs_recon.png",
-        diff_hist = f"{VAE_BASEDIR}/{{param_id}}/ld_eval/ld_difference_hist.png",
+        emb = f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy",
+        pca = f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png",
     params:
-        latent_dim = lambda wildcards: parse_param_id(wildcards.param_id)["latent_dim"],
-        arch       = lambda wildcards: parse_param_id(wildcards.param_id)["arch"],
-        beta       = lambda wildcards: parse_param_id(wildcards.param_id)["beta"],
-        hidden_dim = lambda wc: parse_param_id(wc.param_id).get("hidden_dim", 512),
-        depth      = lambda wc: parse_param_id(wc.param_id).get("depth", 6),
-        channels   = lambda wc: ",".join(map(str, parse_param_id(wc.param_id).get("channels", [32, 64, 128]))),
-        kernel_size = lambda wc: parse_param_id(wc.param_id).get("kernel_size", 5),
-        dropout    = lambda wc: parse_param_id(wc.param_id).get("dropout", 0.0),
-        use_batchnorm = lambda wc: "1",  # Default to True (most models use batchnorm)
+        outdir = lambda wc: f"{TX_BASEDIR}/{wc.param_id}/embeddings",
     threads: 1
     resources:
         gpus = 1
     shell:
         r"""
-        python snakemake_scripts/evaluate_vae_ld.py \
-            --genotype {input.geno} \
-            --meta {input.meta} \
-            --model {input.model} \
-            --latent-dim {params.latent_dim} \
-            --hidden-dim {params.hidden_dim} \
-            --depth {params.depth} \
-            --beta {params.beta} \
-            --arch {params.arch} \
-            --channels {params.channels} \
-            --kernel-size {params.kernel_size} \
-            --dropout {params.dropout} \
-            --use-batchnorm {params.use_batchnorm} \
-            --outdir "{VAE_BASEDIR}/{wildcards.param_id}/ld_eval" \
-            --max-snps 5000 \
-            --seed 42
+        set -euo pipefail
+        python "{EMB_TX_SCRIPT}" \
+            --config "{input.cfg}" \
+            --model "{input.model}" \
+            --geno "{input.geno}" \
+            --hap1 "{input.hap1}" \
+            --hap2 "{input.hap2}" \
+            --meta "{input.meta}" \
+            --outdir "{params.outdir}" \
+            --output-embeddings "{output.emb}" \
+            --output-pca "{output.pca}"
         """
-
-##############################################################################
-# RULE generate_reconstructed_genotypes – Generate full recon matrix for LD #
-##############################################################################
-rule generate_reconstructed_genotypes:
-    input:
-        geno  = f"{GENO_BASEDIR}/all_individuals.npy",
-        meta  = f"{GENO_BASEDIR}/meta.pkl", 
-        model = f"{VAE_BASEDIR}/{{param_id}}/genotype_vae.pt",
-        config_file = VAE_MODEL_CFG
-    output:
-        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
-    params:
-        latent_dim = lambda wildcards: parse_param_id(wildcards.param_id)["latent_dim"],
-        arch       = lambda wildcards: parse_param_id(wildcards.param_id)["arch"],
-        beta       = lambda wildcards: parse_param_id(wildcards.param_id)["beta"],
-        hidden_dim = lambda wc: parse_param_id(wc.param_id).get("hidden_dim", 512),
-        depth      = lambda wc: parse_param_id(wc.param_id).get("depth", 6),
-        channels   = lambda wc: ",".join(map(str, parse_param_id(wc.param_id).get("channels", [32, 64, 128]))),
-        kernel_size = lambda wc: parse_param_id(wc.param_id).get("kernel_size", 5),
-        dropout    = lambda wc: parse_param_id(wc.param_id).get("dropout", 0.0),
-        use_batchnorm = lambda wc: "1",
-    threads: 1
-    resources:
-        gpus = 1
-    shell:
-        r"""
-        python snakemake_scripts/generate_reconstructed_genotypes.py \
-            --genotype {input.geno} \
-            --meta {input.meta} \
-            --model {input.model} \
-            --output {output.recon} \
-            --arch {params.arch} \
-            --latent-dim {params.latent_dim} \
-            --hidden-dim {params.hidden_dim} \
-            --depth {params.depth} \
-            --channels {params.channels} \
-            --kernel-size {params.kernel_size} \
-            --dropout {params.dropout} \
-            --use-batchnorm {params.use_batchnorm}
-        """
-
-##############################################################################
-# RULE ld_diagnostics_heatmaps – Generate LD heatmaps and decay plots      #  
-##############################################################################
-rule ld_diagnostics_heatmaps:
-    input:
-        real  = f"{GENO_BASEDIR}/all_individuals.npy",
-        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
-    output:
-        metrics = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_metrics.json",
-        decay   = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_decay.png", 
-        heatmap_real = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_real.png",
-        heatmap_recon = f"{VAE_BASEDIR}/{{param_id}}/ld_diagnostics/ld_heatmap_recon.png"
-    params:
-        window_size = 500,
-        max_snps_heatmap = 500,
-        seed = 42
-    threads: 1
-    shell:
-        r"""
-        python -m src.ld_diagnostics \
-            --real {input.real} \
-            --recon {input.recon} \
-            --outdir "{VAE_BASEDIR}/{wildcards.param_id}/ld_diagnostics" \
-            --window-size {params.window_size} \
-            --max-snps-heatmap {params.max_snps_heatmap} \
-            --seed {params.seed}
-        """
-
-##############################################################################
-# RULE genotype_reconstruction_diagnostics – Genotype heatmaps and error analysis
-##############################################################################
-rule genotype_reconstruction_diagnostics:
-    input:
-        real  = f"{GENO_BASEDIR}/all_individuals.npy",
-        recon = f"{VAE_BASEDIR}/{{param_id}}/reconstructed_genotypes.npy"
-    output:
-        metrics = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_metrics.json",
-        heatmaps = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/genotype_heatmaps.png",
-        reconstruction_metrics = f"{VAE_BASEDIR}/{{param_id}}/genotype_diagnostics/reconstruction_metrics.png"
-    params:
-        max_individuals = 100,
-        max_snps = 1000,
-        seed = 42
-    threads: 1
-    shell:
-        r"""
-        python -m src.genotype_diagnostics \
-            --real {input.real} \
-            --recon {input.recon} \
-            --outdir "{VAE_BASEDIR}/{wildcards.param_id}/genotype_diagnostics" \
-            --max-individuals {params.max_individuals} \
-            --max-snps {params.max_snps} \
-            --seed {params.seed}
-        """
-

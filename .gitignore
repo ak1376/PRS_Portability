@@ -4,3 +4,4 @@ lightning_logs/
 archived/
 experiments/
 __pycache__/
+debugging_scripts/
