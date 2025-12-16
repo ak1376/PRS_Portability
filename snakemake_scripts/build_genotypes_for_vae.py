@@ -4,11 +4,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tskit
+import yaml
 
 
 def compute_site_stats(ts: tskit.TreeSequence) -> dict:
     """
     Compute basic genotype / site statistics from a TreeSequence.
+    Note: these are based on raw genotype_matrix() (before biallelic/MAF filters).
     """
     G_hap = ts.genotype_matrix()  # (sites, samples)
 
@@ -49,34 +51,83 @@ def _choose_contiguous_block(num_sites: int, subset_snps: int, subset_mode: str,
     return start, end
 
 
-def _extract_haps_and_diploid(ts: tskit.TreeSequence):
+def _maf_filter_mask_from_haps(G_hap_biallelic: np.ndarray, maf_threshold: float) -> tuple[np.ndarray, dict]:
+    """
+    G_hap_biallelic: (sites, samples) with alleles in {0,1}, no missing.
+    Returns:
+      - keep_mask over sites
+      - info dict with counts for logging
+    Always removes monomorphic (maf == 0).
+    Optionally removes sites with maf < maf_threshold (if maf_threshold > 0).
+    """
+    if G_hap_biallelic.size == 0:
+        keep = np.zeros((0,), dtype=bool)
+        return keep, {
+            "num_sites_in": 0,
+            "num_monomorphic_removed": 0,
+            "num_maf_removed": 0,
+            "num_sites_out": 0,
+        }
+
+    p = G_hap_biallelic.mean(axis=1)  # allele-1 frequency across hap samples
+    maf = np.minimum(p, 1.0 - p)
+
+    # Always remove monomorphic
+    keep = maf > 0.0
+    num_mono_removed = int((maf == 0.0).sum())
+
+    # Optional MAF threshold beyond monomorphic
+    num_maf_removed = 0
+    if maf_threshold is not None and maf_threshold > 0.0:
+        before = int(keep.sum())
+        keep &= (maf >= maf_threshold)
+        after = int(keep.sum())
+        num_maf_removed = before - after
+
+    info = {
+        "num_sites_in": int(G_hap_biallelic.shape[0]),
+        "num_monomorphic_removed": num_mono_removed,
+        "num_maf_removed": int(num_maf_removed),
+        "num_sites_out": int(keep.sum()),
+    }
+    return keep, info
+
+
+def _extract_haps_and_diploid(ts: tskit.TreeSequence, maf_threshold: float):
     """
     Returns:
-      - hap1: (num_valid_inds, num_biallelic_sites) float32 in {0,1}
-      - hap2: (num_valid_inds, num_biallelic_sites) float32 in {0,1}
-      - dip:  (num_valid_inds, num_biallelic_sites) float32 in {0,1,2}
+      - hap1: (num_valid_inds, num_kept_sites) float32 in {0,1}
+      - hap2: (num_valid_inds, num_kept_sites) float32 in {0,1} or None
+      - dip:  (num_valid_inds, num_kept_sites) float32 in {0,1,2}
       - kept_ind_ids: (num_valid_inds,) int64, the *tskit individual IDs* kept
-
-    If ts has no individuals, treats each sample as "haplotype-individual":
-      - hap1 is the sample matrix
-      - hap2 is None
-      - dip is same as hap1
-      - kept_ind_ids is np.arange(num_samples)
+      - filter_report: dict with biallelic/monomorphic/maf filtering counts
     """
     G_hap = ts.genotype_matrix()  # (sites, samples), allele labels 0/1/2...
+
+    filter_report = {}
 
     # --- filter to biallelic sites (and drop missing) ---
     biallelic = (G_hap.max(axis=1) <= 1)
     if (G_hap.min(axis=1) < 0).any():
         biallelic &= (G_hap.min(axis=1) >= 0)
+
+    filter_report["num_sites_raw"] = int(G_hap.shape[0])
+    filter_report["num_sites_after_biallelic_nonmissing"] = int(biallelic.sum())
+
     G_hap = G_hap[biallelic, :]  # (biallelic_sites, samples)
+
+    # Now G_hap should be only {0,1} and no missing; apply monomorphic + optional MAF
+    keep_maf, maf_info = _maf_filter_mask_from_haps(G_hap.astype(np.float32), maf_threshold=float(maf_threshold))
+    filter_report.update(maf_info)
+
+    G_hap = G_hap[keep_maf, :]  # (kept_sites, samples)
 
     # If no individuals exist, we can't form diploids cleanly
     if ts.num_individuals == 0:
         hap1 = G_hap.T.astype(np.float32)  # (samples, sites)
         dip = hap1.copy()
         kept_ind_ids = np.arange(hap1.shape[0], dtype=np.int64)
-        return hap1, None, dip, kept_ind_ids
+        return hap1, None, dip, kept_ind_ids, filter_report
 
     # Map sample node id -> column in G_hap
     samples = ts.samples()
@@ -104,7 +155,21 @@ def _extract_haps_and_diploid(ts: tskit.TreeSequence):
     hap2 = G_hap[:, cols2[:, 1]].T.astype(np.float32)
     dip = (hap1 + hap2).astype(np.float32)
 
-    return hap1, hap2, dip, kept_ind_ids
+    return hap1, hap2, dip, kept_ind_ids, filter_report
+
+
+def _load_maf_from_config(config_path: str | None) -> float | None:
+    if config_path is None:
+        return None
+    cfg = yaml.safe_load(Path(config_path).read_text())
+    # Expecting:
+    # data:
+    #   maf_threshold: 0.0
+    data = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    maf = data.get("maf_threshold", None)
+    if maf is None:
+        return None
+    return float(maf)
 
 
 def main():
@@ -112,6 +177,18 @@ def main():
     p.add_argument("--tree", required=True, help=".trees file with many CEU/YRI individuals")
     p.add_argument("--phenotype", required=True, help="phenotype.pkl with individual_id, population")
     p.add_argument("--outdir", required=True)
+
+    # NEW: optional YAML config
+    p.add_argument("--config", default=None, help="YAML config with data.maf_threshold (optional)")
+
+    # NEW: optional CLI override (wins over YAML if provided)
+    p.add_argument(
+        "--maf-threshold",
+        type=float,
+        default=None,
+        help="Minor allele frequency threshold. 0 disables MAF filtering, but monomorphic sites are always removed. "
+             "If not set, tries to read from --config (data.maf_threshold).",
+    )
 
     p.add_argument("--subset-snps", type=int, default=5000,
                    help="Number of contiguous SNPs to keep (default: 5000).")
@@ -124,6 +201,12 @@ def main():
     args = p.parse_args()
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve maf_threshold: CLI > YAML > default(0.0)
+    maf_from_yaml = _load_maf_from_config(args.config)
+    maf_threshold = args.maf_threshold if args.maf_threshold is not None else (maf_from_yaml if maf_from_yaml is not None else 0.0)
+
+    print(f"[build_genotypes_for_vae] Using maf_threshold={maf_threshold} (monomorphic sites always removed)")
 
     print(f"[build_genotypes_for_vae] Loading tree sequence from {args.tree}")
     ts = tskit.load(args.tree)
@@ -140,7 +223,7 @@ def main():
         f"Multiallelic sites: {stats['num_multiallelic_sites']}\n"
         f"Biallelic segregating sites: {stats['num_biallelic_sites']}\n"
     )
-    print("[build_genotypes_for_vae] Site / genotype summary:")
+    print("[build_genotypes_for_vae] Site / genotype summary (raw TS):")
     print(stats_txt)
 
     stats_path = outdir / "genotype_site_stats.txt"
@@ -150,16 +233,27 @@ def main():
     # -------------------------------
     # Build hap1/hap2 + diploid dosage
     # -------------------------------
-    print("[build_genotypes_for_vae] Extracting haplotypes and diploid genotypes (biallelic only)")
-    hap1, hap2, G, kept_ind_ids = _extract_haps_and_diploid(ts)
+    print("[build_genotypes_for_vae] Extracting haplotypes and diploid genotypes (biallelic + monomorphic removed + optional MAF)")
+    hap1, hap2, G, kept_ind_ids, filt = _extract_haps_and_diploid(ts, maf_threshold=maf_threshold)
 
     num_inds, num_sites = G.shape
-    print(f"[build_genotypes_for_vae] After biallelic filtering: {num_sites} sites retained")
+    print("[build_genotypes_for_vae] Site filtering report:")
+    print(f"  raw sites: {filt.get('num_sites_raw')}")
+    print(f"  after biallelic+nonmissing: {filt.get('num_sites_after_biallelic_nonmissing')}")
+    print(f"  monomorphic removed: {filt.get('num_monomorphic_removed')}")
+    print(f"  maf removed (<{maf_threshold}): {filt.get('num_maf_removed')}")
+    print(f"  final kept sites: {filt.get('num_sites_out')}")
+
     print(f"[build_genotypes_for_vae] Diploid genotype matrix shape: {G.shape}")
     if hap2 is None:
         print(f"[build_genotypes_for_vae] No individuals in ts; using haplotypes-as-individuals. hap1 shape={hap1.shape}")
     else:
         print(f"[build_genotypes_for_vae] hap1 shape={hap1.shape}, hap2 shape={hap2.shape}")
+
+    # Save filtering report too (handy for debugging)
+    (outdir / "site_filter_report.txt").write_text(
+        "\n".join([f"{k}: {v}" for k, v in filt.items()]) + "\n"
+    )
 
     # -------------------------------
     # Load phenotype/meta and align rows
@@ -171,12 +265,9 @@ def main():
     if "individual_id" in pheno.columns:
         pheno = pheno.sort_values("individual_id").reset_index(drop=True)
 
-    # If we filtered individuals (e.g. missing nodes), we need to subset phenotype too.
-    # Assumption: pheno["individual_id"] matches tskit individual IDs.
     if ts.num_individuals > 0:
         if "individual_id" not in pheno.columns:
             raise ValueError("phenotype.pkl must have an 'individual_id' column when ts has individuals.")
-        # subset and re-order phenotype to match kept_ind_ids
         pheno_indexed = pheno.set_index("individual_id", drop=False)
         missing = [i for i in kept_ind_ids.tolist() if i not in pheno_indexed.index]
         if len(missing) > 0:
@@ -218,6 +309,7 @@ def main():
     meta_path = outdir / "meta.pkl"
     snp_idx_path = outdir / "snp_index.npy"
     ts_ids_path = outdir / "ts_individual_ids.npy"
+    hap_meta_path = outdir / "hap_meta.pkl"
 
     print(f"[build_genotypes_for_vae] Saving diploid genotype matrix to {geno_path}")
     np.save(geno_path, G_subset.astype(np.float32))
@@ -229,7 +321,6 @@ def main():
         print(f"[build_genotypes_for_vae] Saving hap2 to {hap2_path}")
         np.save(hap2_path, hap2_subset.astype(np.float32))
     else:
-        # keep the file contract if your Snakefile expects it
         print(f"[build_genotypes_for_vae] No hap2 available; writing empty placeholder to {hap2_path}")
         np.save(hap2_path, np.zeros((hap1_subset.shape[0], hap1_subset.shape[1]), dtype=np.float32))
 
@@ -239,10 +330,26 @@ def main():
     print(f"[build_genotypes_for_vae] Saving kept tskit individual IDs to {ts_ids_path}")
     np.save(ts_ids_path, kept_ind_ids.astype(np.int64))
 
-    # Keep useful columns for plotting
     meta = pheno[["individual_id", "population"]].copy()
     print(f"[build_genotypes_for_vae] Saving meta to {meta_path}")
     meta.to_pickle(meta_path)
+
+    # -------------------------------
+    # I want to store population labels for each haplotype
+    # -------------------------------
+    hap_meta = pd.concat(
+    [
+        meta.assign(hap_id=0),
+        meta.assign(hap_id=1),
+    ],
+    ignore_index=True,
+    )
+
+    hap_meta["hap_index"] = np.arange(len(hap_meta))
+
+    print(f"[build_genotypes_for_vae] Saving haplotype meta to {hap_meta_path}")
+    hap_meta.to_pickle(hap_meta_path)
+
 
     print("[build_genotypes_for_vae] Done.")
 

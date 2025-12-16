@@ -10,21 +10,24 @@ grid:
 base:
   model:
     vocab_size: 3
+    pad_id: null
+    max_len: 50000
   training:
     batch_size: 64
     epochs: 100
     seed: 42
     weight_decay: 0.0
-    grad_clip: 0.0
+    grad_clip: 1.0
     num_workers: 2
-    amp: true
+    amp: false
+    debug_every: 5
+    debug_n_show: 2
+    debug_max_sites: 256
   masking:
     p_mask_site: 0.75
-    mask_both_prob: 0.5
     mask_id: 2
   data:
-    subset_snps: 10000
-    subset_mode: "random"
     window_len: 512
-    window_mode: "random"
+    window_mode: "fixed"
     fixed_start: 0
+    maf_threshold: 0.01

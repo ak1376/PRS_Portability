@@ -97,8 +97,8 @@ def parse_param_id(param_id: str) -> dict:
 ##############################################################################
 # Directories
 ##############################################################################
-SIM_BASEDIR  = f"experiments/{MODEL}/vae_sims"
-GENO_BASEDIR = f"experiments/{MODEL}/genotypes"
+SIM_BASEDIR  = f"experiments/{MODEL}/simulations"
+GENO_BASEDIR = f"experiments/{MODEL}/processed_data"
 TX_BASEDIR   = f"experiments/{MODEL}/transformer"
 
 Path(SIM_BASEDIR).mkdir(parents=True, exist_ok=True)
@@ -126,17 +126,17 @@ rule all:
         # Per-param resolved config
         expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
 
-        # Train transformer for all hyperparam combos
+        # # Train transformer for all hyperparam combos
         expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
         expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
         expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
 
-        # Uncomment if you want these computed for every param_id
-        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png", param_id=PARAM_IDS),
+        # # Uncomment if you want these computed for every param_id
+        # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png", param_id=PARAM_IDS),
 
 ##############################################################################
 # RULE make_tx_config – write per-param resolved YAML
@@ -218,7 +218,7 @@ rule simulate:
 rule build_inputs:
     input:
         tree  = f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
-        pheno = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
+        pheno = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl"
     output:
         geno    = f"{GENO_BASEDIR}/all_individuals.npy",
         hap1    = f"{GENO_BASEDIR}/hap1.npy",
@@ -230,6 +230,7 @@ rule build_inputs:
         outdir      = GENO_BASEDIR,
         subset_snps = BASE_DATA.get("subset_snps", 10000),
         subset_mode = BASE_DATA.get("subset_mode", "random"),
+        maf_threshold = BASE_DATA.get("maf_threshold", 0.01)
     threads: 1
     shell:
         r"""
@@ -237,23 +238,24 @@ rule build_inputs:
         python "{BUILD_INPUTS}" \
             --tree "{input.tree}" \
             --phenotype "{input.pheno}" \
+            --maf-threshold "{params.maf_threshold}" \
             --outdir "{params.outdir}" \
             --subset-snps "{params.subset_snps}" \
             --subset-mode "{params.subset_mode}"
         """
 
 ##############################################################################
-# RULE train_transformer – YAML-only trainer
+# RULE train_transformer – single-haplotype trainer (hap-only)
 ##############################################################################
 rule train_transformer:
     input:
-        hap1 = f"{GENO_BASEDIR}/hap1.npy",
-        hap2 = f"{GENO_BASEDIR}/hap2.npy",
+        hap  = f"{GENO_BASEDIR}/hap1.npy",   # <--- choose hap1 OR hap2 here
         cfg  = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
     output:
         model  = f"{TX_BASEDIR}/{{param_id}}/model.pt",
         losses = f"{TX_BASEDIR}/{{param_id}}/train_losses.csv",
         plot   = f"{TX_BASEDIR}/{{param_id}}/loss_curves.png",
+        debug_dir = directory(f"{TX_BASEDIR}/{{param_id}}/debug_pngs"),
     threads: 1
     resources:
         gpus = 1
@@ -262,14 +264,15 @@ rule train_transformer:
         set -euo pipefail
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
 
-        python "{TRAIN_TX_SCRIPT}" \
+        python "snakemake_scripts/train_transformer.py" \
             --config "{input.cfg}" \
-            --hap1 "{input.hap1}" \
-            --hap2 "{input.hap2}" \
+            --hap "{input.hap}" \
             --out_model "{output.model}" \
             --out_losses "{output.losses}" \
-            --out_plot "{output.plot}"
+            --out_plot "{output.plot}" \
+            --out_debug_dir "{output.debug_dir}"
         """
+
 
 rule reconstruct_transformer:
     input:

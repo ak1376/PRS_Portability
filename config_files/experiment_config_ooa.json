@@ -4,8 +4,8 @@
     "recombination_rate": 1.5e-08,
     "demographic_model": "out_of_africa",
     "num_samples": {
-        "YRI": 500,
-        "CEU": 500
+        "YRI": 5000,
+        "CEU": 5000
     },
     "num_replicates": 5,
     "num_draws": 100,
