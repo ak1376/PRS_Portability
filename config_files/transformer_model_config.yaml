@@ -12,9 +12,10 @@ base:
     vocab_size: 3
     pad_id: null
     max_len: 50000
+
   training:
     batch_size: 64
-    epochs: 100
+    epochs: 200
     seed: 42
     weight_decay: 0.0
     grad_clip: 1.0
@@ -23,9 +24,19 @@ base:
     debug_every: 5
     debug_n_show: 2
     debug_max_sites: 256
+
+    contrastive:
+      enabled: true
+      lambda: 0.1
+      tau: 0.2
+      permute_negatives: true
+      permute_every_k: 1
+      p_mask_site_ctr: 0.20   # NEW
+
   masking:
     p_mask_site: 0.75
     mask_id: 2
+
   data:
     window_len: 512
     window_mode: "fixed"

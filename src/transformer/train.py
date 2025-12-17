@@ -17,6 +17,18 @@ from torch.utils.data import DataLoader
 
 from src.transformer.masking import mask_haplotype
 from src.transformer.model import HapMaskTransformer
+from src.transformer.contrastive_losses import permute_columns_across_batch, info_nce
+
+def _mean_cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Mean cosine similarity over batch between vectors a and b.
+    a,b: (B,d)
+    returns: scalar tensor
+    """
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    return (a * b).sum(dim=-1).mean()
+
 
 
 # -----------------------------------------------------------------------------
@@ -259,30 +271,108 @@ def train_epoch(
     device: torch.device,
     *,
     mask_id: int,
-    p_mask_site: float = 0.15,
+    p_mask_site: float = 0.15,              # MLM masking prob
+    p_mask_site_ctr: float | None = None,   # contrastive masking prob (defaults to p_mask_site)
     grad_clip: float | None = 1.0,
     class_balance: bool = True,
-) -> float:
+    # ---- contrastive knobs ----
+    use_contrastive: bool = True,
+    contrastive_lambda: float = 0.1,
+    contrastive_tau: float = 0.2,
+    use_perm_negatives: bool = True,
+    permute_every_k: int = 5,
+) -> dict[str, float]:
     model.train()
-    total_loss = 0.0
+
+    # --- totals for MLM loss ---
+    total_mlm = 0.0
     total_sites = 0
 
+    # --- totals for contrastive loss ---
+    total_ctr = 0.0
+    n_ctr_steps = 0
+
+    # --- debug geometry metrics ---
+    sum_pos_cos = 0.0          # mean cos(z1,z2)
+    sum_neg_cos = 0.0          # mean cos(z1,z2_shuffled)
+    sum_perm_neg_cos = 0.0     # mean cos(z1,zperm) if computed
+    n_cos_steps = 0
+    n_perm_cos_steps = 0
+
+    # choose masking rate for contrastive views
+    p_ctr = float(p_mask_site if p_mask_site_ctr is None else p_mask_site_ctr)
+
+    step = 0
     for batch in loader:
-        hap = batch.hap.to(device)
+        step += 1
+
+        hap = batch.hap.to(device)  # (B,L)
         pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
-
         hap_true = hap
-        hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
 
-        logits, _z = model(hap_masked, pad_mask=pad_mask)
+        # -------------------------
+        # View 1: MLM + z1
+        # -------------------------
+        hap_masked1, masked_sites1 = mask_haplotype(hap, mask_id=mask_id, p_mask_site=float(p_mask_site))
+        logits1, z1 = model(hap_masked1, pad_mask=pad_mask)  # logits1: (B,L,2), z1: (B,d)
 
-        loss_mask = masked_sites
+        loss_mask1 = masked_sites1
         if pad_mask is not None:
-            loss_mask = loss_mask & (~pad_mask)
+            loss_mask1 = loss_mask1 & (~pad_mask)
 
-        loss, n = _compute_masked_loss(logits, hap_true, loss_mask, class_balance=class_balance)
+        mlm_loss, n = _compute_masked_loss(
+            logits1, hap_true, loss_mask1, class_balance=class_balance
+        )
         if n == 0:
             continue
+
+        # -------------------------
+        # Contrastive (optional)
+        # -------------------------
+        ctr_loss = torch.zeros((), device=device)
+
+        if use_contrastive:
+            # view 2 (positive)
+            hap_masked2, _ = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_ctr)
+            _logits2, z2 = model(hap_masked2, pad_mask=pad_mask)  # z2: (B,d)
+
+            # --- cosine debug metrics (cheap) ---
+            z1n = F.normalize(z1, dim=-1)
+            z2n = F.normalize(z2, dim=-1)
+            pos_cos = (z1n * z2n).sum(dim=-1).mean()
+
+            perm = torch.randperm(z2.size(0), device=z2.device)
+            neg_cos = (z1n * z2n[perm]).sum(dim=-1).mean()
+
+            sum_pos_cos += float(pos_cos.item())
+            sum_neg_cos += float(neg_cos.item())
+            n_cos_steps += 1
+
+            # optional extra negatives: LD-breaking permutation across batch
+            zneg = None
+            do_perm = (use_perm_negatives and permute_every_k > 0 and (step % int(permute_every_k) == 0))
+            if do_perm:
+                # NOTE: if you truly have PAD tokens, you may want to preserve them here.
+                # If you don't have PAD, keep it simple:
+                hap_perm = permute_columns_across_batch(hap)  # (B,L)
+
+                hap_perm_masked, _ = mask_haplotype(hap_perm, mask_id=mask_id, p_mask_site=p_ctr)
+                _logits_p, zperm = model(hap_perm_masked, pad_mask=pad_mask)
+                zneg = zperm
+
+                zperm_n = F.normalize(zperm, dim=-1)
+                perm_neg_cos = (z1n * zperm_n).sum(dim=-1).mean()
+                sum_perm_neg_cos += float(perm_neg_cos.item())
+                n_perm_cos_steps += 1
+
+            ctr_loss = info_nce(z1, z2, zneg=zneg, tau=float(contrastive_tau))
+            total_ctr += float(ctr_loss.item())
+            n_ctr_steps += 1
+
+        # -------------------------
+        # Combined loss + step
+        # -------------------------
+        loss = mlm_loss + (float(contrastive_lambda) * ctr_loss if use_contrastive else 0.0)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -290,11 +380,21 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         optimizer.step()
 
-        total_loss += float(loss.item()) * n
+        total_mlm += float(mlm_loss.item()) * n
         total_sites += n
 
-    return total_loss / max(total_sites, 1)
+    out: dict[str, float] = {
+        "mlm_loss": total_mlm / max(total_sites, 1),
+    }
 
+    if use_contrastive:
+        out["ctr_loss"] = total_ctr / max(n_ctr_steps, 1)
+        out["ctr_pos_cos"] = sum_pos_cos / max(n_cos_steps, 1)
+        out["ctr_neg_cos"] = sum_neg_cos / max(n_cos_steps, 1)
+        if n_perm_cos_steps > 0:
+            out["ctr_perm_neg_cos"] = sum_perm_neg_cos / n_perm_cos_steps
+
+    return out
 
 @torch.no_grad()
 def eval_epoch(
