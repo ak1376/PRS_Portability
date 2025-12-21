@@ -100,7 +100,7 @@ def plot_training_loss(data_dict: dict, output_path: Path):
         lam = params.get('contrastive_lambda', 0.0)
         
         # Plot training loss (lower is better)
-        label = f"λ={lam:.1f}"
+        label = f"λ={lam:.2f}"
         epochs = data['epoch']
         train_losses = data['train_mlm_loss']
         plt.plot(epochs, train_losses, marker='o', label=label, linewidth=2, markersize=4)
