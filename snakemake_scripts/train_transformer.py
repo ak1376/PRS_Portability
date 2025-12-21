@@ -16,12 +16,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yaml
 
+# Add sklearn imports for metrics
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score
+import seaborn as sns
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.transformer.data_class import HapDataset, collate_hapbatch
 from src.transformer.model import HapMaskTransformer
+from src.transformer.masking import mask_haplotype
 from src.transformer.train import train_epoch, eval_epoch, debug_snapshot_and_pngs
 
 
@@ -82,6 +87,146 @@ def plot_contrastive_geometry(
     plt.tight_layout()
     plt.savefig(path, dpi=200)
     plt.close()
+
+
+def comprehensive_validation_analysis(
+    model: HapMaskTransformer,
+    loader: DataLoader,
+    device: torch.device,
+    output_dir: Path,
+    *,
+    mask_id: int,
+    p_mask_site: float = 0.15,
+    class_balance: bool = True,
+) -> dict[str, Any]:
+    """
+    Perform comprehensive validation analysis including:
+    - Predictions and targets collection
+    - Accuracy, AUC calculation
+    - Confusion matrix
+    - ROC curve
+    - Save all results and plots
+    """
+    from src.transformer.train import _compute_masked_loss
+    
+    model.eval()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_predictions = []
+    all_targets = []
+    all_probabilities = []
+    total_loss = 0.0
+    total_sites = 0
+    
+    print("Collecting validation predictions...")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            hap = batch.hap.to(device)
+            pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
+            
+            hap_true = hap
+            hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
+            
+            logits, _z = model(hap_masked, pad_mask=pad_mask)
+            
+            loss_mask = masked_sites
+            if pad_mask is not None:
+                loss_mask = loss_mask & (~pad_mask)
+            
+            loss, n = _compute_masked_loss(logits, hap_true, loss_mask, class_balance=class_balance)
+            if n == 0:
+                continue
+            
+            # Get predictions and probabilities for masked sites
+            probs = torch.softmax(logits, dim=-1)  # (B, L, 2)
+            pred_class = torch.argmax(logits, dim=-1)  # (B, L)
+            
+            # Extract only masked sites
+            masked_targets = hap_true[loss_mask].cpu().numpy()
+            masked_predictions = pred_class[loss_mask].cpu().numpy() 
+            masked_probabilities = probs[loss_mask, 1].cpu().numpy()  # Probability of class 1
+            
+            all_targets.extend(masked_targets)
+            all_predictions.extend(masked_predictions)
+            all_probabilities.extend(masked_probabilities)
+            
+            total_loss += float(loss.item()) * n
+            total_sites += n
+    
+    # Convert to numpy arrays
+    targets = np.array(all_targets)
+    predictions = np.array(all_predictions)
+    probabilities = np.array(all_probabilities)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(targets, predictions)
+    auc_score = roc_auc_score(targets, probabilities)
+    avg_loss = total_loss / max(total_sites, 1)
+    
+    print(f"Validation Results:")
+    print(f"  Total masked sites: {len(targets):,}")
+    print(f"  Accuracy: {accuracy:.4f}")
+    print(f"  AUC: {auc_score:.4f}")
+    print(f"  Average loss: {avg_loss:.6f}")
+    
+    # Save predictions and targets
+    np.save(output_dir / "validation_predictions.npy", predictions)
+    np.save(output_dir / "validation_targets.npy", targets)
+    np.save(output_dir / "validation_probabilities.npy", probabilities)
+    
+    # Confusion Matrix
+    cm = confusion_matrix(targets, predictions)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Pred: 0', 'Pred: 1'], 
+                yticklabels=['True: 0', 'True: 1'])
+    plt.title(f'Confusion Matrix\\nAccuracy: {accuracy:.4f}')
+    plt.tight_layout()
+    plt.savefig(output_dir / "confusion_matrix.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # ROC Curve
+    fpr, tpr, thresholds = roc_curve(targets, probabilities)
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, linewidth=2, label=f'ROC Curve (AUC = {auc_score:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random Classifier')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve - Validation Set')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "roc_curve.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Save detailed metrics
+    metrics = {
+        'accuracy': float(accuracy),
+        'auc': float(auc_score),
+        'average_loss': float(avg_loss),
+        'total_masked_sites': int(len(targets)),
+        'class_distribution': {
+            'class_0_count': int(np.sum(targets == 0)),
+            'class_1_count': int(np.sum(targets == 1)),
+            'class_0_fraction': float(np.mean(targets == 0)),
+            'class_1_fraction': float(np.mean(targets == 1)),
+        },
+        'confusion_matrix': {
+            'tn': int(cm[0, 0]),
+            'fp': int(cm[0, 1]), 
+            'fn': int(cm[1, 0]),
+            'tp': int(cm[1, 1]),
+        }
+    }
+    
+    import json
+    with open(output_dir / "validation_metrics.json", 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    print(f"Validation analysis saved to: {output_dir}")
+    
+    return metrics
 
 
 # -----------------------------------------------------------------------------
@@ -481,6 +626,36 @@ def main():
             ctr_neg_cos,
             ctr_perm_neg_cos if perm_ok else None,
         )
+
+    # ---------------------
+    # Comprehensive validation analysis
+    # ---------------------
+    print("\\nPerforming comprehensive validation analysis...")
+    validation_dir = Path(args.out_debug_dir).parent / "validation_analysis"
+    validation_metrics = comprehensive_validation_analysis(
+        model=model,
+        loader=dl,
+        device=device,
+        output_dir=validation_dir,
+        mask_id=int(args.mask_id),
+        p_mask_site=float(args.p_mask_site),
+    )
+    
+    # Add validation metrics to the final row of training data
+    final_metrics = {
+        'final_validation_accuracy': validation_metrics['accuracy'],
+        'final_validation_auc': validation_metrics['auc'],
+        'total_masked_sites_analyzed': validation_metrics['total_masked_sites'],
+    }
+    
+    # Save final metrics separately
+    import json
+    final_metrics_path = Path(args.out_debug_dir).parent / "final_validation_metrics.json"
+    with open(final_metrics_path, 'w') as f:
+        json.dump(final_metrics, f, indent=2)
+    
+    print(f"Final validation metrics saved to: {final_metrics_path}")
+    print(f"Detailed validation analysis saved to: {validation_dir}")
 
 
 if __name__ == "__main__":

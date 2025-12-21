@@ -64,25 +64,39 @@ FF_DIMS    = GRID.get("ff_dim", [512])
 DROPOUTS   = GRID.get("dropout", [0.1])
 POOLS      = GRID.get("pool", ["mean"])
 LRS        = GRID.get("lr", [1e-4])
+LAMBDAS = GRID.get("contrastive_lambda", [BASE_TRAIN.get("contrastive", {}).get("lambda", 0.0)])
+P_MASK_SITE_CTRS = GRID.get("p_mask_site_ctr", [0.20])
+P_MASK_SITES = GRID.get("p_mask_site", [0.75])
 
-PARAM_COMBINATIONS = list(product(EMBED_DIMS, N_HEADS, N_LAYERS, FF_DIMS, DROPOUTS, POOLS, LRS))
+PARAM_COMBINATIONS = list(product(
+    EMBED_DIMS, N_HEADS, N_LAYERS, FF_DIMS, DROPOUTS, POOLS, LRS, LAMBDAS,
+    P_MASK_SITE_CTRS, P_MASK_SITES
+))
+
+def _fmt_float(x: float) -> str:
+    # stable string for filenames: 0.1 -> 0p1, 1.0 -> 1p0
+    s = str(float(x))
+    return s.replace(".", "p").replace("-", "m")
 
 PARAM_IDS = [
-    f"tx_e{e}_h{h}_L{L}_ff{ff}_do{str(do).replace('.','p')}_pool{pool}_lr{str(lr).replace('.','p')}"
-    for (e, h, L, ff, do, pool, lr) in PARAM_COMBINATIONS
+    f"tx_e{e}_h{h}_L{L}_ff{ff}_do{str(do).replace('.','p')}_pool{pool}_lr{str(lr).replace('.','p')}_lam{_fmt_float(lam)}_pmc{_fmt_float(pmc)}_pms{_fmt_float(pms)}"
+    for (e, h, L, ff, do, pool, lr, lam, pmc, pms) in PARAM_COMBINATIONS
 ]
 
 def parse_param_id(param_id: str) -> dict:
     m = re.match(
-        r"tx_e(\d+)_h(\d+)_L(\d+)_ff(\d+)_do([0-9ep\-]+)_pool([A-Za-z0-9]+)_lr([0-9ep\-]+)$",
+        r"tx_e(\d+)_h(\d+)_L(\d+)_ff(\d+)_do([0-9ep\-m]+)_pool([A-Za-z0-9]+)_lr([0-9ep\-m]+)_lam([0-9ep\-m]+)_pmc([0-9ep\-m]+)_pms([0-9ep\-m]+)$",
         param_id,
     )
     if not m:
         raise ValueError(f"Unrecognized param_id: {param_id}")
 
-    dropout = float(m.group(5).replace("p", "."))
-    pool = m.group(6)
-    lr = float(m.group(7).replace("p", "."))
+    dropout = float(m.group(5).replace("p", ".").replace("m", "-"))
+    pool    = m.group(6)
+    lr      = float(m.group(7).replace("p", ".").replace("m", "-"))
+    lam     = float(m.group(8).replace("p", ".").replace("m", "-"))
+    pmc     = float(m.group(9).replace("p", ".").replace("m", "-"))
+    pms     = float(m.group(10).replace("p", ".").replace("m", "-"))
 
     return dict(
         embed_dim=int(m.group(1)),
@@ -92,6 +106,9 @@ def parse_param_id(param_id: str) -> dict:
         dropout=dropout,
         pool=pool,
         lr=lr,
+        contrastive_lambda=lam,
+        p_mask_site_ctr=pmc,
+        p_mask_site=pms,
     )
 
 ##############################################################################
@@ -130,6 +147,24 @@ rule all:
         expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
         expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
         expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
+        
+        # Validation analysis outputs
+        expand(f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json", param_id=PARAM_IDS),
+        
+        # Validation box plots
+        f"{TX_BASEDIR}/validation_analysis/validation_auc_boxplot.png",
+        f"{TX_BASEDIR}/validation_analysis/validation_accuracy_boxplot.png",
+
+        # Contrastive plots (only for models with lambda > 0)
+        expand(f"{TX_BASEDIR}/{{param_id}}/contrastive_geometry.png", 
+               param_id=[p for p in PARAM_IDS if parse_param_id(p)['contrastive_lambda'] > 0]),
+
+        # Model comparison plots
+        f"{TX_BASEDIR}/comparison_plots/training_loss_comparison.png",
+        f"{TX_BASEDIR}/comparison_plots/validation_loss_comparison.png",
+        f"{TX_BASEDIR}/comparison_plots/contrastive_pos.png",
+        f"{TX_BASEDIR}/comparison_plots/contrastive_neg.png", 
+        f"{TX_BASEDIR}/comparison_plots/contrastive_perm_neg.png",
 
         # # Uncomment if you want these computed for every param_id
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
@@ -154,6 +189,9 @@ rule make_tx_config:
         dropout   = lambda wc: parse_param_id(wc.param_id)["dropout"],
         pool      = lambda wc: parse_param_id(wc.param_id)["pool"],
         lr        = lambda wc: parse_param_id(wc.param_id)["lr"],
+        lam       = lambda wc: parse_param_id(wc.param_id)["contrastive_lambda"],
+        p_mask_site_ctr = lambda wc: parse_param_id(wc.param_id)["p_mask_site_ctr"],
+        p_mask_site = lambda wc: parse_param_id(wc.param_id)["p_mask_site"],
     run:
         tx = yaml.safe_load(Path(input.base).read_text()) or {}
         base = tx.get("base", {}) or {}
@@ -176,8 +214,19 @@ rule make_tx_config:
 
         cfg["training"]["lr"] = float(params.lr)
 
+        # ---- contrastive override ----
+        cfg["training"].setdefault("contrastive", {})
+        lam = float(params.lam)
+        cfg["training"]["contrastive"]["lambda"] = lam
+        cfg["training"]["contrastive"]["enabled"] = (lam > 0.0)
+        cfg["training"]["contrastive"]["p_mask_site_ctr"] = float(params.p_mask_site_ctr)
+
+        # ---- masking override ----
+        cfg["masking"]["p_mask_site"] = float(params.p_mask_site)
+
         Path(output.cfg).parent.mkdir(parents=True, exist_ok=True)
         Path(output.cfg).write_text(yaml.safe_dump(cfg, sort_keys=False))
+
 
 ##############################################################################
 # RULE simulate
@@ -249,16 +298,20 @@ rule build_inputs:
 ##############################################################################
 rule train_transformer:
     input:
-        hap  = f"{GENO_BASEDIR}/hap1.npy",   # <--- choose hap1 OR hap2 here
-        cfg  = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
+        hap = f"{GENO_BASEDIR}/hap1.npy",   # <--- choose hap1 OR hap2 here
+        cfg = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
     output:
         model  = f"{TX_BASEDIR}/{{param_id}}/model.pt",
         losses = f"{TX_BASEDIR}/{{param_id}}/train_losses.csv",
         plot   = f"{TX_BASEDIR}/{{param_id}}/loss_curves.png",
         debug_dir = directory(f"{TX_BASEDIR}/{{param_id}}/debug_pngs"),
+        val_metrics = f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json",
+        val_analysis_dir = directory(f"{TX_BASEDIR}/{{param_id}}/validation_analysis"),
+
     threads: 1
     resources:
-        gpus = 1
+        gpus = 1,
+        gpu_mem_mb = 8000  # Estimate GPU memory needed
     shell:
         r"""
         set -euo pipefail
@@ -273,7 +326,85 @@ rule train_transformer:
             --out_debug_dir "{output.debug_dir}"
         """
 
+##############################################################################
+# RULE generate_contrastive_plot – Generate contrastive geometry plots for existing models
+##############################################################################
+rule generate_contrastive_plot:
+    input:
+        losses = f"{TX_BASEDIR}/{{param_id}}/train_losses.csv",
+    output:
+        ctr_plot = f"{TX_BASEDIR}/{{param_id}}/contrastive_geometry.png",
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
 
+        python "snakemake_scripts/generate_contrastive_plot.py" \
+            --losses_csv "{input.losses}" \
+            --output "{output.ctr_plot}"
+        """
+
+
+##############################################################################
+# RULE generate_validation_boxplots – Box plots for validation metrics
+##############################################################################
+rule generate_validation_boxplots:
+    input:
+        metrics = expand(f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json", param_id=PARAM_IDS),
+    output:
+        auc_boxplot = f"{TX_BASEDIR}/validation_analysis/validation_auc_boxplot.png",
+        acc_boxplot = f"{TX_BASEDIR}/validation_analysis/validation_accuracy_boxplot.png",
+        summary = f"{TX_BASEDIR}/validation_analysis/validation_metrics_summary.json",
+    params:
+        base_dir = TX_BASEDIR,
+        output_dir = f"{TX_BASEDIR}/validation_analysis",
+        param_ids = PARAM_IDS,
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+
+        python "snakemake_scripts/generate_validation_boxplots.py" \
+            --base_dir "{params.base_dir}" \
+            --output_dir "{params.output_dir}" \
+            --param_ids {params.param_ids}
+        """
+
+
+##############################################################################
+# RULE generate_model_comparison_plots – Compare metrics across all models
+##############################################################################
+rule generate_model_comparison_plots:
+    input:
+        losses_csv = expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
+    output:
+        train_loss = f"{TX_BASEDIR}/comparison_plots/training_loss_comparison.png",
+        val_loss = f"{TX_BASEDIR}/comparison_plots/validation_loss_comparison.png",
+        pos_cos = f"{TX_BASEDIR}/comparison_plots/contrastive_pos.png", 
+        neg_cos = f"{TX_BASEDIR}/comparison_plots/contrastive_neg.png",
+        hard_neg_cos = f"{TX_BASEDIR}/comparison_plots/contrastive_perm_neg.png",
+    params:
+        losses_dir = TX_BASEDIR,
+        output_dir = f"{TX_BASEDIR}/comparison_plots",
+        param_ids = PARAM_IDS,
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+
+        python "snakemake_scripts/generate_model_comparison_plots.py" \
+            --losses_dir "{params.losses_dir}" \
+            --output_dir "{params.output_dir}" \
+            --param_ids {params.param_ids}
+        """
+
+
+##############################################################################
+# RULE reconstruct_transformer
+##############################################################################
 rule reconstruct_transformer:
     input:
         hap1  = f"{GENO_BASEDIR}/hap1.npy",

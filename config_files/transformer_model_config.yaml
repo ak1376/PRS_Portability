@@ -6,6 +6,7 @@ grid:
   dropout: [0.1]
   pool: ["mean"]
   lr: [1e-4]
+  contrastive_lambda: [0.0, 0.1, 0.5, 1.0]
 
 base:
   model:
@@ -26,8 +27,7 @@ base:
     debug_max_sites: 256
 
     contrastive:
-      enabled: true
-      lambda: 0.1
+      enabled: true   # will be auto-set false if lambda==0.0 (see Snakefile)
       tau: 0.2
       permute_negatives: true
       permute_every_k: 1
