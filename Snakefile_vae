@@ -149,12 +149,11 @@ rule all:
         expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
         
         # Validation analysis outputs
-        expand(f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
         
         # Validation box plots
-        f"{TX_BASEDIR}/validation_analysis/validation_auc_boxplot.png",
-        f"{TX_BASEDIR}/validation_analysis/validation_accuracy_boxplot.png",
-
+        f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",
+        f"{TX_BASEDIR}/test_analysis/test_accuracy_boxplot.png",
         # Contrastive plots (only for models with lambda > 0)
         expand(f"{TX_BASEDIR}/{{param_id}}/contrastive_geometry.png", 
                param_id=[p for p in PARAM_IDS if parse_param_id(p)['contrastive_lambda'] > 0]),
@@ -305,8 +304,8 @@ rule train_transformer:
         losses = f"{TX_BASEDIR}/{{param_id}}/train_losses.csv",
         plot   = f"{TX_BASEDIR}/{{param_id}}/loss_curves.png",
         debug_dir = directory(f"{TX_BASEDIR}/{{param_id}}/debug_pngs"),
-        val_metrics = f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json",
-        val_analysis_dir = directory(f"{TX_BASEDIR}/{{param_id}}/validation_analysis"),
+        val_metrics = f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json",
+        val_analysis_dir = directory(f"{TX_BASEDIR}/{{param_id}}/test_analysis"),
 
     threads: 1
     resources:
@@ -347,18 +346,18 @@ rule generate_contrastive_plot:
 
 
 ##############################################################################
-# RULE generate_validation_boxplots – Box plots for validation metrics
+# RULE generate_test_boxplots – Box plots for test metrics
 ##############################################################################
-rule generate_validation_boxplots:
+rule generate_test_boxplots:
     input:
-        metrics = expand(f"{TX_BASEDIR}/{{param_id}}/final_validation_metrics.json", param_id=PARAM_IDS),
+        metrics = expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
     output:
-        auc_boxplot = f"{TX_BASEDIR}/validation_analysis/validation_auc_boxplot.png",
-        acc_boxplot = f"{TX_BASEDIR}/validation_analysis/validation_accuracy_boxplot.png",
-        summary = f"{TX_BASEDIR}/validation_analysis/validation_metrics_summary.json",
+        auc_boxplot = f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",
+        acc_boxplot = f"{TX_BASEDIR}/test_analysis/test_accuracy_boxplot.png",
+        summary = f"{TX_BASEDIR}/test_analysis/test_metrics_summary.json",
     params:
         base_dir = TX_BASEDIR,
-        output_dir = f"{TX_BASEDIR}/validation_analysis",
+        output_dir = f"{TX_BASEDIR}/test_analysis",
         param_ids = PARAM_IDS,
     threads: 1
     shell:

@@ -1,4 +1,4 @@
-# src/transformer/masking_single.py
+# src/transformer/masking.py
 from __future__ import annotations
 import torch
 

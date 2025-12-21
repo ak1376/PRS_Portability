@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate box and whisker plots for validation metrics across models.
+Generate box and whisker plots for test metrics across models.
 """
 import argparse
 from pathlib import Path
@@ -44,12 +44,12 @@ def parse_param_id(param_id: str) -> dict:
     )
 
 
-def load_validation_metrics(param_ids: list[str], base_dir: Path) -> dict[str, dict]:
-    """Load validation metrics for all param_ids."""
+def load_test_metrics(param_ids: list[str], base_dir: Path) -> dict[str, dict]:
+    """Load test metrics for all param_ids."""
     metrics_data = {}
     
     for param_id in param_ids:
-        metrics_path = base_dir / param_id / "final_validation_metrics.json"
+        metrics_path = base_dir / param_id / "final_test_metrics.json"
         if metrics_path.exists():
             try:
                 with open(metrics_path, 'r') as f:
@@ -65,7 +65,7 @@ def load_validation_metrics(param_ids: list[str], base_dir: Path) -> dict[str, d
 
 
 def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
-    """Create box and whisker plots for validation metrics."""
+    """Create box and whisker plots for test metrics."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Organize data by lambda values
@@ -82,8 +82,8 @@ def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
                 'param_ids': []
             }
         
-        lambda_groups[lam]['auc_scores'].append(metrics['final_validation_auc'])
-        lambda_groups[lam]['accuracies'].append(metrics['final_validation_accuracy'])
+        lambda_groups[lam]['auc_scores'].append(metrics['final_test_auc'])
+        lambda_groups[lam]['accuracies'].append(metrics['final_test_accuracy'])
         lambda_groups[lam]['param_ids'].append(param_id)
     
     # Prepare data for plotting
@@ -112,11 +112,11 @@ def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
         patch.set_alpha(0.7)
     
     plt.xlabel('Contrastive Lambda', fontsize=12)
-    plt.ylabel('Validation AUC', fontsize=12)
-    plt.title('Validation AUC Distribution Across Contrastive Lambda Values', fontsize=14)
+    plt.ylabel('test AUC', fontsize=12)
+    plt.title('test AUC Distribution Across Contrastive Lambda Values', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(output_dir / "validation_auc_boxplot.png", dpi=150, bbox_inches='tight')
+    plt.savefig(output_dir / "test_auc_boxplot.png", dpi=150, bbox_inches='tight')
     plt.close()
     
     # Create box plots for Accuracy
@@ -132,11 +132,11 @@ def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
         patch.set_alpha(0.7)
     
     plt.xlabel('Contrastive Lambda', fontsize=12)
-    plt.ylabel('Validation Accuracy', fontsize=12)
-    plt.title('Validation Accuracy Distribution Across Contrastive Lambda Values', fontsize=14)
+    plt.ylabel('test Accuracy', fontsize=12)
+    plt.title('test Accuracy Distribution Across Contrastive Lambda Values', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(output_dir / "validation_accuracy_boxplot.png", dpi=150, bbox_inches='tight')
+    plt.savefig(output_dir / "test_accuracy_boxplot.png", dpi=150, bbox_inches='tight')
     plt.close()
     
     # Create summary statistics table
@@ -159,11 +159,11 @@ def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
         }
     
     # Save summary statistics
-    with open(output_dir / "validation_metrics_summary.json", 'w') as f:
+    with open(output_dir / "test_metrics_summary.json", 'w') as f:
         json.dump(summary_stats, f, indent=2)
     
     # Print summary
-    print("\\nValidation Metrics Summary:")
+    print("\\ntest Metrics Summary:")
     print("-" * 80)
     print(f"{'Lambda':<8} {'AUC Mean±Std':<15} {'Acc Mean±Std':<15} {'N Models':<8}")
     print("-" * 80)
@@ -174,9 +174,9 @@ def create_box_plots(metrics_data: dict[str, dict], output_dir: Path):
         print(f"{lam:<8.1f} {auc_str:<15} {acc_str:<15} {stats['n_models']:<8}")
     
     print(f"\\nBox plots saved to:")
-    print(f"  - {output_dir}/validation_auc_boxplot.png")
-    print(f"  - {output_dir}/validation_accuracy_boxplot.png")
-    print(f"  - {output_dir}/validation_metrics_summary.json")
+    print(f"  - {output_dir}/test_auc_boxplot.png")
+    print(f"  - {output_dir}/test_accuracy_boxplot.png")
+    print(f"  - {output_dir}/test_metrics_summary.json")
 
 
 def main():
@@ -192,11 +192,11 @@ def main():
     base_dir = Path(args.base_dir)
     output_dir = Path(args.output_dir)
     
-    # Load validation metrics
-    metrics_data = load_validation_metrics(args.param_ids, base_dir)
+    # Load test metrics
+    metrics_data = load_test_metrics(args.param_ids, base_dir)
     
     if not metrics_data:
-        print("No validation metrics found!")
+        print("No test metrics found!")
         return
     
     print(f"\\nFound metrics for {len(metrics_data)} models")

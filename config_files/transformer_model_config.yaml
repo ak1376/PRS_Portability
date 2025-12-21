@@ -6,7 +6,7 @@ grid:
   dropout: [0.1]
   pool: ["mean"]
   lr: [1e-4]
-  contrastive_lambda: [0.0, 0.1, 0.5, 1.0]
+  contrastive_lambda: [0.1]
 
 base:
   model:
@@ -16,7 +16,7 @@ base:
 
   training:
     batch_size: 64
-    epochs: 1000
+    epochs: 20
     seed: 42
     weight_decay: 0.0
     grad_clip: 1.0
@@ -25,7 +25,9 @@ base:
     debug_every: 5
     debug_n_show: 2
     debug_max_sites: 256
+    train_frac: 0.80        # NEW: split dataset into train/val
     val_frac: 0.10          # NEW: split dataset into train/val
+    test_frac: 0.10     # NEW
     early_stopping:
       enabled: true         # NEW
       monitor: "val_mlm_loss"   # NEW: which metric to watch

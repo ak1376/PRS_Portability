@@ -2,406 +2,35 @@
 from __future__ import annotations
 
 import argparse
-import csv
+import json
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import yaml
 
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, accuracy_score
-
+# -----------------------------------------------------------------------------
+# Repo import path
+# -----------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# -----------------------------------------------------------------------------
+# Project imports (thin runner: all logic lives in src/transformer/*)
+# -----------------------------------------------------------------------------
 from src.transformer.data_class import HapDataset, collate_hapbatch
 from src.transformer.model import HapMaskTransformer
-from src.transformer.masking import mask_haplotype
-from src.transformer.train import train_epoch, eval_epoch, debug_snapshot_and_pngs
 
+from src.transformer.splitting import make_train_val_test_loaders
+from src.transformer.early_stopping import EarlyStopConfig, EarlyStopper
 
-# -----------------------------------------------------------------------------
-# Early stopping
-# -----------------------------------------------------------------------------
-@dataclass
-class EarlyStopConfig:
-    enabled: bool = True
-    monitor: str = "val_mlm_loss"   # "val_mlm_loss", "val_accuracy", "val_auc"
-    mode: str = "min"              # "min" or "max"
-    patience: int = 25
-    min_delta: float = 1e-4
-    burn_in: int = 0               # epochs to wait before stopping
-
-
-def _is_improvement(curr: float, best: float, *, mode: str, min_delta: float) -> bool:
-    if mode not in ("min", "max"):
-        raise ValueError(f"early_stopping.mode must be 'min' or 'max', got {mode}")
-    if np.isnan(curr):
-        return False
-    if np.isnan(best):
-        return True
-    if mode == "min":
-        return curr < (best - float(min_delta))
-    else:
-        return curr > (best + float(min_delta))
-
-
-# -----------------------------------------------------------------------------
-# Dataset split / loaders
-# -----------------------------------------------------------------------------
-def make_train_val_loaders(
-    ds: torch.utils.data.Dataset,
-    *,
-    batch_size: int,
-    num_workers: int,
-    seed: int,
-    val_frac: float,
-    device: torch.device,
-    collate_fn,
-):
-    """
-    Deterministic split of dataset indices into train/val.
-    """
-    n = len(ds)
-    if n < 2:
-        raise ValueError(f"Need at least 2 samples to split train/val, got n={n}")
-
-    n_val = int(round(float(val_frac) * n))
-    n_val = max(1, min(n - 1, n_val))  # keep both non-empty
-
-    g = torch.Generator().manual_seed(int(seed))
-    perm = torch.randperm(n, generator=g).tolist()
-
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
-
-    train_ds = Subset(ds, train_idx)
-    val_ds = Subset(ds, val_idx)
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=int(batch_size),
-        shuffle=True,
-        num_workers=int(num_workers),
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
-        persistent_workers=(int(num_workers) > 0),
-    )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=int(batch_size),
-        shuffle=False,
-        num_workers=int(num_workers),
-        pin_memory=(device.type == "cuda"),
-        collate_fn=collate_fn,
-        persistent_workers=(int(num_workers) > 0),
-    )
-    return train_dl, val_dl, len(train_ds), len(val_ds)
-
-
-# -----------------------------------------------------------------------------
-# I/O helpers
-# -----------------------------------------------------------------------------
-def write_losses_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    """
-    Write rows with a union-of-keys header (robust if some rows have extra columns).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        raise ValueError("No rows to write.")
-
-    keys: list[str] = []
-    seen: set[str] = set()
-    for r in rows:
-        for k in r.keys():
-            if k not in seen:
-                seen.add(k)
-                keys.append(k)
-
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        w.writerows(rows)
-
-
-def plot_losses(path: Path, epochs: list[int], train_mlm: list[float], val_mlm: list[float]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure()
-    plt.plot(epochs, train_mlm, label="train_mlm")
-    plt.plot(epochs, val_mlm, label="val_mlm")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def plot_contrastive_geometry(
-    path: Path,
-    epochs: list[int],
-    pos_cos: list[float],
-    neg_cos: list[float],
-    perm_neg_cos: Optional[list[float]] = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure()
-    plt.plot(epochs, pos_cos, label="pos_cos (z1·z2)")
-    plt.plot(epochs, neg_cos, label="neg_cos (z1·z2_shuf)")
-    if perm_neg_cos is not None:
-        plt.plot(epochs, perm_neg_cos, label="perm_neg_cos (z1·zperm)")
-    plt.xlabel("epoch")
-    plt.ylabel("cosine")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def _plot_confusion_matrix_png(cm: np.ndarray, out_png: Path, *, title: str) -> None:
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6.5, 5.2))
-    im = ax.imshow(cm, interpolation="nearest")
-    ax.set_title(title)
-
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Pred 0", "Pred 1"])
-    ax.set_yticklabels(["True 0", "True 1"])
-
-    # annotate
-    for (i, j), v in np.ndenumerate(cm):
-        ax.text(j, i, str(int(v)), ha="center", va="center")
-
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-@torch.no_grad()
-def eval_masked_acc_auc(
-    model: HapMaskTransformer,
-    loader: DataLoader,
-    device: torch.device,
-    *,
-    mask_id: int,
-    p_mask_site: float,
-    class_balance: bool = True,
-) -> dict[str, float]:
-    """
-    Compute accuracy + AUC on masked sites over the given loader.
-    Only used if you early-stop on val_accuracy or val_auc (or want to log them).
-    """
-    from src.transformer.train import _compute_masked_loss  # local import
-
-    model.eval()
-
-    all_targets: list[int] = []
-    all_preds: list[int] = []
-    all_p1: list[float] = []
-    total_loss = 0.0
-    total_sites = 0
-
-    for batch in loader:
-        hap = batch.hap.to(device)
-        pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
-
-        hap_true = hap
-        hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
-
-        logits, _z = model(hap_masked, pad_mask=pad_mask)
-
-        loss_mask = masked_sites
-        if pad_mask is not None:
-            loss_mask = loss_mask & (~pad_mask)
-
-        loss, n = _compute_masked_loss(logits, hap_true, loss_mask, class_balance=class_balance)
-        if n == 0:
-            continue
-
-        probs = torch.softmax(logits, dim=-1)   # (B,L,2)
-        pred = torch.argmax(logits, dim=-1)     # (B,L)
-
-        t = hap_true[loss_mask].detach().cpu().numpy().astype(np.int64)
-        p = pred[loss_mask].detach().cpu().numpy().astype(np.int64)
-        p1 = probs[loss_mask, 1].detach().cpu().numpy().astype(np.float64)
-
-        all_targets.extend(t.tolist())
-        all_preds.extend(p.tolist())
-        all_p1.extend(p1.tolist())
-
-        total_loss += float(loss.item()) * n
-        total_sites += n
-
-    if len(all_targets) == 0:
-        return {"val_accuracy": float("nan"), "val_auc": float("nan"), "val_avg_loss": float("nan")}
-
-    targets = np.asarray(all_targets, dtype=np.int64)
-    preds = np.asarray(all_preds, dtype=np.int64)
-    p1 = np.asarray(all_p1, dtype=np.float64)
-
-    acc = float(accuracy_score(targets, preds))
-
-    # AUC can fail if only one class appears
-    try:
-        auc = float(roc_auc_score(targets, p1))
-    except Exception:
-        auc = float("nan")
-
-    avg_loss = float(total_loss / max(total_sites, 1))
-
-    return {"val_accuracy": acc, "val_auc": auc, "val_avg_loss": avg_loss}
-
-
-def comprehensive_validation_analysis(
-    model: HapMaskTransformer,
-    loader: DataLoader,
-    device: torch.device,
-    output_dir: Path,
-    *,
-    mask_id: int,
-    p_mask_site: float = 0.15,
-    class_balance: bool = True,
-) -> dict[str, Any]:
-    """
-    Final validation analysis on the provided loader (use the VAL loader).
-    Saves:
-      - validation_predictions.npy / validation_targets.npy / validation_probabilities.npy
-      - confusion_matrix.png
-      - roc_curve.png
-      - validation_metrics.json
-    """
-    from src.transformer.train import _compute_masked_loss
-
-    model.eval()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    all_predictions: list[int] = []
-    all_targets: list[int] = []
-    all_probabilities: list[float] = []
-
-    total_loss = 0.0
-    total_sites = 0
-
-    print("Collecting validation predictions...")
-
-    with torch.no_grad():
-        for batch in loader:
-            hap = batch.hap.to(device)
-            pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
-
-            hap_true = hap
-            hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
-
-            logits, _z = model(hap_masked, pad_mask=pad_mask)
-
-            loss_mask = masked_sites
-            if pad_mask is not None:
-                loss_mask = loss_mask & (~pad_mask)
-
-            loss, n = _compute_masked_loss(logits, hap_true, loss_mask, class_balance=class_balance)
-            if n == 0:
-                continue
-
-            probs = torch.softmax(logits, dim=-1)     # (B,L,2)
-            pred_class = torch.argmax(logits, dim=-1) # (B,L)
-
-            masked_targets = hap_true[loss_mask].cpu().numpy().astype(np.int64)
-            masked_predictions = pred_class[loss_mask].cpu().numpy().astype(np.int64)
-            masked_probabilities = probs[loss_mask, 1].cpu().numpy().astype(np.float64)
-
-            all_targets.extend(masked_targets.tolist())
-            all_predictions.extend(masked_predictions.tolist())
-            all_probabilities.extend(masked_probabilities.tolist())
-
-            total_loss += float(loss.item()) * n
-            total_sites += n
-
-    targets = np.asarray(all_targets, dtype=np.int64)
-    predictions = np.asarray(all_predictions, dtype=np.int64)
-    probabilities = np.asarray(all_probabilities, dtype=np.float64)
-
-    if targets.size == 0:
-        raise RuntimeError("No masked sites were collected in validation analysis. Check masking/pad handling.")
-
-    accuracy = float(accuracy_score(targets, predictions))
-
-    try:
-        auc_score = float(roc_auc_score(targets, probabilities))
-    except Exception:
-        auc_score = float("nan")
-
-    avg_loss = float(total_loss / max(total_sites, 1))
-
-    print("Validation Results:")
-    print(f"  Total masked sites: {len(targets):,}")
-    print(f"  Accuracy: {accuracy:.4f}")
-    print(f"  AUC: {auc_score:.4f}")
-    print(f"  Average loss: {avg_loss:.6f}")
-
-    np.save(output_dir / "validation_predictions.npy", predictions)
-    np.save(output_dir / "validation_targets.npy", targets)
-    np.save(output_dir / "validation_probabilities.npy", probabilities)
-
-    cm = confusion_matrix(targets, predictions)
-    _plot_confusion_matrix_png(cm, output_dir / "confusion_matrix.png", title=f"Confusion Matrix (acc={accuracy:.4f})")
-
-    # ROC curve
-    # If only one class present, roc_curve can error
-    try:
-        fpr, tpr, _thr = roc_curve(targets, probabilities)
-        plt.figure(figsize=(7, 6))
-        plt.plot(fpr, tpr, linewidth=2, label=f"ROC (AUC={auc_score:.4f})")
-        plt.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random")
-        plt.xlabel("False Positive Rate")
-        plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve - Validation Set")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(output_dir / "roc_curve.png", dpi=150, bbox_inches="tight")
-        plt.close()
-    except Exception:
-        pass
-
-    metrics: dict[str, Any] = {
-        "accuracy": accuracy,
-        "auc": auc_score,
-        "average_loss": avg_loss,
-        "total_masked_sites": int(len(targets)),
-        "class_distribution": {
-            "class_0_count": int(np.sum(targets == 0)),
-            "class_1_count": int(np.sum(targets == 1)),
-            "class_0_fraction": float(np.mean(targets == 0)),
-            "class_1_fraction": float(np.mean(targets == 1)),
-        },
-        "confusion_matrix": {
-            "tn": int(cm[0, 0]),
-            "fp": int(cm[0, 1]),
-            "fn": int(cm[1, 0]),
-            "tp": int(cm[1, 1]),
-        },
-    }
-
-    import json
-    with open(output_dir / "validation_metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-
-    print(f"Validation analysis saved to: {output_dir}")
-    return metrics
+from src.transformer.train import train_epoch, eval_epoch_losses, debug_snapshot_and_pngs
+from src.transformer.metrics import eval_masked_acc_auc, comprehensive_validation_analysis
+from src.transformer.io_utils import write_losses_csv
+from src.transformer.plots import plot_losses, plot_contrastive_geometry
 
 
 # -----------------------------------------------------------------------------
@@ -429,10 +58,52 @@ def _pick(cli_val, yaml_val, default):
     return default if (cli_val is None and yaml_val is None) else (yaml_val if cli_val is None else cli_val)
 
 
+def _resolve_fracs(
+    train_frac: float | None,
+    val_frac: float,
+    test_frac: float,
+) -> tuple[float, float, float]:
+    """
+    Accept:
+      - train_frac=None -> infer train = 1 - val - test
+      - test_frac can be 0
+    Renormalize ONLY if sum is not ~1 AND train_frac was provided explicitly.
+    """
+    val_frac = float(val_frac)
+    test_frac = float(test_frac)
+
+    inferred_train = (train_frac is None)
+    if inferred_train:
+        train_frac = 1.0 - val_frac - test_frac
+    train_frac = float(train_frac)
+
+    for name, v in [("train_frac", train_frac), ("val_frac", val_frac), ("test_frac", test_frac)]:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"{name} must be in [0,1], got {v}")
+
+    s = train_frac + val_frac + test_frac
+    if s <= 0:
+        raise ValueError("train/val/test fracs sum to 0; set at least one > 0")
+
+    # Only renormalize if the user explicitly provided train_frac (i.e., not inferred).
+    if abs(s - 1.0) > 1e-6 and (not inferred_train):
+        train_frac /= s
+        val_frac /= s
+        test_frac /= s
+
+    if train_frac <= 0.0:
+        raise ValueError("train_frac ended up 0; need non-empty training set.")
+    if val_frac <= 0.0:
+        raise ValueError("val_frac ended up 0; need non-empty validation set.")
+    # test_frac may be 0
+
+    return float(train_frac), float(val_frac), float(test_frac)
+
+
 # -----------------------------------------------------------------------------
-# Main
+# CLI
 # -----------------------------------------------------------------------------
-def main():
+def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--hap", type=str, required=True, help="Path to ONE haplotype .npy (N,L)")
@@ -441,6 +112,7 @@ def main():
     ap.add_argument("--out_plot", type=str, required=True)
     ap.add_argument("--out_debug_dir", type=str, required=True, help="Directory for debug PNGs")
     ap.add_argument("--out_ctr_plot", type=str, default=None, help="Optional: contrastive geometry plot path")
+    ap.add_argument("--out_total_plot", type=str, default=None, help="Optional: plot for total losses")
 
     ap.add_argument("--config", type=str, default=None)
 
@@ -466,10 +138,12 @@ def main():
     ap.add_argument("--debug_n_show", type=int, default=None)
     ap.add_argument("--debug_max_sites", type=int, default=None)
 
-    # Train/val split
-    ap.add_argument("--val_frac", type=float, default=None, help="Fraction of samples used for validation split")
+    # Train/val/test split overrides
+    ap.add_argument("--train_frac", type=float, default=None)
+    ap.add_argument("--val_frac", type=float, default=None)
+    ap.add_argument("--test_frac", type=float, default=None)
 
-    # Early stopping overrides (optional)
+    # Early stopping overrides
     ap.add_argument("--early_stop", action="store_true", help="Enable early stopping")
     ap.add_argument("--early_monitor", type=str, default=None)
     ap.add_argument("--early_mode", type=str, default=None, choices=["min", "max"])
@@ -494,7 +168,14 @@ def main():
     ap.add_argument("--window_mode", type=str, default=None, choices=["random", "first", "middle", "fixed"])
     ap.add_argument("--fixed_start", type=int, default=None)
 
-    args = ap.parse_args()
+    return ap
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main():
+    args = build_argparser().parse_args()
 
     # ---------------------
     # Load YAML
@@ -530,21 +211,30 @@ def main():
     args.debug_n_show = _pick(args.debug_n_show, train_cfg.get("debug_n_show"), 2)
     args.debug_max_sites = _pick(args.debug_max_sites, train_cfg.get("debug_max_sites"), 256)
 
-    # Train/val split
-    args.val_frac = _pick(args.val_frac, train_cfg.get("val_frac"), 0.1)
-    if not (0.0 < float(args.val_frac) < 1.0):
-        raise ValueError(f"val_frac must be in (0,1), got {args.val_frac}")
+    # Splits (defaults keep old behavior: val=0.1, test=0.0, train=rest)
+    yaml_train_frac = train_cfg.get("train_frac", None)
+    yaml_val_frac = train_cfg.get("val_frac", 0.1)
+    yaml_test_frac = train_cfg.get("test_frac", 0.0)
 
-    # Early stopping config (YAML defaults)
+    args.train_frac = _pick(args.train_frac, yaml_train_frac, None)
+    args.val_frac = _pick(args.val_frac, yaml_val_frac, 0.1)
+    args.test_frac = _pick(args.test_frac, yaml_test_frac, 0.0)
+
+    args.train_frac, args.val_frac, args.test_frac = _resolve_fracs(
+        args.train_frac, float(args.val_frac), float(args.test_frac)
+    )
+
+    # Early stopping (YAML defaults)
     es_yaml = train_cfg.get("early_stopping", {}) or {}
-    es = EarlyStopConfig(
+    es_cfg = EarlyStopConfig(
         enabled=bool(_pick((True if args.early_stop else None), es_yaml.get("enabled"), False)),
-        monitor=str(_pick(args.early_monitor, es_yaml.get("monitor"), "val_mlm_loss")),
+        monitor=str(_pick(args.early_monitor, es_yaml.get("monitor"), "val_total_loss")),
         mode=str(_pick(args.early_mode, es_yaml.get("mode"), "min")),
         patience=int(_pick(args.early_patience, es_yaml.get("patience"), 25)),
         min_delta=float(_pick(args.early_min_delta, es_yaml.get("min_delta"), 1e-4)),
         burn_in=int(_pick(args.early_burn_in, es_yaml.get("burn_in"), 0)),
     )
+    stopper = EarlyStopper(es_cfg)
 
     # Masking
     args.p_mask_site = _pick(args.p_mask_site, masking_cfg.get("p_mask_site"), 0.15)
@@ -588,9 +278,12 @@ def main():
     hap = torch.from_numpy(hap_np).long()
 
     print(f"[train_transformer_single] hap shape: {tuple(hap.shape)}")
-    print(f"[train_transformer_single] window_len={args.window_len} window_mode={args.window_mode} fixed_start={args.fixed_start}")
+    print(
+        f"[train_transformer_single] window_len={args.window_len} window_mode={args.window_mode} "
+        f"fixed_start={args.fixed_start}"
+    )
     print(f"[train_transformer_single] masking p_mask_site={args.p_mask_site} mask_id={args.mask_id}")
-    print(f"[train_transformer_single] val_frac={float(args.val_frac):.3f}")
+    print(f"[split_fracs] train={args.train_frac:.3f} val={args.val_frac:.3f} test={args.test_frac:.3f}")
     print(
         f"[train_transformer_single] contrastive={args.contrastive} "
         f"lambda={args.contrastive_lambda} tau={args.contrastive_tau} "
@@ -598,8 +291,8 @@ def main():
         f"p_mask_site_ctr={args.p_mask_site_ctr}"
     )
     print(
-        f"[early_stopping] enabled={es.enabled} monitor={es.monitor} mode={es.mode} "
-        f"patience={es.patience} min_delta={es.min_delta} burn_in={es.burn_in}"
+        f"[early_stopping] enabled={es_cfg.enabled} monitor={es_cfg.monitor} mode={es_cfg.mode} "
+        f"patience={es_cfg.patience} min_delta={es_cfg.min_delta} burn_in={es_cfg.burn_in}"
     )
 
     # prior for bias init
@@ -610,7 +303,7 @@ def main():
         print(f"[init] pi={pi:.6f} logit_pi={logit_pi:.6f}")
 
     # ---------------------
-    # Dataset + train/val loaders
+    # Dataset + loaders
     # ---------------------
     g = torch.Generator().manual_seed(int(args.seed))
     ds = HapDataset(
@@ -622,19 +315,21 @@ def main():
         rng=g,
     )
 
-    train_dl, val_dl, n_tr, n_va = make_train_val_loaders(
+    train_dl, val_dl, test_dl, n_tr, n_va, n_te = make_train_val_test_loaders(
         ds,
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
         seed=int(args.seed),
+        train_frac=float(args.train_frac),
         val_frac=float(args.val_frac),
+        test_frac=float(args.test_frac),
         device=device,
         collate_fn=collate_hapbatch,
     )
-    print(f"[split] n_train={n_tr} n_val={n_va}")
+    print(f"[split_counts] n_train={n_tr} n_val={n_va} n_test={n_te}")
 
     # ---------------------
-    # Model
+    # Model + optimizer
     # ---------------------
     model = HapMaskTransformer(
         vocab_size=int(args.vocab_size),
@@ -647,7 +342,6 @@ def main():
         max_len=int(args.max_len),
     ).to(device)
 
-    # init bias to class prior
     with torch.no_grad():
         model.head.bias.zero_()
         model.head.bias[1] = logit_pi
@@ -659,38 +353,34 @@ def main():
     )
 
     # ---------------------
-    # Outputs
+    # Outputs / tracking
     # ---------------------
     out_debug = Path(args.out_debug_dir)
     out_debug.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
     epochs: list[int] = []
+
     train_mlm_losses: list[float] = []
     val_mlm_losses: list[float] = []
+    train_total_losses: list[float] = []
+    val_total_losses: list[float] = []
 
-    # contrastive tracking
     ctr_pos_cos: list[float] = []
     ctr_neg_cos: list[float] = []
     ctr_perm_neg_cos: list[float] = []
 
-    # ---------------------
-    # Early stopping state
-    # ---------------------
-    best_metric = float("nan")
-    best_epoch = 0
-    best_state_cpu: Optional[dict[str, torch.Tensor]] = None
-    bad_epochs = 0
-
-    # validate monitor name
-    valid_monitors = {"val_mlm_loss", "val_accuracy", "val_auc"}
-    if es.monitor not in valid_monitors:
-        raise ValueError(f"early_stopping.monitor must be one of {sorted(valid_monitors)}, got {es.monitor}")
+    valid_monitors = {"val_total_loss", "val_mlm_loss", "val_accuracy", "val_auc"}
+    if es_cfg.monitor not in valid_monitors:
+        raise ValueError(f"early_stopping.monitor must be one of {sorted(valid_monitors)}, got {es_cfg.monitor}")
 
     # ---------------------
     # Train loop
     # ---------------------
+    last_epoch = 0
     for ep in range(1, int(args.epochs) + 1):
+        last_epoch = ep
+
         tr_out = train_epoch(
             model=model,
             loader=train_dl,
@@ -700,7 +390,6 @@ def main():
             p_mask_site=float(args.p_mask_site),
             p_mask_site_ctr=(None if args.p_mask_site_ctr is None else float(args.p_mask_site_ctr)),
             grad_clip=float(args.grad_clip),
-            # contrastive knobs
             use_contrastive=bool(args.contrastive),
             contrastive_lambda=float(args.contrastive_lambda),
             contrastive_tau=float(args.contrastive_tau),
@@ -709,26 +398,34 @@ def main():
         )
 
         tr_mlm = float(tr_out["mlm_loss"])
+        tr_total = float(tr_out["total_loss"])
         tr_ctr = float(tr_out.get("ctr_loss", float("nan")))
         pos_cos = float(tr_out.get("ctr_pos_cos", float("nan")))
         neg_cos = float(tr_out.get("ctr_neg_cos", float("nan")))
         perm_cos = float(tr_out.get("ctr_perm_neg_cos", float("nan")))
 
-        # val loss on VAL loader
-        va_loss = float(
-            eval_epoch(
-                model=model,
-                loader=val_dl,
-                device=device,
-                mask_id=int(args.mask_id),
-                p_mask_site=float(args.p_mask_site),
-            )
+        va_out = eval_epoch_losses(
+            model=model,
+            loader=val_dl,
+            device=device,
+            mask_id=int(args.mask_id),
+            p_mask_site=float(args.p_mask_site),
+            class_balance=True,
+            use_contrastive=bool(args.contrastive),
+            contrastive_lambda=float(args.contrastive_lambda),
+            contrastive_tau=float(args.contrastive_tau),
+            p_mask_site_ctr=(None if args.p_mask_site_ctr is None else float(args.p_mask_site_ctr)),
+            use_perm_negatives=bool(args.permute_negatives),
+            permute_every_k=int(args.permute_every_k),
         )
+        va_mlm = float(va_out["mlm_loss"])
+        va_total = float(va_out["total_loss"])
+        va_ctr = float(va_out["ctr_loss"])
 
-        # only compute acc/auc if needed (monitor or you want to log)
+        # acc/auc only if needed
         val_acc = float("nan")
         val_auc = float("nan")
-        if es.monitor in ("val_accuracy", "val_auc"):
+        if es_cfg.monitor in ("val_accuracy", "val_auc"):
             m = eval_masked_acc_auc(
                 model=model,
                 loader=val_dl,
@@ -739,25 +436,30 @@ def main():
             val_acc = float(m["val_accuracy"])
             val_auc = float(m["val_auc"])
 
-        # logging
+        # -------- logging --------
         if args.contrastive:
             msg = (
-                f"[epoch {ep:03d}] train_mlm={tr_mlm:.6f} train_ctr={tr_ctr:.6f} "
+                f"[epoch {ep:03d}] "
+                f"train_mlm={tr_mlm:.6f} train_total={tr_total:.6f} train_ctr={tr_ctr:.6f} "
+                f"val_mlm={va_mlm:.6f} val_total={va_total:.6f} val_ctr={va_ctr:.6f} "
                 f"pos_cos={pos_cos:.4f} neg_cos={neg_cos:.4f}"
             )
             if not np.isnan(perm_cos):
                 msg += f" perm_neg_cos={perm_cos:.4f}"
-            msg += f" val_mlm={va_loss:.6f}"
-            if es.monitor in ("val_accuracy", "val_auc"):
+            if es_cfg.monitor in ("val_accuracy", "val_auc"):
                 msg += f" val_acc={val_acc:.4f} val_auc={val_auc:.4f}"
             print(msg)
         else:
-            msg = f"[epoch {ep:03d}] train_mlm={tr_mlm:.6f} val_mlm={va_loss:.6f}"
-            if es.monitor in ("val_accuracy", "val_auc"):
+            msg = (
+                f"[epoch {ep:03d}] "
+                f"train_mlm={tr_mlm:.6f} train_total={tr_total:.6f} "
+                f"val_mlm={va_mlm:.6f} val_total={va_total:.6f}"
+            )
+            if es_cfg.monitor in ("val_accuracy", "val_auc"):
                 msg += f" val_acc={val_acc:.4f} val_auc={val_auc:.4f}"
             print(msg)
 
-        # Debug snapshots (use TRAIN loader batch so it’s stable & fast)
+        # -------- debug snapshots --------
         if int(args.debug_every) > 0 and (ep % int(args.debug_every) == 0):
             batch = next(iter(train_dl))
             snap = debug_snapshot_and_pngs(
@@ -777,139 +479,156 @@ def main():
                 f"baseMaj={snap['baseline_majority']:.3f}"
             )
 
-        # record row
+        # -------- record row --------
         row: dict[str, Any] = {
             "epoch": ep,
             "train_mlm_loss": tr_mlm,
-            "val_mlm_loss": va_loss,
+            "train_total_loss": tr_total,
+            "val_mlm_loss": va_mlm,
+            "val_total_loss": va_total,
         }
-        if es.monitor in ("val_accuracy", "val_auc"):
-            row["val_accuracy"] = val_acc
-            row["val_auc"] = val_auc
-
         if args.contrastive:
             row["train_ctr_loss"] = tr_ctr
+            row["val_ctr_loss"] = va_ctr
             row["ctr_pos_cos"] = pos_cos
             row["ctr_neg_cos"] = neg_cos
             if not np.isnan(perm_cos):
                 row["ctr_perm_neg_cos"] = perm_cos
+        if es_cfg.monitor in ("val_accuracy", "val_auc"):
+            row["val_accuracy"] = val_acc
+            row["val_auc"] = val_auc
+
         rows.append(row)
 
         epochs.append(ep)
         train_mlm_losses.append(tr_mlm)
-        val_mlm_losses.append(va_loss)
+        val_mlm_losses.append(va_mlm)
+        train_total_losses.append(tr_total)
+        val_total_losses.append(va_total)
 
         if args.contrastive:
             ctr_pos_cos.append(pos_cos)
             ctr_neg_cos.append(neg_cos)
             ctr_perm_neg_cos.append(perm_cos)
 
-        # ---------------------
-        # Early stopping check
-        # ---------------------
-        if es.enabled:
-            # get current monitored metric
-            if es.monitor == "val_mlm_loss":
-                curr = va_loss
-            elif es.monitor == "val_accuracy":
+        # -------- early stopping --------
+        if es_cfg.enabled:
+            if es_cfg.monitor == "val_total_loss":
+                curr = va_total
+            elif es_cfg.monitor == "val_mlm_loss":
+                curr = va_mlm
+            elif es_cfg.monitor == "val_accuracy":
                 curr = val_acc
-            elif es.monitor == "val_auc":
+            elif es_cfg.monitor == "val_auc":
                 curr = val_auc
             else:
                 curr = float("nan")
 
-            improved = _is_improvement(curr, best_metric, mode=es.mode, min_delta=es.min_delta)
-            if improved:
-                best_metric = float(curr)
-                best_epoch = int(ep)
-                bad_epochs = 0
+            prev_best_epoch = stopper.best_epoch
+            prev_bad = stopper.bad_epochs
 
-                # save best weights (CPU copy to avoid GPU memory balloon)
-                best_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            should_stop = stopper.step(curr_metric=float(curr), epoch=int(ep), model=model)
 
-                print(f"[early_stopping] new best {es.monitor}={best_metric:.6f} at epoch {best_epoch}")
-            else:
-                if ep >= int(es.burn_in):
-                    bad_epochs += 1
-                    print(f"[early_stopping] no improvement (bad_epochs={bad_epochs}/{es.patience})")
-                    if bad_epochs >= int(es.patience):
-                        print(
-                            f"[early_stopping] STOP at epoch {ep} "
-                            f"(best epoch={best_epoch}, best {es.monitor}={best_metric:.6f})"
-                        )
-                        break
+            # nice logs without assuming stopper.is_best exists
+            if stopper.best_epoch != prev_best_epoch:
+                if not np.isnan(stopper.best_metric):
+                    print(f"[early_stopping] new best {es_cfg.monitor}={stopper.best_metric:.6f} at epoch {stopper.best_epoch}")
                 else:
-                    # still in burn-in: do not accumulate bad epochs
-                    pass
+                    print(f"[early_stopping] new best at epoch {stopper.best_epoch}")
+
+            if stopper.bad_epochs != prev_bad and ep >= int(es_cfg.burn_in):
+                print(f"[early_stopping] no improvement (bad_epochs={stopper.bad_epochs}/{es_cfg.patience})")
+
+            if should_stop:
+                if not np.isnan(stopper.best_metric):
+                    print(
+                        f"[early_stopping] STOP at epoch {ep} "
+                        f"(best epoch={stopper.best_epoch}, best {es_cfg.monitor}={stopper.best_metric:.6f})"
+                    )
+                else:
+                    print(f"[early_stopping] STOP at epoch {ep} (best epoch={stopper.best_epoch})")
+                break
+
+    # Restore best weights (if early stopping enabled)
+    if es_cfg.enabled:
+        restored = stopper.restore_best(model)
+        if restored:
+            if not np.isnan(stopper.best_metric):
+                print(
+                    f"[early_stopping] restored best model from epoch {stopper.best_epoch} "
+                    f"({es_cfg.monitor}={stopper.best_metric:.6f})"
+                )
+            else:
+                print(f"[early_stopping] restored best model from epoch {stopper.best_epoch}")
 
     # ---------------------
-    # Restore best weights (if early stopping was enabled)
-    # ---------------------
-    if es.enabled and best_state_cpu is not None:
-        model.load_state_dict(best_state_cpu)
-        print(f"[early_stopping] restored best model from epoch {best_epoch} ({es.monitor}={best_metric:.6f})")
-
-    # ---------------------
-    # Save checkpoint (BEST model if early stopping enabled)
+    # Save checkpoint
     # ---------------------
     out_model = Path(args.out_model)
     out_model.parent.mkdir(parents=True, exist_ok=True)
 
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "config": {
-                # model
-                "vocab_size": int(args.vocab_size),
-                "d_model": int(args.d_model),
-                "n_heads": int(args.n_heads),
-                "n_layers": int(args.n_layers),
-                "dropout": float(args.dropout),
-                "pad_id": args.pad_id,
-                "pool": str(args.pool),
-                "max_len": int(args.max_len),
-                # training
-                "lr": float(args.lr),
-                "epochs": int(args.epochs),
-                "batch_size": int(args.batch_size),
-                "seed": int(args.seed),
-                "weight_decay": float(args.weight_decay),
-                "grad_clip": float(args.grad_clip),
-                "val_frac": float(args.val_frac),
-                "early_stopping": {
-                    "enabled": bool(es.enabled),
-                    "monitor": str(es.monitor),
-                    "mode": str(es.mode),
-                    "patience": int(es.patience),
-                    "min_delta": float(es.min_delta),
-                    "burn_in": int(es.burn_in),
-                    "best_epoch": int(best_epoch),
-                    "best_metric": float(best_metric) if not np.isnan(best_metric) else None,
-                },
-                # masking
-                "p_mask_site": float(args.p_mask_site),
-                "mask_id": int(args.mask_id),
-                # contrastive
-                "contrastive": bool(args.contrastive),
-                "contrastive_lambda": float(args.contrastive_lambda),
-                "contrastive_tau": float(args.contrastive_tau),
-                "permute_negatives": bool(args.permute_negatives),
-                "permute_every_k": int(args.permute_every_k),
-                "p_mask_site_ctr": (None if args.p_mask_site_ctr is None else float(args.p_mask_site_ctr)),
-                # windowing
-                "window_len": int(args.window_len) if args.window_len is not None else None,
-                "window_mode": str(args.window_mode),
-                "fixed_start": int(args.fixed_start),
-            },
+    ckpt_cfg = {
+        "vocab_size": int(args.vocab_size),
+        "d_model": int(args.d_model),
+        "n_heads": int(args.n_heads),
+        "n_layers": int(args.n_layers),
+        "dropout": float(args.dropout),
+        "pad_id": args.pad_id,
+        "pool": str(args.pool),
+        "max_len": int(args.max_len),
+        "lr": float(args.lr),
+        "epochs_requested": int(args.epochs),
+        "epochs_ran": int(last_epoch),
+        "batch_size": int(args.batch_size),
+        "seed": int(args.seed),
+        "weight_decay": float(args.weight_decay),
+        "grad_clip": float(args.grad_clip),
+        "splits": {
+            "train_frac": float(args.train_frac),
+            "val_frac": float(args.val_frac),
+            "test_frac": float(args.test_frac),
+            "n_train": int(n_tr),
+            "n_val": int(n_va),
+            "n_test": int(n_te),
         },
-        out_model,
-    )
+        "early_stopping": {
+            "enabled": bool(es_cfg.enabled),
+            "monitor": str(es_cfg.monitor),
+            "mode": str(es_cfg.mode),
+            "patience": int(es_cfg.patience),
+            "min_delta": float(es_cfg.min_delta),
+            "burn_in": int(es_cfg.burn_in),
+            "best_epoch": int(stopper.best_epoch) if es_cfg.enabled else None,
+            "best_metric": (None if (not es_cfg.enabled or np.isnan(stopper.best_metric)) else float(stopper.best_metric)),
+        },
+        "p_mask_site": float(args.p_mask_site),
+        "mask_id": int(args.mask_id),
+        "contrastive": bool(args.contrastive),
+        "contrastive_lambda": float(args.contrastive_lambda),
+        "contrastive_tau": float(args.contrastive_tau),
+        "permute_negatives": bool(args.permute_negatives),
+        "permute_every_k": int(args.permute_every_k),
+        "p_mask_site_ctr": (None if args.p_mask_site_ctr is None else float(args.p_mask_site_ctr)),
+        "window_len": int(args.window_len) if args.window_len is not None else None,
+        "window_mode": str(args.window_mode),
+        "fixed_start": int(args.fixed_start),
+    }
+
+    torch.save({"state_dict": model.state_dict(), "config": ckpt_cfg}, out_model)
 
     # ---------------------
-    # Write CSV + plots
+    # CSV + plots
     # ---------------------
     write_losses_csv(Path(args.out_losses), rows)
-    plot_losses(Path(args.out_plot), epochs, train_mlm_losses, val_mlm_losses)
+
+    plot_losses(Path(args.out_plot), epochs, train_mlm_losses, val_mlm_losses, ylabel="loss", title="MLM Loss")
+
+    out_total_plot = (
+        Path(args.out_total_plot)
+        if args.out_total_plot is not None
+        else Path(args.out_plot).with_name("loss_total.png")
+    )
+    plot_losses(out_total_plot, epochs, train_total_losses, val_total_losses, ylabel="loss", title="Total Loss (MLM + λ·CTR)")
 
     if args.contrastive:
         out_ctr_plot = (
@@ -927,35 +646,44 @@ def main():
         )
 
     # ---------------------
-    # Comprehensive validation analysis (VAL loader)
+    # Final evaluation: TEST if present else VAL
     # ---------------------
-    print("\nPerforming comprehensive validation analysis (VAL split)...")
-    validation_dir = Path(args.out_debug_dir).parent / "validation_analysis"
-    validation_metrics = comprehensive_validation_analysis(
+    use_test = (test_dl is not None and int(n_te) > 0)
+    eval_loader = test_dl if use_test else val_dl
+    split_name = "TEST" if use_test else "VAL"
+
+    # Always write into param_dir/{test_analysis|validation_analysis}
+    param_dir = Path(args.out_debug_dir).parent
+    analysis_dir = param_dir / ("test_analysis" if use_test else "validation_analysis")
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nPerforming comprehensive evaluation analysis ({split_name} split)...")
+    metrics = comprehensive_validation_analysis(
         model=model,
-        loader=val_dl,
+        loader=eval_loader,
         device=device,
-        output_dir=validation_dir,
+        output_dir=analysis_dir,
         mask_id=int(args.mask_id),
         p_mask_site=float(args.p_mask_site),
+        split_name=split_name,
     )
 
+    # Write the EXACT filename Snakemake expects at the param_dir root
     final_metrics = {
-        "final_validation_accuracy": float(validation_metrics["accuracy"]),
-        "final_validation_auc": float(validation_metrics["auc"]),
-        "total_masked_sites_analyzed": int(validation_metrics["total_masked_sites"]),
-        "best_epoch": int(best_epoch) if es.enabled else None,
-        "best_monitor": str(es.monitor) if es.enabled else None,
-        "best_metric": float(best_metric) if (es.enabled and not np.isnan(best_metric)) else None,
+        f"final_{split_name.lower()}_accuracy": float(metrics["accuracy"]),
+        f"final_{split_name.lower()}_auc": float(metrics["auc"]),
+        "total_masked_sites_analyzed": int(metrics["total_masked_sites"]),
+        "best_epoch": int(stopper.best_epoch) if es_cfg.enabled else None,
+        "best_monitor": str(es_cfg.monitor) if es_cfg.enabled else None,
+        "best_metric": (None if (not es_cfg.enabled or np.isnan(stopper.best_metric)) else float(stopper.best_metric)),
     }
 
-    import json
-    final_metrics_path = Path(args.out_debug_dir).parent / "final_validation_metrics.json"
+    final_metrics_path = param_dir / f"final_{split_name.lower()}_metrics.json"
     with open(final_metrics_path, "w") as f:
         json.dump(final_metrics, f, indent=2)
 
-    print(f"Final validation metrics saved to: {final_metrics_path}")
-    print(f"Detailed validation analysis saved to: {validation_dir}")
+    print(f"Final metrics saved to: {final_metrics_path}")
+    print(f"Detailed analysis saved to: {analysis_dir}")
 
 
 if __name__ == "__main__":
