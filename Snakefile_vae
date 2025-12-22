@@ -169,8 +169,13 @@ rule all:
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy", param_id=PARAM_IDS),
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy", param_id=PARAM_IDS),
-        # expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy", param_id=PARAM_IDS),
-        # expand(f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings_pca.png", param_id=PARAM_IDS),
+
+        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/pairs.npy", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/run_info.json", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/representative_window.txt", param_id=PARAM_IDS),
+
 
 ##############################################################################
 # RULE make_tx_config – write per-param resolved YAML
@@ -435,35 +440,94 @@ rule reconstruct_transformer:
 
 
 ##############################################################################
-# RULE extract_embeddings – uses per-param config.yaml
+# RULE extract_haplotype_embedding – single-hap z embeddings (N x d)
 ##############################################################################
-rule extract_embeddings:
+rule extract_haplotype_embedding:
     input:
-        geno  = f"{GENO_BASEDIR}/all_individuals.npy",
-        hap1  = f"{GENO_BASEDIR}/hap1.npy",
-        hap2  = f"{GENO_BASEDIR}/hap2.npy",
+        hap   = f"{GENO_BASEDIR}/hap1.npy",
         meta  = f"{GENO_BASEDIR}/meta.pkl",
         cfg   = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
         model = f"{TX_BASEDIR}/{{param_id}}/model.pt",
     output:
-        emb = f"{TX_BASEDIR}/{{param_id}}/embeddings/embeddings.npy",
-        pca = f"{TX_BASEDIR}/{{param_id}}/embeddings/latent_pca_by_population.png",
+        emb = f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings.npy",
+        pca = f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings_pca.png",
     params:
-        outdir = lambda wc: f"{TX_BASEDIR}/{wc.param_id}/embeddings",
+        script = "snakemake_scripts/extract_haplotype_embeddings.py",
     threads: 1
     resources:
         gpus = 1
     shell:
         r"""
         set -euo pipefail
-        python "{EMB_TX_SCRIPT}" \
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+
+        python "{params.script}" \
             --config "{input.cfg}" \
-            --model "{input.model}" \
-            --geno "{input.geno}" \
-            --hap1 "{input.hap1}" \
-            --hap2 "{input.hap2}" \
+            --hap "{input.hap}" \
             --meta "{input.meta}" \
-            --outdir "{params.outdir}" \
+            --model "{input.model}" \
             --output-embeddings "{output.emb}" \
-            --output-pca "{output.pca}"
+            --output-pca "{output.pca}" \
+            --amp
+        """
+
+##############################################################################
+# RULE probing_representation – compare embeddings vs IBS + Hamming
+##############################################################################
+rule probing_representation:
+    input:
+        hap = f"{GENO_BASEDIR}/hap1.npy",
+        meta = f"{GENO_BASEDIR}/meta.pkl",
+        emb = f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings.npy",
+        cfg = f"{TX_BASEDIR}/{{param_id}}/config.yaml",
+        model = f"{TX_BASEDIR}/{{param_id}}/model.pt",
+    output:
+        outdir = directory(f"{TX_BASEDIR}/{{param_id}}/probing_representation"),
+        summary = f"{TX_BASEDIR}/{{param_id}}/probing_representation/window_correlation_summary.csv",
+        fig1 = f"{TX_BASEDIR}/{{param_id}}/probing_representation/corr_summary_median_iqr.png",
+        fig2 = f"{TX_BASEDIR}/{{param_id}}/probing_representation/binned_curve_across_windows_frac_match.png",
+        fig3 = f"{TX_BASEDIR}/{{param_id}}/probing_representation/binned_curve_across_windows_max_tract.png",
+
+        # NEW: explicitly tracked "side products" your script writes
+        pairs = f"{TX_BASEDIR}/{{param_id}}/probing_representation/pairs.npy",
+        run_info = f"{TX_BASEDIR}/{{param_id}}/probing_representation/run_info.json",
+        repwin = f"{TX_BASEDIR}/{{param_id}}/probing_representation/representative_window.txt",
+
+        figH = f"{TX_BASEDIR}/{{param_id}}/probing_representation/binned_curve_across_windows_hamming.png",
+        rep_scatter = f"{TX_BASEDIR}/{{param_id}}/probing_representation/scatter_hamming_vs_cosine_repwindow.png",
+        rep_binned  = f"{TX_BASEDIR}/{{param_id}}/probing_representation/binned_hamming_vs_cosine_repwindow.png",
+        rep_strat_png = f"{TX_BASEDIR}/{{param_id}}/probing_representation/stratified_cosine_by_mcount_repwindow.png",
+        rep_strat_csv = f"{TX_BASEDIR}/{{param_id}}/probing_representation/stratified_by_mcount_summary_repwindow.csv",
+
+    params:
+        script = "snakemake_scripts/representation_probe.py",
+        window_len = 512,
+        stride = 512,
+        n_pairs = 20000,
+        seed = 42,
+        min_tract = 1,
+        q = 20,
+        min_per_bin = 200,
+        rep_choose = "best_frac",
+    threads: 1
+    resources:
+        gpus = 0
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+
+        python "{params.script}" \
+            --hap "{input.hap}" \
+            --meta "{input.meta}" \
+            --emb "{input.emb}" \
+            --outdir "{output.outdir}" \
+            --window_len {params.window_len} \
+            --stride {params.stride} \
+            --n_pairs {params.n_pairs} \
+            --seed {params.seed} \
+            --min_tract {params.min_tract} \
+            --q {params.q} \
+            --min_per_bin {params.min_per_bin} \
+            --rep_choose {params.rep_choose}
         """

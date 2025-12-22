@@ -6,7 +6,7 @@ grid:
   dropout: [0.1]
   pool: ["mean"]
   lr: [1e-4]
-  contrastive_lambda: [0.1]
+  contrastive_lambda: [0, 0.1, 0.5, 1.0]
 
 base:
   model:
@@ -16,7 +16,7 @@ base:
 
   training:
     batch_size: 64
-    epochs: 20
+    epochs: 1000
     seed: 42
     weight_decay: 0.0
     grad_clip: 1.0
