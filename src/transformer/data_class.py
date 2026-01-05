@@ -1,6 +1,7 @@
 # src/transformer/data_single.py
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset
@@ -16,8 +17,8 @@ def collate_hapbatch(items):
 
 @dataclass
 class HapBatch:
-    hap: torch.Tensor                 # (B, L) long
-    pad_mask: torch.Tensor | None = None  # (B, L) bool
+    hap: torch.Tensor
+    pad_mask: torch.Tensor | None = None
 
 
 class HapDataset(Dataset):
@@ -25,7 +26,9 @@ class HapDataset(Dataset):
     Stores haplotypes:
       hap_all: (N, L_total) long
 
-    Optionally returns a contiguous window of length window_len.
+    Supports two kinds of indexing:
+      - idx: int -> chooses window start according to window_mode (back-compat)
+      - idx: (int_ind, int_start) -> uses provided start (for same-window batching)
     """
     def __init__(
         self,
@@ -73,13 +76,25 @@ class HapDataset(Dataset):
             return int(torch.randint(0, max_start + 1, (1,)).item())
         return int(torch.randint(0, max_start + 1, (1,), generator=self.rng).item())
 
-    def __getitem__(self, idx: int) -> HapBatch:
-        h = self.hap_all[idx]
+    def __getitem__(self, idx: int | tuple[int, int]) -> HapBatch:
+        # NEW: allow (ind, start) indexing for same-window batching
+        if isinstance(idx, tuple):
+            ind = int(idx[0])
+            start = int(idx[1])
+        else:
+            ind = int(idx)
+            start = None
+
+        h = self.hap_all[ind]
 
         if self.window_len is not None and self.window_len < self.L_total:
-            s = self._choose_start()
-            e = s + self.window_len
-            h = h[s:e]
+            max_start = self.L_total - self.window_len
+            if start is None:
+                start = self._choose_start()
+            # clamp
+            start = int(max(0, min(start, max_start)))
+            end = start + self.window_len
+            h = h[start:end]
 
         pad_mask = None
         if self.pad_id is not None:

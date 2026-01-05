@@ -4,18 +4,54 @@ from __future__ import annotations
 from typing import Callable, Tuple
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
+
+from src.transformer.window_batching import SameWindowBatchSampler
+
+
+class IndexMapWindowDataset(Dataset):
+    """
+    Wraps a base dataset + a list of base indices (like Subset),
+    BUT preserves the ability to pass (local_ind, start) tuples
+    down to the base dataset as (base_ind, start).
+    """
+    def __init__(self, base_ds: Dataset, index_map: list[int]):
+        self.base_ds = base_ds
+        self.index_map = list(map(int, index_map))
+
+    def __len__(self) -> int:
+        return len(self.index_map)
+
+    def __getitem__(self, item):
+        if isinstance(item, tuple):
+            local_ind, s = int(item[0]), int(item[1])
+            base_ind = self.index_map[local_ind]
+            return self.base_ds[(base_ind, s)]
+        base_ind = self.index_map[int(item)]
+        return self.base_ds[base_ind]
 
 
 def _make_loader(
-    subset: Subset,
+    subset: Dataset,
     *,
     batch_size: int,
     num_workers: int,
     shuffle: bool,
     device: torch.device,
     collate_fn: Callable,
+    batch_sampler=None,
 ) -> DataLoader:
+    if batch_sampler is not None:
+        # When using batch_sampler, you must NOT pass batch_size or shuffle
+        return DataLoader(
+            subset,
+            batch_sampler=batch_sampler,
+            num_workers=int(num_workers),
+            pin_memory=(device.type == "cuda"),
+            collate_fn=collate_fn,
+            persistent_workers=(int(num_workers) > 0),
+        )
+
     return DataLoader(
         subset,
         batch_size=int(batch_size),
@@ -25,33 +61,6 @@ def _make_loader(
         collate_fn=collate_fn,
         persistent_workers=(int(num_workers) > 0),
     )
-
-
-def make_train_val_loaders(
-    ds: torch.utils.data.Dataset,
-    *,
-    batch_size: int,
-    num_workers: int,
-    seed: int,
-    val_frac: float,
-    device: torch.device,
-    collate_fn: Callable,
-) -> Tuple[DataLoader, DataLoader, int, int]:
-    """
-    Back-compat: deterministic train/val split.
-    """
-    train_dl, val_dl, _test_dl, n_tr, n_va, _n_te = make_train_val_test_loaders(
-        ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        seed=seed,
-        train_frac=None,          # infer from remaining
-        val_frac=val_frac,
-        test_frac=0.0,
-        device=device,
-        collate_fn=collate_fn,
-    )
-    return train_dl, val_dl, n_tr, n_va
 
 
 def make_train_val_test_loaders(
@@ -65,17 +74,10 @@ def make_train_val_test_loaders(
     test_frac: float = 0.1,
     device: torch.device,
     collate_fn: Callable,
+    # NEW:
+    same_window_batches: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader | None, int, int, int]:
-    """
-    Deterministic split of dataset indices into train/val/test.
 
-    Returns:
-      train_dl, val_dl, test_dl_or_None, n_train, n_val, n_test
-
-    Notes:
-    - If test_frac == 0.0, test_dl will be None and n_test=0.
-    - If train_frac is None, it is taken as 1 - val_frac - test_frac.
-    """
     n = len(ds)
     if n < 2:
         raise ValueError(f"Need at least 2 samples to split, got n={n}")
@@ -90,20 +92,15 @@ def make_train_val_test_loaders(
         raise ValueError(f"Invalid fracs: train={train_frac} val={val_frac} test={test_frac}")
     s = train_frac + val_frac + test_frac
     if not (abs(s - 1.0) < 1e-6):
-        # be helpful: allow slightly-off due to rounding in YAML
         train_frac /= s
         val_frac /= s
         test_frac /= s
 
-    # compute counts
     n_test = int(round(test_frac * n))
     n_val = int(round(val_frac * n))
     n_train = n - n_val - n_test
 
-    # keep non-empty splits when possible
-    # (if n is tiny, this may force test to 0)
     if n_train <= 0:
-        # steal from val first, then test
         need = 1 - n_train
         take = min(need, n_val - 1) if n_val > 1 else 0
         n_val -= take
@@ -114,7 +111,6 @@ def make_train_val_test_loaders(
         n_train += take
 
     if n_val <= 0:
-        # steal from train
         take = 1 - n_val
         if n_train - take < 1:
             raise ValueError(f"Not enough samples to make non-empty train+val splits: n={n}")
@@ -122,15 +118,12 @@ def make_train_val_test_loaders(
         n_val += take
 
     if test_frac > 0.0 and n_test <= 0:
-        # if user asked for a test set, try to create one
         if n_train > 1:
             n_train -= 1
             n_test += 1
         else:
-            # too small; fall back to no test split
             n_test = 0
 
-    # deterministic permutation
     g = torch.Generator().manual_seed(int(seed))
     perm = torch.randperm(n, generator=g).tolist()
 
@@ -138,17 +131,39 @@ def make_train_val_test_loaders(
     val_idx = perm[n_test : n_test + n_val]
     train_idx = perm[n_test + n_val :]
 
-    train_ds = Subset(ds, train_idx)
-    val_ds = Subset(ds, val_idx)
+    # IMPORTANT: use IndexMapWindowDataset so (local_ind, start) can flow through
+    train_ds = IndexMapWindowDataset(ds, train_idx)
+    val_ds = IndexMapWindowDataset(ds, val_idx)
+
+    # TRAIN LOADER
+    train_batch_sampler = None
+    if same_window_batches:
+        # ds must expose L_total and window_len for this to work
+        if not hasattr(ds, "L_total") or not hasattr(ds, "window_len"):
+            raise ValueError("same_window_batches=True requires dataset to have L_total and window_len attributes")
+        if ds.window_len is None:
+            raise ValueError("same_window_batches=True requires ds.window_len to be set (not None)")
+
+        train_batch_sampler = SameWindowBatchSampler(
+            n_samples=len(train_ds),
+            L_total=int(ds.L_total),
+            window_len=int(ds.window_len),
+            batch_size=int(batch_size),
+            seed=int(seed),
+            drop_last=True,
+        )
 
     train_dl = _make_loader(
         train_ds,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=True,
+        shuffle=(train_batch_sampler is None),
         device=device,
         collate_fn=collate_fn,
+        batch_sampler=train_batch_sampler,
     )
+
+    # VAL LOADER (keep normal batching)
     val_dl = _make_loader(
         val_ds,
         batch_size=batch_size,
@@ -160,7 +175,7 @@ def make_train_val_test_loaders(
 
     test_dl = None
     if n_test > 0:
-        test_ds = Subset(ds, test_idx)
+        test_ds = IndexMapWindowDataset(ds, test_idx)
         test_dl = _make_loader(
             test_ds,
             batch_size=batch_size,

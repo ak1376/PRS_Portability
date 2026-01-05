@@ -6,7 +6,7 @@ grid:
   dropout: [0.1]
   pool: ["mean"]
   lr: [1e-4]
-  contrastive_lambda: [0, 0.1, 0.5, 1.0]
+  contrastive_lambda: [0, 0.1]
 
 base:
   model:

@@ -132,49 +132,49 @@ rule all:
         f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
         f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
 
-        # Build genotype inputs
-        f"{GENO_BASEDIR}/all_individuals.npy",
-        f"{GENO_BASEDIR}/hap1.npy",
-        f"{GENO_BASEDIR}/hap2.npy",
-        f"{GENO_BASEDIR}/meta.pkl",
-        f"{GENO_BASEDIR}/snp_index.npy",
-        f"{GENO_BASEDIR}/ts_individual_ids.npy",
+        # # Build genotype inputs
+        # f"{GENO_BASEDIR}/all_individuals.npy",
+        # f"{GENO_BASEDIR}/hap1.npy",
+        # f"{GENO_BASEDIR}/hap2.npy",
+        # f"{GENO_BASEDIR}/meta.pkl",
+        # f"{GENO_BASEDIR}/snp_index.npy",
+        # f"{GENO_BASEDIR}/ts_individual_ids.npy",
 
-        # Per-param resolved config
-        expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
+        # # Per-param resolved config
+        # expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
 
-        # # Train transformer for all hyperparam combos
-        expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
+        # # # Train transformer for all hyperparam combos
+        # expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
         
-        # Validation analysis outputs
-        expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
+        # # Validation analysis outputs
+        # expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
         
-        # Validation box plots
-        f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",
-        f"{TX_BASEDIR}/test_analysis/test_accuracy_boxplot.png",
-        # Contrastive plots (only for models with lambda > 0)
-        expand(f"{TX_BASEDIR}/{{param_id}}/contrastive_geometry.png", 
-               param_id=[p for p in PARAM_IDS if parse_param_id(p)['contrastive_lambda'] > 0]),
+        # # Validation box plots
+        # f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",
+        # f"{TX_BASEDIR}/test_analysis/test_accuracy_boxplot.png",
+        # # Contrastive plots (only for models with lambda > 0)
+        # expand(f"{TX_BASEDIR}/{{param_id}}/contrastive_geometry.png", 
+        #        param_id=[p for p in PARAM_IDS if parse_param_id(p)['contrastive_lambda'] > 0]),
 
-        # Model comparison plots
-        f"{TX_BASEDIR}/comparison_plots/training_loss_comparison.png",
-        f"{TX_BASEDIR}/comparison_plots/validation_loss_comparison.png",
-        f"{TX_BASEDIR}/comparison_plots/contrastive_pos.png",
-        f"{TX_BASEDIR}/comparison_plots/contrastive_neg.png", 
-        f"{TX_BASEDIR}/comparison_plots/contrastive_perm_neg.png",
+        # # Model comparison plots
+        # f"{TX_BASEDIR}/comparison_plots/training_loss_comparison.png",
+        # f"{TX_BASEDIR}/comparison_plots/validation_loss_comparison.png",
+        # f"{TX_BASEDIR}/comparison_plots/contrastive_pos.png",
+        # f"{TX_BASEDIR}/comparison_plots/contrastive_neg.png", 
+        # f"{TX_BASEDIR}/comparison_plots/contrastive_perm_neg.png",
 
         # # Uncomment if you want these computed for every param_id
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap1.npy", param_id=PARAM_IDS),
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_hap2.npy", param_id=PARAM_IDS),
         # expand(f"{TX_BASEDIR}/{{param_id}}/recon/reconstructed_genotypes.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings_pca.png", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/hap_embeddings/hap1_embeddings_pca.png", param_id=PARAM_IDS),
 
-        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/pairs.npy", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/run_info.json", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/representative_window.txt", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/pairs.npy", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/run_info.json", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/probing_representation/representative_window.txt", param_id=PARAM_IDS),
 
 
 ##############################################################################

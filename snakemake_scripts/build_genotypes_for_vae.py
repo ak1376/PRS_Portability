@@ -12,12 +12,12 @@ def compute_site_stats(ts: tskit.TreeSequence) -> dict:
     Compute basic genotype / site statistics from a TreeSequence.
     Note: these are based on raw genotype_matrix() (before biallelic/MAF filters).
     """
-    G_hap = ts.genotype_matrix()  # (sites, samples)
+    G_hap = ts.genotype_matrix()  # (sites, samples), where samples = 2 * individuals
 
     num_sites_total = ts.num_sites
     num_inds = ts.num_individuals if ts.num_individuals > 0 else ts.num_samples
 
-    segregating = (G_hap.max(axis=1) > 0)
+    segregating = (G_hap.max(axis=1) > 0) # Mark an allele as segregating if it has alleles that aren't just 0
     multiallelic = (G_hap.max(axis=1) > 1)
 
     stats = {
@@ -32,7 +32,14 @@ def compute_site_stats(ts: tskit.TreeSequence) -> dict:
 
 def _choose_contiguous_block(num_sites: int, subset_snps: int, subset_mode: str, seed: int = 0):
     """
-    Return (start, end) indices for a contiguous SNP block.
+    Purpose: Constructing the input dataset for our SSL model. Genomic window of SNPs.
+    Args:
+        - num_sites: total number of available SNPs
+        - subset_snps: number of SNPs to keep in the block
+        - subset_mode: "first", "middle", or "random"
+        - seed: random seed for "random" mode
+    Returns:
+        Tuple[int, int]: (start, end) indices for a contiguous SNP block.
     """
     if subset_snps is None or subset_snps >= num_sites:
         return 0, num_sites
@@ -53,7 +60,10 @@ def _choose_contiguous_block(num_sites: int, subset_snps: int, subset_mode: str,
 
 def _maf_filter_mask_from_haps(G_hap_biallelic: np.ndarray, maf_threshold: float) -> tuple[np.ndarray, dict]:
     """
-    G_hap_biallelic: (sites, samples) with alleles in {0,1}, no missing.
+    Takes the biallelic haplotype matrix and then removes monomorphic sites and low MAF sites.
+    Args:
+        - G_hap_biallelic: (sites, samples) with alleles in {0,1}, no missing.
+        - maf_threshold: float, minimum minor allele frequency to keep a site.
     Returns:
       - keep_mask over sites
       - info dict with counts for logging

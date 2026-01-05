@@ -1,5 +1,5 @@
 {
-    "genome_length": 1e6,
+    "genome_length": 1e7,
     "mutation_rate": 1.5e-08,
     "recombination_rate": 1.5e-08,
     "demographic_model": "out_of_africa",

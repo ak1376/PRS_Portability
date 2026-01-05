@@ -325,6 +325,7 @@ def main():
         test_frac=float(args.test_frac),
         device=device,
         collate_fn=collate_hapbatch,
+        same_window_batches=True,   # <--- ADD THIS
     )
     print(f"[split_counts] n_train={n_tr} n_val={n_va} n_test={n_te}")
 
@@ -380,6 +381,11 @@ def main():
     last_epoch = 0
     for ep in range(1, int(args.epochs) + 1):
         last_epoch = ep
+
+        # NEW: tell the batch sampler what epoch we're in (for deterministic window-starts)
+        bs = getattr(train_dl, "batch_sampler", None)
+        if bs is not None and hasattr(bs, "set_epoch"):
+            bs.set_epoch(ep)
 
         tr_out = train_epoch(
             model=model,
