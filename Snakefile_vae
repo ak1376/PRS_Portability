@@ -126,30 +126,40 @@ Path(f"{SIM_BASEDIR}/config.json").write_text(json.dumps(CFG, indent=4))
 ##############################################################################
 # RULE all
 ##############################################################################
+##############################################################################
+# RULE all
+##############################################################################
 rule all:
     input:
         # One sim (sid=0 rep=0)
         f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
         f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
 
-        # # Build genotype inputs
-        # f"{GENO_BASEDIR}/all_individuals.npy",
-        # f"{GENO_BASEDIR}/hap1.npy",
-        # f"{GENO_BASEDIR}/hap2.npy",
-        # f"{GENO_BASEDIR}/meta.pkl",
-        # f"{GENO_BASEDIR}/snp_index.npy",
-        # f"{GENO_BASEDIR}/ts_individual_ids.npy",
+        # Build genotype inputs (updated outputs)
+        f"{GENO_BASEDIR}/all_individuals.npy",
+        f"{GENO_BASEDIR}/hap1.npy",
+        # hap2 is expected for stdpopsim human OOA (diploid); keep as required
+        f"{GENO_BASEDIR}/hap2.npy",
+        f"{GENO_BASEDIR}/meta.pkl",
+        f"{GENO_BASEDIR}/snp_index.npy",
+        f"{GENO_BASEDIR}/ts_individual_ids.npy",
+        # NEW: stable variant identifiers / positions
+        f"{GENO_BASEDIR}/variant_positions_bp.npy",
+        f"{GENO_BASEDIR}/variant_site_ids.npy",
+        # also handy to keep (your script writes these)
+        f"{GENO_BASEDIR}/genotype_site_stats.txt",
+        f"{GENO_BASEDIR}/site_filter_report.txt",
 
-        # # Per-param resolved config
-        # expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
+        # Per-param resolved config
+        expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
 
         # # # Train transformer for all hyperparam combos
-        # expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
-        # expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
-        # expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
+        expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
         
-        # # Validation analysis outputs
-        # expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
+        # Validation analysis outputs
+        expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
         
         # # Validation box plots
         # f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",
@@ -271,30 +281,59 @@ rule simulate:
 rule build_inputs:
     input:
         tree  = f"{SIM_BASEDIR}/0/rep0/tree_sequence.trees",
-        pheno = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl"
+        pheno = f"{SIM_BASEDIR}/0/rep0/phenotype.pkl",
     output:
-        geno    = f"{GENO_BASEDIR}/all_individuals.npy",
-        hap1    = f"{GENO_BASEDIR}/hap1.npy",
-        hap2    = f"{GENO_BASEDIR}/hap2.npy",
-        meta    = f"{GENO_BASEDIR}/meta.pkl",
-        snp_idx = f"{GENO_BASEDIR}/snp_index.npy",
-        ts_ids  = f"{GENO_BASEDIR}/ts_individual_ids.npy",
+        geno      = f"{GENO_BASEDIR}/all_individuals.npy",
+        hap1      = f"{GENO_BASEDIR}/hap1.npy",
+        hap2      = f"{GENO_BASEDIR}/hap2.npy",
+        meta      = f"{GENO_BASEDIR}/meta.pkl",
+        snp_idx   = f"{GENO_BASEDIR}/snp_index.npy",
+        ts_ids    = f"{GENO_BASEDIR}/ts_individual_ids.npy",
+        positions = f"{GENO_BASEDIR}/variant_positions_bp.npy",
+        site_ids  = f"{GENO_BASEDIR}/variant_site_ids.npy",
+        stats_txt = f"{GENO_BASEDIR}/genotype_site_stats.txt",
+        filt_txt  = f"{GENO_BASEDIR}/site_filter_report.txt",
     params:
-        outdir      = GENO_BASEDIR,
-        subset_snps = BASE_DATA.get("subset_snps", 10000),
-        subset_mode = BASE_DATA.get("subset_mode", "random"),
-        maf_threshold = BASE_DATA.get("maf_threshold", 0.01)
+        outdir        = GENO_BASEDIR,
+        subset_mode   = BASE_DATA.get("subset_mode", "random"),
+        subset_seed   = int(BASE_DATA.get("subset_seed", 0)),
+        maf_threshold = float(BASE_DATA.get("maf_threshold", 0.01)),
+        # choose ONE: bp-based preferred if provided; else SNP-count
+        subset_bp     = BASE_DATA.get("subset_bp", None),
+        subset_snps   = int(BASE_DATA.get("subset_snps", 10000)),
     threads: 1
     shell:
         r"""
         set -euo pipefail
+
+        # Prefer bp-based windowing if subset_bp is provided in config
+        EXTRA_SUBSET_ARGS=""
+        if [ "{params.subset_bp}" != "None" ] && [ -n "{params.subset_bp}" ]; then
+            EXTRA_SUBSET_ARGS="--subset-bp {params.subset_bp}"
+        else
+            EXTRA_SUBSET_ARGS="--subset-snps {params.subset_snps}"
+        fi
+
         python "{BUILD_INPUTS}" \
             --tree "{input.tree}" \
             --phenotype "{input.pheno}" \
-            --maf-threshold "{params.maf_threshold}" \
             --outdir "{params.outdir}" \
-            --subset-snps "{params.subset_snps}" \
-            --subset-mode "{params.subset_mode}"
+            --maf-threshold "{params.maf_threshold}" \
+            --subset-mode "{params.subset_mode}" \
+            --subset-seed "{params.subset_seed}" \
+            $EXTRA_SUBSET_ARGS
+
+        # Sanity checks that required outputs exist (Snakemake also checks, but this is nice for debugging)
+        test -f "{output.geno}"
+        test -f "{output.hap1}"
+        test -f "{output.hap2}"
+        test -f "{output.meta}"
+        test -f "{output.snp_idx}"
+        test -f "{output.ts_ids}"
+        test -f "{output.positions}"
+        test -f "{output.site_ids}"
+        test -f "{output.stats_txt}"
+        test -f "{output.filt_txt}"
         """
 
 ##############################################################################
