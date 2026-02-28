@@ -39,38 +39,9 @@ from simulation import (  # noqa: E402
     simulation,   # engine-aware (msprime = neutral; slim = BGS)
     create_SFS,   # builds a moments.Spectrum from the ts,
     simulate_traits,
-    calculate_fst
+    calculate_fst,
+    sample_params
 )
-
-# ------------------------------------------------------------------
-# parameter sampling helpers
-# ------------------------------------------------------------------
-def sample_params(
-    priors: Dict[str, List[float]], *, rng: Optional[np.random.Generator] = None
-) -> Dict[str, float]:
-    rng = rng or np.random.default_rng()
-    params = {k: float(rng.uniform(*bounds)) for k, bounds in priors.items()}
-    # keep bottleneck start > end if both are present
-    if {"t_bottleneck_start", "t_bottleneck_end"}.issubset(params) and params[
-        "t_bottleneck_start"
-    ] <= params["t_bottleneck_end"]:
-        params["t_bottleneck_start"], params["t_bottleneck_end"] = (
-            params["t_bottleneck_end"],
-            params["t_bottleneck_start"],
-        )
-    return params
-
-
-def sample_coverage_percent(
-    selection_cfg: Dict[str, List[float]], *, rng: Optional[np.random.Generator] = None
-) -> float:
-    """
-    Sample a *percent* (e.g., 37.4) from selection_cfg["coverage_percent"] = [low, high].
-    Only used when engine == "slim".
-    """
-    rng = rng or np.random.default_rng()
-    low, high = selection_cfg["coverage_percent"]
-    return float(rng.uniform(low, high))
 
 
 # ------------------------------------------------------------------
@@ -153,15 +124,7 @@ def run_simulation(
         sampled_params = sample_params(cfg["priors"], rng=rng)
 
 
-    # Decide coverage based on engine
-    if engine == "slim":
-        if not sel_cfg.get("enabled", False):
-            raise ValueError("engine='slim' requires selection.enabled=true in your config.")
-        if "coverage_percent" not in sel_cfg:
-            raise ValueError("engine='slim' requires selection.coverage_percent=[low, high].")
-        sampled_coverage = sample_coverage_percent(sel_cfg, rng=rng)  # percent, e.g. 37.4
-        print(f"• engine=slim → sampled coverage: {sampled_coverage:.2f}%")
-    elif engine == "msprime":
+    if engine == "msprime":
         # Neutral path: NO BGS and NO coverage sampling
         sampled_coverage = None
         print("• engine=msprime → neutral (no BGS); skipping coverage sampling.")
@@ -174,7 +137,7 @@ def run_simulation(
     if simulation_seed is not None:
         sim_cfg["seed"] = simulation_seed
     
-    ts, g = simulation(sampled_params, model_type, sim_cfg, sampled_coverage)
+    ts, g = simulation(sampled_params = sampled_params, model_type = model_type, experiment_config = sim_cfg)
 
     # Get both trait effect sizes and complete phenotype simulation (with population info)
     trait_df, phenotype_df = simulate_traits(ts, cfg)
@@ -207,66 +170,6 @@ def run_simulation(
     ax.figure.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close(ax.figure)
 
-    # Metadata sidecar
-    sel_summary = getattr(ts, "_bgs_selection_summary", {}) or {}
-
-    # Only include BGS / selection knobs if we actually ran SLiM
-    is_bgs = (engine == "slim")
-    meta = dict(
-        engine=str(engine),
-        model_type=str(model_type),
-        # Neutral vs BGS:
-        selection=is_bgs,
-        # Species/DFE only meaningful for SLiM runs
-        species=(str(sel_cfg.get("species", "HomSap")) if is_bgs else None),
-        dfe_id=(str(sel_cfg.get("dfe_id", "Gamma_K17")) if is_bgs else None),
-        # Real-window keys (None if unused or neutral)
-        chromosome=(sel_cfg.get("chromosome") if is_bgs else None),
-        left=(sel_cfg.get("left") if is_bgs else None),
-        right=(sel_cfg.get("right") if is_bgs else None),
-        genetic_map=(sel_cfg.get("genetic_map") if is_bgs else None),
-        # Synthetic-contig parameters (always in cfg)
-        genome_length=float(cfg.get("genome_length")),
-        mutation_rate=float(cfg.get("mutation_rate")),
-        recombination_rate=float(cfg.get("recombination_rate")),
-        # BGS tiling / coverage knobs from config (only if SLiM)
-        coverage_fraction=(
-            None if not is_bgs else
-            (None if sel_cfg.get("coverage_fraction") is None else float(sel_cfg["coverage_fraction"]))
-        ),
-        coverage_percent=(
-            None if not is_bgs else
-            (None if sel_cfg.get("coverage_percent") is None else
-             [float(sel_cfg["coverage_percent"][0]), float(sel_cfg["coverage_percent"][1])])
-        ),
-        exon_bp=(int(sel_cfg.get("exon_bp", 200)) if is_bgs else None),
-        jitter_bp=(int(sel_cfg.get("jitter_bp", 0)) if is_bgs else None),
-        tile_bp=(int(sel_cfg["tile_bp"]) if is_bgs and sel_cfg.get("tile_bp") is not None else None),
-        # Realized selection span (after interval building; zeroes for neutral)
-        selected_bp=(int(sel_summary.get("selected_bp", 0)) if is_bgs else 0),
-        selected_frac=(float(sel_summary.get("selected_frac", 0.0)) if is_bgs else 0.0),
-        # Persist the actual sampled coverage (percent) only for SLiM
-        sampled_coverage_percent=(float(sampled_coverage) if is_bgs and sampled_coverage is not None else None),
-        # Also a fraction version (helpful for window scripts)
-        target_coverage_frac=(
-            (float(sampled_coverage) / 100.0) if is_bgs and sampled_coverage is not None and float(sampled_coverage) > 1.0
-            else (float(sampled_coverage) if is_bgs and sampled_coverage is not None else None)
-        ),
-        # SLiM options
-        slim_scaling=(float(sel_cfg.get("slim_scaling", 10.0)) if is_bgs else None),
-        slim_burn_in=(float(sel_cfg.get("slim_burn_in", 5.0)) if is_bgs else None),
-        # misc
-        num_samples={k: int(v) for k, v in (cfg.get("num_samples") or {}).items()},
-        base_seed=(None if cfg.get("seed") is None else int(cfg.get("seed"))),
-        simulation_seed=simulation_seed,
-        sequence_length=float(ts.sequence_length),
-        tree_sequence=str(ts_path),
-        # sampled priors
-        sampled_params={k: float(v) for k, v in sampled_params.items()},
-    )
-
-    (out_dir / "bgs.meta.json").write_text(json.dumps(meta, indent=2))
-
     # friendly path for log
     try:
         rel = out_dir.relative_to(PROJECT_ROOT)
@@ -296,11 +199,7 @@ def main():
         "--model-type",
         required=True,
         choices=[
-            "bottleneck",
-            "split_isolation",
-            "split_migration",
-            "drosophila_three_epoch",
-            "out_of_africa",
+            "IM_symmetric"
         ],
         help="Which demographic model to simulate",
     )
@@ -332,8 +231,6 @@ def main():
         args.replicate,
         args.output_dir,
     )
-
-
 
 if __name__ == "__main__":
     main()

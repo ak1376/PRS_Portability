@@ -3,7 +3,7 @@ from pathlib import Path
 from snakemake.io import protected
 
 SIM_SCRIPT = "snakemake_scripts/simulation.py"
-EXP_CFG    = "config_files/experiment_config_ooa.json"
+EXP_CFG    = "config_files/experiment_config_IM_symmetric.json"
 
 # Experiment metadata
 CFG   = json.loads(Path(EXP_CFG).read_text())
@@ -50,12 +50,11 @@ rule simulate:
         params    = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/sampled_params.pkl",
         tree      = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/tree_sequence.trees",
         fig       = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/demes.png",
-        meta      = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/bgs.meta.json",
         trait     = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/effect_sizes.pkl",
         phenotype = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/phenotype.pkl",
         done      = protected(f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/.done"),
     params:
-        sim_dir = SIM_BASEDIR,   # <- BASE dir, no sid/rep here
+        sim_dir = SIM_BASEDIR,
         cfg     = EXP_CFG,
         model   = MODEL
     threads: 1
@@ -71,11 +70,8 @@ rule simulate:
           --replicate {wildcards.rep} \
           --output-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}"
 
-        # ensure expected outputs exist, then create sentinel
-        test -f "{output.meta}"
         touch "{output.done}"
         """
-
 
 ##############################################################################
 # RULE gwas – run GWAS for each sid × rep                                   #

@@ -1,0 +1,51 @@
+{
+  "genome_length": 1e7,
+  "mutation_rate": 1.29e-8,
+  "recombination_rate": 1.2e-8,
+  "demographic_model": "IM_symmetric",
+  "num_samples": {
+    "YRI": 500,
+    "CEU": 500
+  },
+  "seed": 295,
+  "num_draws": 1,
+  "priors": {
+    "N_anc": [
+      100,
+      30000
+    ],
+    "N_YRI": [
+      100,
+      30000
+    ],
+    "N_CEU": [
+      100,
+      30000
+    ],
+    "m": [
+      1e-8,
+      1e-4
+    ],
+    "T_split": [
+      500,
+      20000
+    ]
+  },
+
+  "parameter_order": [
+    "N_anc",
+    "N_YRI",
+    "N_CEU",
+    "m",
+    "T_split"
+  ], 
+    "num_causal_variants": 100, 
+    "heritability": 0.7,
+    "trait_distribution": "normal",
+    "trait_distribution_parameters": {
+        "mean": 0,
+        "std": 1
+    },
+    "engine": "msprime", 
+    "species": "HomSap"
+}
