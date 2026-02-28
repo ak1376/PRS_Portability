@@ -44,11 +44,11 @@ base:
       p_mask_site_ctr: 0.20   # NEW
 
   masking:
-    p_mask_site: 0.75
+    p_mask_site: 0.2
     mask_id: 2
 
   data:
     window_len: 512
-    window_mode: "fixed"
+    window_mode: "random"
     fixed_start: 0
     maf_threshold: 0.01

@@ -66,7 +66,8 @@ POOLS      = GRID.get("pool", ["mean"])
 LRS        = GRID.get("lr", [1e-4])
 LAMBDAS = GRID.get("contrastive_lambda", [BASE_TRAIN.get("contrastive", {}).get("lambda", 0.0)])
 P_MASK_SITE_CTRS = GRID.get("p_mask_site_ctr", [0.20])
-P_MASK_SITES = GRID.get("p_mask_site", [0.75])
+#TODO: Need to fix this hardcoding
+P_MASK_SITES = GRID.get("p_mask_site", [0.2])
 
 PARAM_COMBINATIONS = list(product(
     EMBED_DIMS, N_HEADS, N_LAYERS, FF_DIMS, DROPOUTS, POOLS, LRS, LAMBDAS,
@@ -153,13 +154,13 @@ rule all:
         # Per-param resolved config
         expand(f"{TX_BASEDIR}/{{param_id}}/config.yaml", param_id=PARAM_IDS),
 
-        # # # Train transformer for all hyperparam combos
-        expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
-        expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
+        # # # # Train transformer for all hyperparam combos
+        # expand(f"{TX_BASEDIR}/{{param_id}}/model.pt", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/train_losses.csv", param_id=PARAM_IDS),
+        # expand(f"{TX_BASEDIR}/{{param_id}}/loss_curves.png", param_id=PARAM_IDS),
         
-        # Validation analysis outputs
-        expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
+        # # Validation analysis outputs
+        # expand(f"{TX_BASEDIR}/{{param_id}}/final_test_metrics.json", param_id=PARAM_IDS),
         
         # # Validation box plots
         # f"{TX_BASEDIR}/test_analysis/test_auc_boxplot.png",

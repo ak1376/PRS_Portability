@@ -277,15 +277,15 @@ def main():
         raise ValueError(f"--hap must be 2D (N,L). Got {hap_np.shape}")
     hap = torch.from_numpy(hap_np).long()
 
-    print(f"[train_transformer_single] hap shape: {tuple(hap.shape)}")
+    print(f"[train_transformer] hap shape: {tuple(hap.shape)}")
     print(
-        f"[train_transformer_single] window_len={args.window_len} window_mode={args.window_mode} "
+        f"[train_transformer] window_len={args.window_len} window_mode={args.window_mode} "
         f"fixed_start={args.fixed_start}"
     )
-    print(f"[train_transformer_single] masking p_mask_site={args.p_mask_site} mask_id={args.mask_id}")
+    print(f"[train_transformer] masking p_mask_site={args.p_mask_site} mask_id={args.mask_id}")
     print(f"[split_fracs] train={args.train_frac:.3f} val={args.val_frac:.3f} test={args.test_frac:.3f}")
     print(
-        f"[train_transformer_single] contrastive={args.contrastive} "
+        f"[train_transformer] contrastive={args.contrastive} "
         f"lambda={args.contrastive_lambda} tau={args.contrastive_tau} "
         f"perm_neg={args.permute_negatives} permute_every_k={args.permute_every_k} "
         f"p_mask_site_ctr={args.p_mask_site_ctr}"
@@ -295,24 +295,16 @@ def main():
         f"patience={es_cfg.patience} min_delta={es_cfg.min_delta} burn_in={es_cfg.burn_in}"
     )
 
-    # prior for bias init
-    with torch.no_grad():
-        pi = float(hap.float().mean().item())
-        pi = min(max(pi, 1e-4), 1.0 - 1e-4)
-        logit_pi = float(np.log(pi / (1.0 - pi)))
-        print(f"[init] pi={pi:.6f} logit_pi={logit_pi:.6f}")
-
     # ---------------------
     # Dataset + loaders
     # ---------------------
-    g = torch.Generator().manual_seed(int(args.seed))
     ds = HapDataset(
         hap_all=hap,
         pad_id=args.pad_id,
         window_len=int(args.window_len) if args.window_len is not None else None,
         window_mode=str(args.window_mode),
         fixed_start=int(args.fixed_start),
-        rng=g,
+        seed=int(args.seed),
     )
 
     train_dl, val_dl, test_dl, n_tr, n_va, n_te = make_train_val_test_loaders(
@@ -325,7 +317,6 @@ def main():
         test_frac=float(args.test_frac),
         device=device,
         collate_fn=collate_hapbatch,
-        same_window_batches=True,   # <--- ADD THIS
     )
     print(f"[split_counts] n_train={n_tr} n_val={n_va} n_test={n_te}")
 
@@ -342,10 +333,6 @@ def main():
         pool=str(args.pool),
         max_len=int(args.max_len),
     ).to(device)
-
-    with torch.no_grad():
-        model.head.bias.zero_()
-        model.head.bias[1] = logit_pi
 
     opt = torch.optim.AdamW(
         model.parameters(),
@@ -382,10 +369,9 @@ def main():
     for ep in range(1, int(args.epochs) + 1):
         last_epoch = ep
 
-        # NEW: tell the batch sampler what epoch we're in (for deterministic window-starts)
-        bs = getattr(train_dl, "batch_sampler", None)
-        if bs is not None and hasattr(bs, "set_epoch"):
-            bs.set_epoch(ep)
+        # IMPORTANT: advance dataset epoch so each epoch gets new windows (reproducibly)
+        if hasattr(ds, "set_epoch"):
+            ds.set_epoch(ep)
 
         tr_out = train_epoch(
             model=model,
@@ -416,7 +402,7 @@ def main():
             device=device,
             mask_id=int(args.mask_id),
             p_mask_site=float(args.p_mask_site),
-            class_balance=True,
+            class_balance=False,
             use_contrastive=bool(args.contrastive),
             contrastive_lambda=float(args.contrastive_lambda),
             contrastive_tau=float(args.contrastive_tau),
@@ -535,7 +521,6 @@ def main():
 
             should_stop = stopper.step(curr_metric=float(curr), epoch=int(ep), model=model)
 
-            # nice logs without assuming stopper.is_best exists
             if stopper.best_epoch != prev_best_epoch:
                 if not np.isnan(stopper.best_metric):
                     print(f"[early_stopping] new best {es_cfg.monitor}={stopper.best_metric:.6f} at epoch {stopper.best_epoch}")
@@ -626,7 +611,6 @@ def main():
     # CSV + plots
     # ---------------------
     write_losses_csv(Path(args.out_losses), rows)
-
     plot_losses(Path(args.out_plot), epochs, train_mlm_losses, val_mlm_losses, ylabel="loss", title="MLM Loss")
 
     out_total_plot = (
@@ -658,7 +642,6 @@ def main():
     eval_loader = test_dl if use_test else val_dl
     split_name = "TEST" if use_test else "VAL"
 
-    # Always write into param_dir/{test_analysis|validation_analysis}
     param_dir = Path(args.out_debug_dir).parent
     analysis_dir = param_dir / ("test_analysis" if use_test else "validation_analysis")
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -674,7 +657,6 @@ def main():
         split_name=split_name,
     )
 
-    # Write the EXACT filename Snakemake expects at the param_dir root
     final_metrics = {
         f"final_{split_name.lower()}_accuracy": float(metrics["accuracy"]),
         f"final_{split_name.lower()}_auc": float(metrics["auc"]),

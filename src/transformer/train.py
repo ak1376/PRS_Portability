@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -156,7 +157,6 @@ def save_debug_png_top_only(
     plt.close(fig)
 
 
-
 @torch.no_grad()
 def debug_snapshot_and_pngs(
     *,
@@ -175,8 +175,13 @@ def debug_snapshot_and_pngs(
     hap = batch.hap.to(device)
     pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
 
-    hap_true = hap
-    hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
+    # IMPORTANT: preserve true targets before any masking (masking may be in-place)
+    hap_true = hap.clone()
+
+    # IMPORTANT: mask a clone so we never corrupt `hap_true`
+    hap_masked, masked_sites = mask_haplotype(
+        hap.clone(), mask_id=mask_id, p_mask_site=p_mask_site
+    )
 
     logits, _ = model(hap_masked, pad_mask=pad_mask)
     pred = logits.argmax(dim=-1)
@@ -204,6 +209,7 @@ def debug_snapshot_and_pngs(
         )
 
     return metrics
+
 
 # -----------------------------------------------------------------------------
 # Loss (MLM over masked sites)
@@ -270,7 +276,7 @@ def train_epoch(
     p_mask_site: float = 0.15,
     p_mask_site_ctr: float | None = None,
     grad_clip: float | None = 1.0,
-    class_balance: bool = True,
+    class_balance: bool = False,
     # contrastive knobs
     use_contrastive: bool = True,
     contrastive_lambda: float = 0.1,
@@ -318,13 +324,30 @@ def train_epoch(
 
         hap = batch.hap.to(device)
         pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
-        hap_true = hap
+
+        # IMPORTANT: preserve true targets before any masking (masking may be in-place)
+        hap_true = hap.clone()
 
         # ---- view 1 (MLM) ----
+        # IMPORTANT: mask a clone so we never corrupt `hap_true` (and don't mutate `hap`)
         hap_masked1, masked_sites1 = mask_haplotype(
-            hap, mask_id=mask_id, p_mask_site=float(p_mask_site), rng=rng
+            hap.clone(), mask_id=mask_id, p_mask_site=float(p_mask_site), rng=rng
         )
         logits1, z1 = model(hap_masked1, pad_mask=pad_mask)
+
+        # ---- DEBUG: are logits varying across sites? ----
+        with torch.no_grad():
+            l = logits1.detach()
+            pos_std = l.std(dim=1).mean().item()
+            batch_std = l.std(dim=0).mean().item()
+            if l.size(1) >= 2:
+                mean_abs_diff_0_1 = (l[:, 0, :] - l[:, 1, :]).abs().mean().item()
+            else:
+                mean_abs_diff_0_1 = float("nan")
+            print(
+                f"[logits_debug] pos_std={pos_std:.6g} batch_std={batch_std:.6g} "
+                f"| mean|Δpos0-pos1|={mean_abs_diff_0_1:.6g}"
+            )
 
         loss_mask1 = masked_sites1
         if pad_mask is not None:
@@ -334,11 +357,51 @@ def train_epoch(
         if n == 0:
             continue
 
+        # =====================================================================
+        # (A) DEBUG: masked-site prediction distribution & CE sanity
+        # =====================================================================
+        if step <= 3 or (step % 50 == 0):
+            with torch.no_grad():
+                logits_m = logits1[loss_mask1]            # (n,2)
+                t_m = hap_true[loss_mask1]                # (n,)
+                probs_m = torch.softmax(logits_m, dim=-1) # (n,2)
+
+                p1 = probs_m[:, 1]
+                pred_m = probs_m.argmax(dim=-1)
+
+                pi_true = float(t_m.float().mean().item())      # frac of 1s in masked truth
+                pred_pi = float(pred_m.float().mean().item())   # frac of predicted 1s
+                mean_p1 = float(p1.mean().item())               # mean predicted P(class=1)
+                acc_m = float((pred_m == t_m).float().mean().item())
+
+                # entropy baseline H(pi)
+                eps = 1e-8
+                H_pi = -(
+                    (1 - pi_true) * np.log(max(1 - pi_true, eps))
+                    + pi_true * np.log(max(pi_true, eps))
+                )
+
+                # CE if you used constant probability mean_p1
+                CE_const = -(
+                    (1 - pi_true) * np.log(max(1 - mean_p1, eps))
+                    + pi_true * np.log(max(mean_p1, eps))
+                )
+
+                print(
+                    f"[masked_dbg] n={int(t_m.numel())} pi_true={pi_true:.3f} "
+                    f"pred_pi={pred_pi:.3f} meanP1={mean_p1:.3f} "
+                    f"acc={acc_m:.3f} mlm_loss={float(mlm_loss.item()):.3f} "
+                    f"H(pi)={H_pi:.3f} CE_const(meanP1)={CE_const:.3f}"
+                )
+
         # ---- contrastive (optional) ----
         ctr_loss = torch.zeros((), device=device)
 
         if do_ctr:
-            hap_masked2, _ = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_ctr, rng=rng)
+            # IMPORTANT: also mask clones for CTR views
+            hap_masked2, _ = mask_haplotype(
+                hap.clone(), mask_id=mask_id, p_mask_site=p_ctr, rng=rng
+            )
             _logits2, z2 = model(hap_masked2, pad_mask=pad_mask)
 
             # geometry diagnostics
@@ -351,7 +414,9 @@ def train_epoch(
             do_perm = bool(use_perm_negatives and permute_every_k > 0 and (step % int(permute_every_k) == 0))
             if do_perm:
                 hap_perm = permute_columns_across_batch(hap)
-                hap_perm_masked, _ = mask_haplotype(hap_perm, mask_id=mask_id, p_mask_site=p_ctr, rng=rng)
+                hap_perm_masked, _ = mask_haplotype(
+                    hap_perm.clone(), mask_id=mask_id, p_mask_site=p_ctr, rng=rng
+                )
                 _logits_p, zperm = model(hap_perm_masked, pad_mask=pad_mask)
                 zneg = zperm
 
@@ -371,6 +436,52 @@ def train_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+
+        # =====================================================================
+        # (B) DEBUG: gradient norms (is anything learning?)
+        # =====================================================================
+        if step <= 3 or (step % 50 == 0):
+            def _gn(p: torch.Tensor) -> float:
+                if p.grad is None:
+                    return float("nan")
+                return float(p.grad.detach().data.norm().item())
+
+            # Try common attribute names; if none found, fall back to "first/last" params.
+            head = (
+                getattr(model, "mlm_head", None)
+                or getattr(model, "head", None)
+                or getattr(model, "classifier", None)
+                or getattr(model, "out_proj", None)
+            )
+            emb = (
+                getattr(model, "tok_embed", None)
+                or getattr(model, "token_embed", None)
+                or getattr(model, "embed", None)
+                or getattr(model, "embedding", None)
+            )
+
+            head_gn = float("nan")
+            if head is not None and hasattr(head, "parameters"):
+                ps = [p for p in head.parameters() if p.requires_grad]
+                if len(ps) > 0:
+                    head_gn = float(np.nanmean([_gn(p) for p in ps]))
+
+            emb_gn = float("nan")
+            if emb is not None and hasattr(emb, "parameters"):
+                ps = [p for p in emb.parameters() if p.requires_grad]
+                if len(ps) > 0:
+                    emb_gn = float(np.nanmean([_gn(p) for p in ps]))
+
+            # Fallback: first and last trainable param grad norms
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            first_gn = _gn(trainable[0]) if len(trainable) else float("nan")
+            last_gn = _gn(trainable[-1]) if len(trainable) else float("nan")
+
+            print(
+                f"[grad_dbg] head_gn~{head_gn:.3e} emb_gn~{emb_gn:.3e} "
+                f"first_param_gn~{first_gn:.3e} last_param_gn~{last_gn:.3e}"
+            )
+
         if grad_clip is not None and float(grad_clip) > 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         optimizer.step()
@@ -441,11 +552,13 @@ def eval_epoch_losses(
 
         hap = batch.hap.to(device)
         pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
-        hap_true = hap
 
-        # view 1 (MLM)
+        # IMPORTANT: preserve true targets before any masking
+        hap_true = hap.clone()
+
+        # view 1 (MLM) — IMPORTANT: mask a clone
         hap_masked1, masked_sites1 = mask_haplotype(
-            hap, mask_id=mask_id, p_mask_site=float(p_mask_site), rng=rng
+            hap.clone(), mask_id=mask_id, p_mask_site=float(p_mask_site), rng=rng
         )
         logits1, z1 = model(hap_masked1, pad_mask=pad_mask)
 
@@ -460,14 +573,18 @@ def eval_epoch_losses(
         # contrastive
         ctr_loss = torch.zeros((), device=device)
         if do_ctr:
-            hap_masked2, _ = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_ctr, rng=rng)
+            hap_masked2, _ = mask_haplotype(
+                hap.clone(), mask_id=mask_id, p_mask_site=p_ctr, rng=rng
+            )
             _logits2, z2 = model(hap_masked2, pad_mask=pad_mask)
 
             zneg = None
             do_perm = bool(use_perm_negatives and permute_every_k > 0 and (step % int(permute_every_k) == 0))
             if do_perm:
                 hap_perm = permute_columns_across_batch(hap)
-                hap_perm_masked, _ = mask_haplotype(hap_perm, mask_id=mask_id, p_mask_site=p_ctr, rng=rng)
+                hap_perm_masked, _ = mask_haplotype(
+                    hap_perm.clone(), mask_id=mask_id, p_mask_site=p_ctr, rng=rng
+                )
                 _logits_p, zperm = model(hap_perm_masked, pad_mask=pad_mask)
                 zneg = zperm
 

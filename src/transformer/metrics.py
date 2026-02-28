@@ -46,8 +46,9 @@ def eval_masked_acc_auc(
         hap = batch.hap.to(device)
         pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
 
-        hap_true = hap
-        hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
+        hap_true = hap.clone()  # IMPORTANT: prevent in-place masking from corrupting targets
+        hap_masked, masked_sites = mask_haplotype(hap.clone(), mask_id=mask_id, p_mask_site=p_mask_site)
+
         logits, _z = model(hap_masked, pad_mask=pad_mask)
 
         loss_mask = masked_sites
@@ -149,8 +150,9 @@ def comprehensive_validation_analysis(
             hap = batch.hap.to(device)
             pad_mask = batch.pad_mask.to(device) if getattr(batch, "pad_mask", None) is not None else None
 
-            hap_true = hap
-            hap_masked, masked_sites = mask_haplotype(hap, mask_id=mask_id, p_mask_site=p_mask_site)
+            hap_true = hap.clone()  # IMPORTANT: prevent in-place masking from corrupting targets
+            hap_masked, masked_sites = mask_haplotype(hap.clone(), mask_id=mask_id, p_mask_site=p_mask_site)
+
             logits, _z = model(hap_masked, pad_mask=pad_mask)
 
             loss_mask = masked_sites
