@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Train VAE with PyTorch Lightning (Snakemake-friendly).")
     ap.add_argument("--train", type=Path, required=True, help=".npy (N,L) train array")
     ap.add_argument("--val", type=Path, required=True, help=".npy (N,L) val array")
+    ap.add_argument("--target", type=Path, default=None, help="Optional .npy (N,L) target array for eval-only logging")
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with seed/model/training sections")
     ap.add_argument("--outdir", type=Path, required=True)
 
@@ -108,6 +109,19 @@ def main() -> None:
 
     input_len = int(X_train.shape[1])
 
+    X_target = None
+    if args.target is not None:
+        X_target = np.load(args.target)
+
+        if X_target.ndim != 2:
+            raise ValueError(f"Expected 2D target array. Got target {X_target.shape}")
+        if X_target.shape[1] != input_len:
+            raise ValueError(
+                f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}"
+            )
+        if not np.isfinite(X_target).all():
+            raise ValueError("Non-finite values found in target array.")
+
     # -------------------------
     # Build cfg
     # -------------------------
@@ -145,14 +159,25 @@ def main() -> None:
     # DataLoaders
     # -------------------------
     train_loader = make_loader(X_train, batch_size, shuffle=True, num_workers=num_workers)
+
     val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
+    val_dataloaders = [val_loader]
+
+    if X_target is not None:
+        target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
+        val_dataloaders.append(target_loader)
 
     # -------------------------
     # Write resolved YAML for plotting later
     # -------------------------
     resolved = {
         "seed": seed,
-        "data": {"train": str(args.train), "val": str(args.val), "input_len": input_len},
+        "data": {
+        "train": str(args.train),
+        "val": str(args.val),
+        "target": (str(args.target) if args.target is not None else None),
+        "input_len": input_len,
+        },
         "model": {
             "latent_dim": cfg.latent_dim,
             "hidden_channels": list(cfg.hidden_channels),
@@ -192,10 +217,10 @@ def main() -> None:
     # Don't try to format {val_loss:.4f} in filename; it won't exist.
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        monitor="val/loss_epoch",
+        monitor="val/loss_epoch/dataloader_idx_0",  # discovery val
         mode="min",
         save_top_k=1,
-        filename="vae-{epoch:03d}-{step:06d}",
+        filename="vae-{epoch:03d}",
     )
     lr_cb = LearningRateMonitor(logging_interval="epoch")
 
@@ -226,7 +251,7 @@ def main() -> None:
     # -------------------------
     # Fit
     # -------------------------
-    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
 
     # -------------------------
     # Save summary + stable best.ckpt

@@ -1,10 +1,10 @@
-# src/build_genotypes_for_vae.py
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,9 +12,9 @@ import tskit
 import yaml
 
 
-# -------------------------
+# =============================================================================
 # Public API
-# -------------------------
+# =============================================================================
 
 @dataclass(frozen=True)
 class BuildGenotypesArgs:
@@ -22,9 +22,12 @@ class BuildGenotypesArgs:
     phenotype: Path
     outdir: Path
 
-    # optional config file (used only to find maf_threshold under cfg["data"]["maf_threshold"])
+    # Optional YAML config (maf_threshold under cfg["data"]["maf_threshold"])
     config: Optional[Path] = None
     maf_threshold: Optional[float] = None
+
+    # Optional experiment config JSON (reads "discovery")
+    experiment_config_json: Optional[Path] = None
 
     # SNP subsetting
     subset_snps: int = 5000
@@ -32,29 +35,28 @@ class BuildGenotypesArgs:
     subset_mode: str = "first"   # "first" | "middle" | "random"
     subset_seed: int = 0
 
-    # Train/val split
-    split_mode: str = "cross_pop"  # "random" | "within_pop" | "discovery_only" | "cross_pop"
+    # split
     val_frac: float = 0.2
     split_seed: int = 0
-    discovery_pop: str = "CEU"
+    discovery_pop: Optional[str] = None  # if None, read from experiment_config_json, else default "CEU"
+
+    # NEW: normalization
+    normalize: bool = True
+    norm_mode: str = "zscore_snp"  # "none" | "zscore_snp" | "af_residual" | "divide_by_2"
+    norm_eps: float = 1e-6
+    norm_clip_std_min: float = 1e-3
 
 
 def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     """
-    Heavy-hitter entrypoint: loads TS + phenotype, filters sites, subsets window,
-    aligns meta, creates train/val split, and writes outputs to a.outdir.
-
-    Outputs written in outdir:
-      - all_individuals.npy (N,L) float32 in {0,1,2}
-      - hap1.npy, hap2.npy (N,L) float32 in {0,1}
-      - meta.pkl (aligned to genotype rows)
-      - hap_meta.pkl
-      - snp_index.npy (indices in filtered-site space)
-      - ts_individual_ids.npy (tskit individual IDs aligned to rows)
-      - variant_positions_bp.npy, variant_site_ids.npy
-      - genotype_site_stats.txt, site_filter_report.txt
-      - train_idx.npy, val_idx.npy
-      - train.npy, val.npy  (convenience slices of all_individuals)
+    End-to-end builder:
+      - Load TS + phenotype
+      - Filter sites (biallelic, non-missing, monomorphic removed, optional MAF)
+      - Subset window
+      - Align phenotype to genotype rows
+      - Split discovery into train/val and define target (non-discovery)
+      - Optionally normalize (fit on discovery_train only)
+      - Save arrays + metadata
     """
     outdir = Path(a.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -66,21 +68,17 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         else (maf_from_yaml if maf_from_yaml is not None else 0.0)
     )
 
+    discovery_pop = _resolve_discovery_pop(a.discovery_pop, a.experiment_config_json)
+
     print(f"[build_genotypes_for_vae] maf_threshold={maf_threshold} (monomorphic always removed)")
+    print(f"[build_genotypes_for_vae] discovery_pop={discovery_pop}")
     print(f"[build_genotypes_for_vae] loading ts: {a.tree}")
+
     ts = tskit.load(str(a.tree))
 
     # Basic TS site stats (raw)
     stats = compute_site_stats(ts)
-    stats_txt = (
-        f"Tree sequence: {a.tree}\n"
-        f"Number of individuals_or_samples: {stats['num_individuals_or_samples']}\n"
-        f"Total sites: {stats['num_sites_total']}\n"
-        f"Segregating sites: {stats['num_segregating_sites']}\n"
-        f"Multiallelic sites: {stats['num_multiallelic_sites']}\n"
-        f"Biallelic segregating sites: {stats['num_biallelic_sites']}\n"
-    )
-    (outdir / "genotype_site_stats.txt").write_text(stats_txt)
+    (outdir / "genotype_site_stats.txt").write_text(_format_site_stats(a.tree, stats))
 
     # Extract/filter to biallelic + maf
     hap1, hap2, G, kept_ind_ids, filt, kept_positions_bp, kept_site_ids = _extract_haps_and_diploid(
@@ -94,7 +92,6 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     pheno = pd.read_pickle(a.phenotype)
     pheno = _align_pheno_to_kept_inds(ts, pheno, kept_ind_ids, G.shape[0])
 
-    # Validate phenotype columns we rely on
     for col in ["individual_id", "population", "phenotype"]:
         if col not in pheno.columns:
             raise ValueError(
@@ -111,30 +108,16 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         subset_mode=a.subset_mode,
         subset_seed=a.subset_seed,
     )
-
     if end <= start:
         raise RuntimeError(f"Subset window invalid: start={start}, end={end}, num_sites={num_sites}")
 
-    G_subset = G[:, start:end]
-    hap1_subset = hap1[:, start:end]
-    hap2_subset = None if hap2 is None else hap2[:, start:end]
-    kept_positions_subset = kept_positions_bp[start:end]
-    kept_site_ids_subset = kept_site_ids[start:end]
+    G_subset = G[:, start:end].astype(np.float32)
+    hap1_subset = hap1[:, start:end].astype(np.float32)
+    hap2_subset = None if hap2 is None else hap2[:, start:end].astype(np.float32)
+
+    kept_positions_subset = kept_positions_bp[start:end].astype(np.float64)
+    kept_site_ids_subset = kept_site_ids[start:end].astype(np.int32)
     snp_idx = np.arange(start, end, dtype=np.int64)
-
-    # Save core arrays
-    np.save(outdir / "all_individuals.npy", G_subset.astype(np.float32))
-    np.save(outdir / "hap1.npy", hap1_subset.astype(np.float32))
-    if hap2_subset is not None:
-        np.save(outdir / "hap2.npy", hap2_subset.astype(np.float32))
-    else:
-        # predictable artifact even in haploid mode
-        np.save(outdir / "hap2.npy", np.zeros_like(hap1_subset, dtype=np.float32))
-
-    np.save(outdir / "snp_index.npy", snp_idx)
-    np.save(outdir / "variant_positions_bp.npy", kept_positions_subset.astype(np.float64))
-    np.save(outdir / "variant_site_ids.npy", kept_site_ids_subset.astype(np.int32))
-    np.save(outdir / "ts_individual_ids.npy", kept_ind_ids.astype(np.int64))
 
     # Meta aligned to genotype rows
     meta = pheno[["individual_id", "population", "phenotype"]].copy()
@@ -143,33 +126,57 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     hap_meta = _build_hap_meta(meta, has_hap2=True)
     hap_meta.to_pickle(outdir / "hap_meta.pkl")
 
-    # -------------------------
-    # Train/val split + convenience arrays
-    # -------------------------
-    train_idx, val_idx = _make_train_val_split(
+    # Save core arrays (raw)
+    np.save(outdir / "all_individuals.npy", G_subset)
+    np.save(outdir / "hap1.npy", hap1_subset)
+    np.save(outdir / "hap2.npy", hap2_subset if hap2_subset is not None else np.zeros_like(hap1_subset, dtype=np.float32))
+    np.save(outdir / "snp_index.npy", snp_idx)
+    np.save(outdir / "variant_positions_bp.npy", kept_positions_subset)
+    np.save(outdir / "variant_site_ids.npy", kept_site_ids_subset)
+    np.save(outdir / "ts_individual_ids.npy", kept_ind_ids.astype(np.int64))
+
+    # Split: discovery -> train/val; target = non-discovery
+    disc_train_idx, disc_val_idx, target_idx = _make_discovery_train_val_target_split(
         meta=meta,
-        split_mode=a.split_mode,
+        discovery_pop=discovery_pop,
         val_frac=float(a.val_frac),
         seed=int(a.split_seed),
-        discovery_pop=str(a.discovery_pop),
     )
 
-    # enforce non-empty splits (fallback to random split if needed)
-    if train_idx.size == 0 or val_idx.size == 0:
-        print("[build_genotypes_for_vae] WARNING: empty split detected; falling back to random split.")
-        train_idx, val_idx = _make_train_val_split(
-            meta=meta,
-            split_mode="random",
-            val_frac=float(a.val_frac),
-            seed=int(a.split_seed),
-            discovery_pop=str(a.discovery_pop),
+    np.save(outdir / "discovery_train_idx.npy", disc_train_idx.astype(np.int64))
+    np.save(outdir / "discovery_val_idx.npy", disc_val_idx.astype(np.int64))
+    np.save(outdir / "target_idx.npy", target_idx.astype(np.int64))
+
+    # Optional normalization (fit on discovery_train only)
+    norm_report: Dict[str, Any] = {"normalize": bool(a.normalize), "norm_mode": str(a.norm_mode)}
+    if a.normalize and a.norm_mode != "none":
+        G_disc_train = G_subset[disc_train_idx]
+        mean, scale = _fit_normalizer(G_disc_train, mode=a.norm_mode, eps=a.norm_eps, clip_std_min=a.norm_clip_std_min)
+        np.save(outdir / "norm_mean.npy", mean.astype(np.float32))
+        np.save(outdir / "norm_scale.npy", scale.astype(np.float32))  # std or denom depending on mode
+
+        G_disc_train_n = _apply_normalizer(G_disc_train, mean, scale, mode=a.norm_mode)
+        G_disc_val_n = _apply_normalizer(G_subset[disc_val_idx], mean, scale, mode=a.norm_mode)
+        G_target_n = _apply_normalizer(G_subset[target_idx], mean, scale, mode=a.norm_mode)
+
+        np.save(outdir / "discovery_train.npy", G_disc_train_n.astype(np.float32))
+        np.save(outdir / "discovery_val.npy", G_disc_val_n.astype(np.float32))
+        np.save(outdir / "target.npy", G_target_n.astype(np.float32))
+
+        norm_report.update(
+            {
+                "fit_on": "discovery_train",
+                "eps": float(a.norm_eps),
+                "clip_std_min": float(a.norm_clip_std_min),
+            }
         )
+    else:
+        # Save raw splits
+        np.save(outdir / "discovery_train.npy", G_subset[disc_train_idx].astype(np.float32))
+        np.save(outdir / "discovery_val.npy", G_subset[disc_val_idx].astype(np.float32))
+        np.save(outdir / "target.npy", G_subset[target_idx].astype(np.float32))
 
-    np.save(outdir / "train_idx.npy", train_idx.astype(np.int64))
-    np.save(outdir / "val_idx.npy", val_idx.astype(np.int64))
-
-    np.save(outdir / "train.npy", G_subset[train_idx].astype(np.float32))
-    np.save(outdir / "val.npy",   G_subset[val_idx].astype(np.float32))
+    (outdir / "normalization_report.json").write_text(json.dumps(norm_report, indent=2) + "\n")
 
     summary = {
         "outdir": str(outdir),
@@ -178,20 +185,22 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         "subset_end": int(end),
         "num_inds": int(G_subset.shape[0]),
         "num_snps": int(G_subset.shape[1]),
-        "split_mode": str(a.split_mode),
         "val_frac": float(a.val_frac),
         "split_seed": int(a.split_seed),
-        "discovery_pop": str(a.discovery_pop),
-        "n_train": int(train_idx.size),
-        "n_val": int(val_idx.size),
+        "discovery_pop": str(discovery_pop),
+        "n_discovery_train": int(disc_train_idx.size),
+        "n_discovery_val": int(disc_val_idx.size),
+        "n_target": int(target_idx.size),
         "pop_counts": meta["population"].astype(str).value_counts().to_dict(),
+        "normalize": bool(a.normalize),
+        "norm_mode": str(a.norm_mode),
     }
     return summary
 
 
-# -------------------------
-# Small helpers
-# -------------------------
+# =============================================================================
+# Config helpers
+# =============================================================================
 
 def _load_maf_from_config(config_path: Optional[Path]) -> Optional[float]:
     if config_path is None:
@@ -201,6 +210,36 @@ def _load_maf_from_config(config_path: Optional[Path]) -> Optional[float]:
     maf = data.get("maf_threshold", None)
     return None if maf is None else float(maf)
 
+
+def _load_discovery_from_experiment_json(path: Optional[Path]) -> Optional[str]:
+    if path is None:
+        return None
+    cfg = json.loads(Path(path).read_text())
+    disc = cfg.get("discovery", None)
+    return None if disc is None else str(disc)
+
+
+def _resolve_discovery_pop(cli_discovery: Optional[str], experiment_json: Optional[Path]) -> str:
+    if cli_discovery is not None:
+        return str(cli_discovery)
+    disc = _load_discovery_from_experiment_json(experiment_json)
+    return disc if disc is not None else "CEU"
+
+
+def _format_site_stats(tree_path: Path, stats: Dict[str, Any]) -> str:
+    return (
+        f"Tree sequence: {tree_path}\n"
+        f"Number of individuals_or_samples: {stats['num_individuals_or_samples']}\n"
+        f"Total sites: {stats['num_sites_total']}\n"
+        f"Segregating sites: {stats['num_segregating_sites']}\n"
+        f"Multiallelic sites: {stats['num_multiallelic_sites']}\n"
+        f"Biallelic segregating sites: {stats['num_biallelic_sites']}\n"
+    )
+
+
+# =============================================================================
+# Subsetting helpers
+# =============================================================================
 
 def _choose_subset_indices(
     *,
@@ -218,151 +257,6 @@ def _choose_subset_indices(
     else:
         start, end = _choose_contiguous_block(num_sites, subset_snps, subset_mode, seed=subset_seed)
     return start, end
-
-
-def _align_pheno_to_kept_inds(
-    ts: tskit.TreeSequence,
-    pheno: pd.DataFrame,
-    kept_ind_ids: np.ndarray,
-    n_rows_expected: int,
-) -> pd.DataFrame:
-    # Sort by individual_id if present (just for determinism)
-    if "individual_id" in pheno.columns:
-        pheno = pheno.sort_values("individual_id").reset_index(drop=True)
-
-    if ts.num_individuals > 0:
-        if "individual_id" not in pheno.columns:
-            raise ValueError("phenotype.pkl must have an 'individual_id' column when ts has individuals.")
-        pheno_indexed = pheno.set_index("individual_id", drop=False)
-        missing = [i for i in kept_ind_ids.tolist() if i not in pheno_indexed.index]
-        if missing:
-            raise ValueError(f"Some kept tskit individual IDs missing from phenotype.pkl: {missing[:10]} ...")
-        pheno = pheno_indexed.loc[kept_ind_ids].reset_index(drop=True)
-
-    if n_rows_expected != len(pheno):
-        raise ValueError(
-            f"Genotype rows ({n_rows_expected}) and phenotype rows ({len(pheno)}) do not match after alignment."
-        )
-    return pheno
-
-
-def _build_hap_meta(meta: pd.DataFrame, has_hap2: bool) -> pd.DataFrame:
-    if not has_hap2:
-        hm = meta.assign(hap_id=0).copy()
-        hm["hap_index"] = np.arange(len(hm))
-        return hm
-    hm = pd.concat([meta.assign(hap_id=0), meta.assign(hap_id=1)], ignore_index=True)
-    hm["hap_index"] = np.arange(len(hm))
-    return hm
-
-
-def _make_train_val_split(
-    *,
-    meta: pd.DataFrame,
-    split_mode: str,
-    val_frac: float,
-    seed: int,
-    discovery_pop: str,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns train_idx, val_idx indices into rows of meta / G_subset.
-
-    Modes:
-      - random: split across all individuals
-      - within_pop: stratified split within each population (keeps pop proportions)
-      - discovery_only: split only within discovery_pop, BUT indices are still into full array
-        (i.e. training+val are subsets of the full individuals, containing only discovery pop)
-      - cross_pop: train = discovery_pop, val = everyone else (ignores val_frac)
-    """
-    if split_mode not in {"random", "within_pop", "discovery_only", "cross_pop"}:
-        raise ValueError(f"Unknown split_mode: {split_mode}")
-
-    if split_mode != "cross_pop":
-        if not (0.0 < val_frac < 1.0):
-            raise ValueError(f"val_frac must be in (0,1). Got {val_frac}")
-
-    n = len(meta)
-    if n < 2:
-        raise ValueError("Need at least 2 individuals to split.")
-
-    rng = np.random.default_rng(seed)
-    pops = meta["population"].astype(str).to_numpy()
-    all_idx = np.arange(n, dtype=np.int64)
-
-    def split_indices(idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        idx = np.asarray(idx, dtype=np.int64).copy()
-        rng.shuffle(idx)
-        n_val = max(1, int(round(val_frac * idx.size)))
-        if idx.size - n_val < 1:
-            n_val = idx.size - 1
-        val = np.sort(idx[:n_val])
-        train = np.sort(idx[n_val:])
-        return train, val
-
-    if split_mode == "random":
-        return split_indices(all_idx)
-
-    if split_mode == "within_pop":
-        train_parts: List[np.ndarray] = []
-        val_parts: List[np.ndarray] = []
-        for u in np.unique(pops):
-            idx_u = all_idx[pops == u]
-            if idx_u.size < 2:
-                # can't split this pop; push to train and rely on other pops for val
-                train_parts.append(idx_u)
-                continue
-            tr, va = split_indices(idx_u)
-            train_parts.append(tr)
-            val_parts.append(va)
-
-        train = np.sort(np.concatenate(train_parts)) if train_parts else np.array([], dtype=np.int64)
-        val = np.sort(np.concatenate(val_parts)) if val_parts else np.array([], dtype=np.int64)
-
-        # If we failed to produce both sides, fallback random
-        if train.size == 0 or val.size == 0:
-            return split_indices(all_idx)
-        return train, val
-
-    if split_mode == "discovery_only":
-        idx_d = all_idx[pops == discovery_pop]
-        if idx_d.size < 2:
-            raise ValueError(f"discovery_only requires >=2 individuals in {discovery_pop}. Got {idx_d.size}.")
-        return split_indices(idx_d)
-
-    if split_mode == "cross_pop":
-        idx_train = np.sort(all_idx[pops == discovery_pop])
-        idx_val = np.sort(all_idx[pops != discovery_pop])
-        if idx_train.size < 1 or idx_val.size < 1:
-            raise ValueError(
-                f"cross_pop requires >=1 in discovery ({discovery_pop}) and >=1 in other. "
-                f"Got train={idx_train.size}, val={idx_val.size}."
-            )
-        # Shuffle within each to avoid any ordering artifacts
-        idx_train = idx_train.copy(); rng.shuffle(idx_train)
-        idx_val = idx_val.copy(); rng.shuffle(idx_val)
-        return np.sort(idx_train), np.sort(idx_val)
-
-    raise RuntimeError("unreachable")
-
-
-def compute_site_stats(ts: tskit.TreeSequence) -> dict:
-    """
-    Basic genotype / site statistics from a TreeSequence.
-    """
-    G_hap = ts.genotype_matrix()  # (sites, samples)
-    num_sites_total = ts.num_sites
-    num_inds = ts.num_individuals if ts.num_individuals > 0 else ts.num_samples
-
-    segregating = (G_hap.max(axis=1) > 0)
-    multiallelic = (G_hap.max(axis=1) > 1)
-
-    return {
-        "num_individuals_or_samples": int(num_inds),
-        "num_sites_total": int(num_sites_total),
-        "num_segregating_sites": int(segregating.sum()),
-        "num_multiallelic_sites": int(multiallelic.sum()),
-        "num_biallelic_sites": int((segregating & ~multiallelic).sum()),
-    }
 
 
 def _choose_contiguous_block(num_sites: int, subset_snps: int, subset_mode: str, seed: int = 0) -> Tuple[int, int]:
@@ -420,14 +314,171 @@ def _choose_bp_window(
     return start_idx, end_idx
 
 
+# =============================================================================
+# Phenotype alignment
+# =============================================================================
+
+def _align_pheno_to_kept_inds(
+    ts: tskit.TreeSequence,
+    pheno: pd.DataFrame,
+    kept_ind_ids: np.ndarray,
+    n_rows_expected: int,
+) -> pd.DataFrame:
+    if "individual_id" in pheno.columns:
+        pheno = pheno.sort_values("individual_id").reset_index(drop=True)
+
+    if ts.num_individuals > 0:
+        if "individual_id" not in pheno.columns:
+            raise ValueError("phenotype.pkl must have an 'individual_id' column when ts has individuals.")
+        pheno_indexed = pheno.set_index("individual_id", drop=False)
+        missing = [i for i in kept_ind_ids.tolist() if i not in pheno_indexed.index]
+        if missing:
+            raise ValueError(f"Some kept tskit individual IDs missing from phenotype.pkl: {missing[:10]} ...")
+        pheno = pheno_indexed.loc[kept_ind_ids].reset_index(drop=True)
+
+    if n_rows_expected != len(pheno):
+        raise ValueError(
+            f"Genotype rows ({n_rows_expected}) and phenotype rows ({len(pheno)}) do not match after alignment."
+        )
+    return pheno
+
+
+def _build_hap_meta(meta: pd.DataFrame, has_hap2: bool) -> pd.DataFrame:
+    if not has_hap2:
+        hm = meta.assign(hap_id=0).copy()
+        hm["hap_index"] = np.arange(len(hm))
+        return hm
+    hm = pd.concat([meta.assign(hap_id=0), meta.assign(hap_id=1)], ignore_index=True)
+    hm["hap_index"] = np.arange(len(hm))
+    return hm
+
+
+# =============================================================================
+# Splitting
+# =============================================================================
+
+def _make_discovery_train_val_target_split(
+    *,
+    meta: pd.DataFrame,
+    discovery_pop: str,
+    val_frac: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pops = meta["population"].astype(str).to_numpy()
+    n = len(meta)
+    if n < 2:
+        raise ValueError("Need at least 2 individuals to split.")
+    if not (0.0 < val_frac < 1.0):
+        raise ValueError(f"val_frac must be in (0,1). Got {val_frac}")
+
+    all_idx = np.arange(n, dtype=np.int64)
+    idx_disc = all_idx[pops == discovery_pop]
+    idx_targ = all_idx[pops != discovery_pop]
+
+    if idx_disc.size < 2:
+        raise ValueError(f"Need >=2 in discovery '{discovery_pop}' to split. Got {idx_disc.size}.")
+    if idx_targ.size < 1:
+        raise ValueError(f"Need >=1 outside discovery '{discovery_pop}' for target. Got {idx_targ.size}.")
+
+    rng = np.random.default_rng(seed)
+    idx_disc = idx_disc.copy()
+    rng.shuffle(idx_disc)
+
+    n_val = max(1, int(round(val_frac * idx_disc.size)))
+    if idx_disc.size - n_val < 1:
+        n_val = idx_disc.size - 1
+
+    disc_val = np.sort(idx_disc[:n_val])
+    disc_train = np.sort(idx_disc[n_val:])
+
+    idx_targ = idx_targ.copy()
+    rng.shuffle(idx_targ)
+    target = np.sort(idx_targ)
+
+    return disc_train, disc_val, target
+
+
+# =============================================================================
+# Normalization (fit on discovery_train only)
+# =============================================================================
+
+def _fit_normalizer(
+    G_train: np.ndarray,
+    *,
+    mode: str,
+    eps: float,
+    clip_std_min: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (mean, scale) where:
+      - zscore_snp: mean=per-SNP mean, scale=per-SNP std (clipped)
+      - af_residual: mean=2p, scale=sqrt(2p(1-p)) (clipped)
+      - divide_by_2: mean=0, scale=2
+    """
+    mode = str(mode)
+    if mode == "zscore_snp":
+        mean = G_train.mean(axis=0, dtype=np.float64)
+        var = G_train.var(axis=0, dtype=np.float64)
+        std = np.sqrt(var + eps)
+        std = np.maximum(std, clip_std_min)
+        return mean.astype(np.float32), std.astype(np.float32)
+
+    if mode == "af_residual":
+        p = (G_train.mean(axis=0, dtype=np.float64) / 2.0)
+        mean = 2.0 * p
+        denom = np.sqrt(2.0 * p * (1.0 - p) + eps)
+        denom = np.maximum(denom, clip_std_min)
+        return mean.astype(np.float32), denom.astype(np.float32)
+
+    if mode == "divide_by_2":
+        mean = np.zeros((G_train.shape[1],), dtype=np.float32)
+        scale = np.full((G_train.shape[1],), 2.0, dtype=np.float32)
+        return mean, scale
+
+    if mode == "none":
+        mean = np.zeros((G_train.shape[1],), dtype=np.float32)
+        scale = np.ones((G_train.shape[1],), dtype=np.float32)
+        return mean, scale
+
+    raise ValueError(f"Unknown norm_mode: {mode}")
+
+
+def _apply_normalizer(G: np.ndarray, mean: np.ndarray, scale: np.ndarray, *, mode: str) -> np.ndarray:
+    mode = str(mode)
+    if mode in {"zscore_snp", "af_residual"}:
+        return (G - mean[None, :]) / scale[None, :]
+    if mode == "divide_by_2":
+        return G / 2.0
+    if mode == "none":
+        return G
+    raise ValueError(f"Unknown norm_mode: {mode}")
+
+
+# =============================================================================
+# Site stats + extraction/filtering
+# =============================================================================
+
+def compute_site_stats(ts: tskit.TreeSequence) -> dict:
+    G_hap = ts.genotype_matrix()  # (sites, samples)
+    num_sites_total = ts.num_sites
+    num_inds = ts.num_individuals if ts.num_individuals > 0 else ts.num_samples
+
+    segregating = (G_hap.max(axis=1) > 0)
+    multiallelic = (G_hap.max(axis=1) > 1)
+
+    return {
+        "num_individuals_or_samples": int(num_inds),
+        "num_sites_total": int(num_sites_total),
+        "num_segregating_sites": int(segregating.sum()),
+        "num_multiallelic_sites": int(multiallelic.sum()),
+        "num_biallelic_sites": int((segregating & ~multiallelic).sum()),
+    }
+
+
 def _maf_filter_mask_from_haps(
     G_hap_biallelic: np.ndarray,
     maf_threshold: float,
 ) -> Tuple[np.ndarray, dict]:
-    """
-    Removes monomorphic sites and (optionally) sites with MAF < maf_threshold.
-    G_hap_biallelic: (sites, samples) with alleles in {0,1}, no missing.
-    """
     if G_hap_biallelic.size == 0:
         keep = np.zeros((0,), dtype=bool)
         return keep, {
@@ -472,16 +523,6 @@ def _extract_haps_and_diploid(
     ts: tskit.TreeSequence,
     maf_threshold: float,
 ):
-    """
-    Returns:
-      - hap1: (num_valid_inds, num_kept_sites) float32 in {0,1}
-      - hap2: (num_valid_inds, num_kept_sites) float32 in {0,1} or None
-      - dip:  (num_valid_inds, num_kept_sites) float32 in {0,1,2}
-      - kept_ind_ids: (num_valid_inds,) int64, the *tskit individual IDs* kept
-      - filter_report: dict with biallelic/monomorphic/maf filtering counts
-      - kept_positions_bp: (num_kept_sites,) float64, site positions in bp
-      - kept_site_ids: (num_kept_sites,) int32, tskit site IDs
-    """
     G_hap = ts.genotype_matrix()  # (sites, samples)
     filter_report: Dict[str, object] = {}
 

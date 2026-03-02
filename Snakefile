@@ -81,25 +81,37 @@ rule all:
         expand(f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/demes.png",           sid=SID_RANGE, rep=REP_RANGE),
 
         # --- processed genotype artifacts ---
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/all_individuals.npy",       sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/meta.pkl",                 sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/variant_site_ids.npy",     sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/train_idx.npy",            sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/val_idx.npy",              sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/train.npy",                sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/val.npy",                  sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/all_individuals.npy",        sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/hap1.npy",                  sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/hap2.npy",                  sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/meta.pkl",                  sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/hap_meta.pkl",              sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/variant_site_ids.npy",      sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/genotype_site_stats.txt",   sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/site_filter_report.txt",    sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- GWAS outputs ---
-        expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_results.csv",   sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_manhattan.png", sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_qq.png",        sid=SID_RANGE, rep=REP_RANGE),
-        expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_af_diff.png",   sid=SID_RANGE, rep=REP_RANGE),
+        # --- NEW splits (always produced; raw or normalized depending on params) ---
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train_idx.npy", sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val_idx.npy",   sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target_idx.npy",          sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",     sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",       sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",              sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- VAE training ---
+        # always exists (Pattern A)
+        expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json", sid=SID_RANGE, rep=REP_RANGE),
+
+        # # --- GWAS outputs ---
+        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_results.csv",   sid=SID_RANGE, rep=REP_RANGE),
+        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_manhattan.png", sid=SID_RANGE, rep=REP_RANGE),
+        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_qq.png",        sid=SID_RANGE, rep=REP_RANGE),
+        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_af_diff.png",   sid=SID_RANGE, rep=REP_RANGE),
+
+        # # --- VAE training ---
         expand(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done", sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- VAE diagnostics ---
-        # expand(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/.done", sid=SID_RANGE, rep=REP_RANGE),
+        # # --- VAE diagnostics ---
+        expand(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/.done", sid=SID_RANGE, rep=REP_RANGE),
 
 ##############################################################################
 # RULE simulate – one sim per sid×rep
@@ -133,11 +145,9 @@ rule simulate:
         touch "{output.done}"
         """
 
-##############################################################################
-# RULE build_inputs – trees -> diploid + haplotype matrices + meta + splits
-##############################################################################
 rule build_inputs:
     input:
+        cfg   = EXP_CFG,
         tree  = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/tree_sequence.trees",
         pheno = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/phenotype.pkl",
         done  = f"{SIM_BASEDIR}/{{sid}}/rep{{rep}}/.done",
@@ -154,26 +164,31 @@ rule build_inputs:
         stats_txt = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/genotype_site_stats.txt",
         filt_txt  = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/site_filter_report.txt",
 
-        # NEW: split artifacts
-        train_idx = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/train_idx.npy",
-        val_idx   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/val_idx.npy",
-        train_npy = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/train.npy",
-        val_npy   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/val.npy",
+        # NEW splits
+        disc_train_idx = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train_idx.npy",
+        disc_val_idx   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val_idx.npy",
+        target_idx     = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target_idx.npy",
+        disc_train_npy = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
+        disc_val_npy   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
+        target_npy     = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
+
+        # always exists (Pattern A)
+        norm_report    = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json",
     params:
         outdir        = lambda wc: f"{GENO_BASEDIR}/{wc.sid}/rep{wc.rep}",
 
-        # subset settings (already in your Snakefile globals)
         subset_mode   = SUBSET_MODE,
         subset_seed   = SUBSET_SEED,
         maf_threshold = MAF_THRESHOLD,
         subset_bp     = SUBSET_BP,
         subset_snps   = SUBSET_SNPS,
 
-        # split settings
-        split_mode    = "cross_pop",     # or "random" | "discovery_only" | "cross_pop"
         val_frac      = 0.2,
-        split_seed    = SUBSET_SEED,      # deterministic w.r.t. your subset seed
-        discovery_pop = DISCOVERY_POP,    # used if split_mode in {"discovery_only","cross_pop"}
+        split_seed    = SUBSET_SEED,
+
+        # Pattern A toggle: flip this True/False and nothing else changes
+        normalize     = False,
+        norm_mode     = "none",        # or "zscore_snp"
     threads: 1
     shell:
         r"""
@@ -191,13 +206,14 @@ rule build_inputs:
           --tree "{input.tree}" \
           --phenotype "{input.pheno}" \
           --outdir "{params.outdir}" \
+          --experiment-config-json "{input.cfg}" \
           --maf-threshold "{params.maf_threshold}" \
           --subset-mode "{params.subset_mode}" \
           --subset-seed "{params.subset_seed}" \
-          --split-mode "{params.split_mode}" \
           --val-frac "{params.val_frac}" \
           --split-seed "{params.split_seed}" \
-          --discovery-pop "{params.discovery_pop}" \
+          --normalize "{params.normalize}" \
+          --norm-mode "{params.norm_mode}" \
           $EXTRA_SUBSET_ARGS
 
         # sanity checks
@@ -212,12 +228,16 @@ rule build_inputs:
         test -f "{output.site_ids}"
         test -f "{output.stats_txt}"
         test -f "{output.filt_txt}"
-        test -f "{output.train_idx}"
-        test -f "{output.val_idx}"
-        test -f "{output.train_npy}"
-        test -f "{output.val_npy}"
+
+        test -f "{output.disc_train_idx}"
+        test -f "{output.disc_val_idx}"
+        test -f "{output.target_idx}"
+        test -f "{output.disc_train_npy}"
+        test -f "{output.disc_val_npy}"
+        test -f "{output.target_npy}"
+        test -f "{output.norm_report}"
         """
-        
+
 ##############################################################################
 # RULE gwas – run GWAS per sid×rep using processed genotype matrix
 ##############################################################################
@@ -261,9 +281,11 @@ rule gwas:
 
 rule train_vae:
     input:
-        train   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/train.npy",
-        val     = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/val.npy",
-        hparams = MODEL_CFG_YAML,
+        train       = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
+        val         = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
+        target      = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",  # <-- NEW (YRI eval-only)
+        norm_report = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json",
+        hparams     = MODEL_CFG_YAML,
     output:
         best_ckpt = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
         summary   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/train_summary.json",
@@ -280,15 +302,16 @@ rule train_vae:
         r"""
         set -euo pipefail
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
-        export CUDA_VISIBLE_DEVICES=0
+        export CUDA_VISIBLE_DEVICES=1
 
         python -u "snakemake_scripts/train_vae.py" \
           --train "{input.train}" \
           --val "{input.val}" \
+          --target "{input.target}" \
           --hparams "{input.hparams}" \
           --outdir "{params.outdir}" \
           --accelerator "{params.accelerator}" \
-          --devices "{params.devices}" \
+          --devices "{params.devices}"
 
         test -f "{output.best_ckpt}"
         test -f "{output.summary}"
@@ -299,16 +322,17 @@ rule train_vae:
         """
 
 ##############################################################################
-# RULE vae_diagnostics – thin wrapper calling src/plotting.py (per sid×rep)
+# RULE vae_diagnostics – plot curves + recon diagnostics (per sid×rep)
 ##############################################################################
 rule vae_diagnostics:
     input:
-        geno   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/all_individuals.npy",
-        meta   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/meta.pkl",
-        ckpt   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
-        logdir = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/logs",
+        train    = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
+        val      = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
+        target   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
+        ckpt     = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
+        logdir   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/logs",
         resolved = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
-        done   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done",
+        done     = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done",
     output:
         loss_epoch = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/loss_epoch.png",
         heatmap    = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/recon_abs_error_heatmap.png",
@@ -316,7 +340,7 @@ rule vae_diagnostics:
         done       = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/.done",
     params:
         outdir = lambda wc: f"{VAE_BASEDIR}/{wc.sid}/rep{wc.rep}/diagnostics",
-        batch_size = 256,
+        batch_size = 64,  # TODO: Change later
         max_step_points = 5000,
     threads: 1
     shell:
@@ -329,8 +353,9 @@ rule vae_diagnostics:
           --logdir "{input.logdir}" \
           --checkpoint "{input.ckpt}" \
           --resolved-hparams "{input.resolved}" \
-          --genotype "{input.geno}" \
-          --meta "{input.meta}" \
+          --train-genotype "{input.train}" \
+          --val-genotype "{input.val}" \
+          --target-genotype "{input.target}" \
           --outdir "{params.outdir}" \
           --batch-size "{params.batch_size}" \
           --max-step-points "{params.max_step_points}" \

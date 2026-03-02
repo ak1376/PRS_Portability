@@ -64,32 +64,27 @@ class LitVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         out = self.step(batch)
-
-        # batchwise
-        self.log("train/loss_step", out["loss"], on_step=True, on_epoch=False, prog_bar=True)
-        self.log("train/recon_step", out["recon"], on_step=True, on_epoch=False)
-        self.log("train/kl_step", out["kl"], on_step=True, on_epoch=False)
-
-        # epochwise
-        self.log("train/loss_epoch", out["loss"], on_step=False, on_epoch=True)
-        self.log("train/recon_epoch", out["recon"], on_step=False, on_epoch=True)
-        self.log("train/kl_epoch", out["kl"], on_step=False, on_epoch=True)
-
+        self.log("train/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=True)
         return out["loss"]
 
+    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        """
+        If you pass multiple val_dataloaders to trainer.fit(...),
+        Lightning will call validation_step(..., dataloader_idx=k).
 
-    def validation_step(self, batch, batch_idx):
+        dataloader_idx=0 -> discovery validation (CEU)
+        dataloader_idx=1 -> target evaluation (YRI) [eval-only logging]
+        """
         out = self.step(batch)
 
-        # batchwise
-        self.log("val/loss_step", out["loss"], on_step=True, on_epoch=False, prog_bar=True)
-        self.log("val/recon_step", out["recon"], on_step=True, on_epoch=False)
-        self.log("val/kl_step", out["kl"], on_step=True, on_epoch=False)
+        prefix = "val" if dataloader_idx == 0 else "target"
 
-        # epochwise
-        self.log("val/loss_epoch", out["loss"], on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/recon_epoch", out["recon"], on_step=False, on_epoch=True)
-        self.log("val/kl_epoch", out["kl"], on_step=False, on_epoch=True)
+        # Log both step + epoch to match your existing behavior
+        self.log(f"{prefix}/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=(dataloader_idx == 0))
+        self.log(f"{prefix}/recon", out["recon"], on_step=True, on_epoch=True, prog_bar=False)
+        self.log(f"{prefix}/kl", out["kl"], on_step=True, on_epoch=True, prog_bar=False)
+
+        return out["loss"]
 
     def configure_optimizers(self):
         lr = float(getattr(self.cfg, "lr", 1e-3))

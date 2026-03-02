@@ -7,6 +7,7 @@
     "YRI": 500,
     "CEU": 500
   },
+  "discovery": "CEU",
   "seed": 295,
   "num_draws": 1,
   "num_replicates": 1,
