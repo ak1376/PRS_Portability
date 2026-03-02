@@ -1,0 +1,19 @@
+model:
+  latent_dim: 32
+  hidden_channels: [32, 64, 128]
+  kernel_size: 9
+  stride: 2
+  padding: 4
+  use_batchnorm: false
+
+training:
+  batch_size: 64
+  max_epochs: 50
+  lr: 0.001  
+  beta: 0.01 
+  weight_decay: 1e-5
+  precision: "32-true"
+  log_every_n_steps: 1
+  num_workers: 4
+
+seed: 0

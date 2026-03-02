@@ -9,6 +9,7 @@
   },
   "seed": 295,
   "num_draws": 1,
+  "num_replicates": 1,
   "priors": {
     "N_anc": [
       100,
@@ -40,7 +41,7 @@
     "T_split"
   ], 
     "num_causal_variants": 100, 
-    "heritability": 0.7,
+    "heritability": 0.9,
     "trait_distribution": "normal",
     "trait_distribution_parameters": {
         "mean": 0,
