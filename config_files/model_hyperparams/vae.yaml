@@ -1,9 +1,9 @@
 model:
-  latent_dim: 32
-  hidden_channels: [32, 64, 128]
-  kernel_size: 9
+  latent_dim: 64
+  hidden_channels: [64, 128, 256]
+  kernel_size: 17
   stride: 2
-  padding: 4
+  padding: 8
   use_batchnorm: false
 
 training:
@@ -15,5 +15,12 @@ training:
   precision: "32-true"
   log_every_n_steps: 1
   num_workers: 4
+
+masking:
+  enabled: true
+  block_len: 1000          # contiguous SNP block length to mask
+  fill_value: "mean"      # "mean" or "zero"
+  weight_masked: 10.0      # knob: emphasize masked reconstruction
+  weight_unmasked: 0.0    # knob: also score unmasked if >0
 
 seed: 0

@@ -34,7 +34,6 @@ def main() -> None:
     ap.add_argument("--train-genotype", type=Path, default=None, help="discovery_train.npy")
     ap.add_argument("--val-genotype", type=Path, default=None, help="discovery_val.npy")
     ap.add_argument("--target-genotype", type=Path, default=None, help="target.npy (e.g., YRI)")
-    ap.add_argument("--meta", type=Path, default=None, help="meta.pkl for population labels (optional but recommended)")
 
     # ---- Legacy inputs (backwards compatible) ----
     ap.add_argument("--genotype", type=Path, default=None, help="legacy: full genotype matrix (N,L)")
@@ -66,7 +65,6 @@ def main() -> None:
                 train_genotype=args.train_genotype,
                 val_genotype=args.val_genotype,
                 target_genotype=args.target_genotype,
-                meta=args.meta,
             )
         )
         return
@@ -85,7 +83,6 @@ def main() -> None:
             max_step_points=args.max_step_points,
             device=args.device,
             genotype=args.genotype,
-            meta=args.meta,
         )
     )
 

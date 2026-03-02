@@ -4,3 +4,4 @@ experiments/
 src/__pycache__/
 src/transformer/__pycache__/
 src/vae/__pycache__/
+debugging_scripts/

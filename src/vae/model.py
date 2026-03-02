@@ -22,6 +22,13 @@ class VAEConfig:
     beta: float = 0.01
     weight_decay: float = 0.0
 
+    # ---- masking / inpainting ----
+    mask_enabled: bool = False
+    mask_block_len: int = 0
+    mask_fill_value: str = "zero"     # {"mean","zero"}
+    weight_masked: float = 1.0
+    weight_unmasked: float = 0.0
+
 
 class ConvVAE1D(nn.Module):
     """

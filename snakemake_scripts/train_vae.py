@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--train", type=Path, required=True, help=".npy (N,L) train array")
     ap.add_argument("--val", type=Path, required=True, help=".npy (N,L) val array")
     ap.add_argument("--target", type=Path, default=None, help="Optional .npy (N,L) target array for eval-only logging")
-    ap.add_argument("--hparams", type=Path, required=True, help="YAML with seed/model/training sections")
+    ap.add_argument("--hparams", type=Path, required=True, help="YAML with seed/model/training/masking sections")
     ap.add_argument("--outdir", type=Path, required=True)
 
     # Optional overrides (default: honor YAML)
@@ -90,6 +90,7 @@ def main() -> None:
     hp = read_yaml(args.hparams)
     model_hp = hp.get("model", {}) or {}
     train_hp = hp.get("training", {}) or {}
+    mask_hp = hp.get("masking", {}) or {}
     seed = int(hp.get("seed", 0))
 
     pl.seed_everything(seed, workers=True)
@@ -116,14 +117,12 @@ def main() -> None:
         if X_target.ndim != 2:
             raise ValueError(f"Expected 2D target array. Got target {X_target.shape}")
         if X_target.shape[1] != input_len:
-            raise ValueError(
-                f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}"
-            )
+            raise ValueError(f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}")
         if not np.isfinite(X_target).all():
             raise ValueError("Non-finite values found in target array.")
 
     # -------------------------
-    # Build cfg
+    # Build cfg (includes masking knobs)
     # -------------------------
     cfg = VAEConfig(
         input_len=input_len,
@@ -136,6 +135,12 @@ def main() -> None:
         lr=float(train_hp.get("lr", 1e-3)),
         beta=float(train_hp.get("beta", 1.0)),
         weight_decay=float(train_hp.get("weight_decay", 0.0)),
+        # Masking
+        mask_enabled=bool(mask_hp.get("enabled", False)),
+        mask_block_len=int(mask_hp.get("block_len", 0)),
+        mask_fill_value=str(mask_hp.get("fill_value", "mean")),
+        weight_masked=float(mask_hp.get("weight_masked", 1.0)),
+        weight_unmasked=float(mask_hp.get("weight_unmasked", 0.0)),
     )
 
     # -------------------------
@@ -168,15 +173,15 @@ def main() -> None:
         val_dataloaders.append(target_loader)
 
     # -------------------------
-    # Write resolved YAML for plotting later
+    # Write resolved YAML for plotting later (NOW includes masking)
     # -------------------------
     resolved = {
         "seed": seed,
         "data": {
-        "train": str(args.train),
-        "val": str(args.val),
-        "target": (str(args.target) if args.target is not None else None),
-        "input_len": input_len,
+            "train": str(args.train),
+            "val": str(args.val),
+            "target": (str(args.target) if args.target is not None else None),
+            "input_len": input_len,
         },
         "model": {
             "latent_dim": cfg.latent_dim,
@@ -185,6 +190,13 @@ def main() -> None:
             "stride": cfg.stride,
             "padding": cfg.padding,
             "use_batchnorm": cfg.use_batchnorm,
+        },
+        "masking": {
+            "enabled": cfg.mask_enabled,
+            "block_len": cfg.mask_block_len,
+            "fill_value": cfg.mask_fill_value,
+            "weight_masked": cfg.weight_masked,
+            "weight_unmasked": cfg.weight_unmasked,
         },
         "training": {
             "batch_size": batch_size,
@@ -213,8 +225,6 @@ def main() -> None:
     ckpt_dir = outdir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # NOTE: your logged metric key is "val/loss" (slash).
-    # Don't try to format {val_loss:.4f} in filename; it won't exist.
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         monitor="val/loss_epoch/dataloader_idx_0",  # discovery val
@@ -229,7 +239,7 @@ def main() -> None:
     # -------------------------
     tb_logger = TensorBoardLogger(save_dir=str(outdir), name="tb")   # outdir/tb/version_*/events...
     csv_logger = CSVLogger(save_dir=str(outdir), name="logs")        # outdir/logs/version_*/metrics.csv
-    logger = [tb_logger, csv_logger]  # <-- works across Lightning versions (no LoggerCollection)
+    logger = [tb_logger, csv_logger]
 
     # -------------------------
     # Trainer

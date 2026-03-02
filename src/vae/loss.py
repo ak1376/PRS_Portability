@@ -16,7 +16,27 @@ def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
 def mse_reconstruction_loss(x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:
         x = x.squeeze(1)
+    if recon.dim() == 3:
+        recon = recon.squeeze(1)
     return F.mse_loss(recon, x, reduction="mean")
+
+def mse_masked(x: torch.Tensor, recon: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Mean squared error over mask==True entries.
+    x, recon: (B,L) (or (B,1,L) will be squeezed)
+    mask: bool (B,L)
+    """
+    if x.dim() == 3:
+        x = x.squeeze(1)
+    if recon.dim() == 3:
+        recon = recon.squeeze(1)
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+
+    # avoid divide-by-zero
+    denom = mask.sum().clamp(min=1).to(x.dtype)
+    se = (recon - x) ** 2
+    return se.masked_select(mask).sum() / denom
 
 
 class VAELoss(nn.Module):
