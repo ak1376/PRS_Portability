@@ -1,14 +1,15 @@
+# YAML (rewrite)
 model:
   latent_dim: 64
   hidden_channels: [64, 128]
   kernel_size: 17
   stride: 2
   padding: 8
-  use_batchnorm: false   # <- simplest
+  use_batchnorm: false
 
 training:
-  batch_size: 64
-  max_epochs: 100
+  batch_size: 8
+  max_epochs: 50
   lr: 3e-4
   beta: 0.001
   weight_decay: 1e-5
@@ -18,45 +19,38 @@ training:
 
 masking:
   enabled: true
-  block_len: 256
-  fill_value: "zero"
-  weight_masked: 3.0
-  weight_unmasked: 0.0
+  alpha_masked: 1.0   # 1.0 = pure inpainting
+
+  # geometry
+  mode: "contiguous"       # currently only contiguous blocks are implemented
+  n_blocks: 4              # NEW: number of blocks per sample
+  allow_overlap: true      # NEW: allow blocks to overlap (simpler; overlap reduces realized masked fraction)
+
+  # length control (choose ONE)
+  mask_frac: 0.10          # NEW (recommended): total fraction of SNPs to mask per sample
+  block_len: null          # if set (int), overrides mask_frac and is interpreted as per-block length
+
+  # corruption / fill (recommended for HWE-normalized inputs)
+  fill: "gaussian"         # gaussian | zero | mean | constant
+  gaussian_std: 0.1        # NEW: std of Gaussian noise in normalized space
+  constant_value: 0.0      # used only if fill == "constant"
 
 seed: 0
 
-# --------------------------
-# NEW: grid definition
-# --------------------------
 grid:
   enabled: false
-
-  # how experiment names are built
-  # (optional; if omitted we’ll use key=value pieces)
   name:
     prefix: "vae"
     sep: "__"
-
-  # list of sweep dimensions
-  # each item is: path + values
-  # path uses dot notation into this YAML
   dims:
-    - path: "masking.block_len"
-      values: [64, 128, 256, 512, 1024]
-      tag: "block"
+    - path: "masking.mask_frac"
+      values: [0.01, 0.02, 0.05, 0.1]
+      tag: "mf"
 
-    # - path: "model.latent_dim"
-    #   values: [32, 64]
-    #   tag: "z"          # optional alias for naming
+    - path: "masking.n_blocks"
+      values: [1, 2, 4, 8]
+      tag: "nb"
 
-    # - path: "training.beta"
-    #   values: [0.005, 0.01, 1.0]
-    #   tag: "beta"
-
-    # - path: "masking.fill_value"
-    #   values: ["mean", "zero"]
-    #   tag: "fill"
-
-    # - path: "masking.weight_masked"
-    #   values: [0.0, 0.5, 1.0]
-    #   tag: "wm"
+    - path: "masking.gaussian_std"
+      values: [0.05, 0.1, 0.2]
+      tag: "gs"

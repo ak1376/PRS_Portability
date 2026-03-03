@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -26,7 +27,7 @@ class BuildGenotypesArgs:
     config: Optional[Path] = None
     maf_threshold: Optional[float] = None
 
-    # Optional experiment config JSON (reads "discovery")
+    # Optional experiment config JSON (reads "discovery" + "maf_threshold")
     experiment_config_json: Optional[Path] = None
 
     # SNP subsetting
@@ -40,9 +41,7 @@ class BuildGenotypesArgs:
     split_seed: int = 0
     discovery_pop: Optional[str] = None  # if None, read from experiment_config_json, else default "CEU"
 
-    # NEW: normalization
-    normalize: bool = True
-    norm_mode: str = "zscore_snp"  # "none" | "zscore_snp" | "af_residual" | "divide_by_2"
+    # Always normalize by HWE (af_residual)
     norm_eps: float = 1e-6
     norm_clip_std_min: float = 1e-3
 
@@ -51,26 +50,33 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     """
     End-to-end builder:
       - Load TS + phenotype
-      - Filter sites (biallelic, non-missing, monomorphic removed, optional MAF)
+      - Filter sites (biallelic, non-missing, monomorphic removed globally, optional MAF)
       - Subset window
       - Align phenotype to genotype rows
       - Split discovery into train/val and define target (non-discovery)
-      - Optionally normalize (fit on discovery_train only)
+      - Drop SNPs monomorphic in discovery_train (prevents tiny HWE scale -> huge standardized values)
+      - Fit HWE normalizer on discovery_train only
       - Save arrays + metadata
     """
     outdir = Path(a.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     maf_from_yaml = _load_maf_from_config(a.config)
+    maf_from_exp_json = _load_maf_from_experiment_json(a.experiment_config_json)
+
     maf_threshold = (
         a.maf_threshold
         if a.maf_threshold is not None
-        else (maf_from_yaml if maf_from_yaml is not None else 0.0)
+        else (
+            maf_from_exp_json
+            if maf_from_exp_json is not None
+            else (maf_from_yaml if maf_from_yaml is not None else 0.0)
+        )
     )
 
     discovery_pop = _resolve_discovery_pop(a.discovery_pop, a.experiment_config_json)
 
-    print(f"[build_genotypes_for_vae] maf_threshold={maf_threshold} (monomorphic always removed)")
+    print(f"[build_genotypes_for_vae] maf_threshold={maf_threshold} (monomorphic always removed globally)")
     print(f"[build_genotypes_for_vae] discovery_pop={discovery_pop}")
     print(f"[build_genotypes_for_vae] loading ts: {a.tree}")
 
@@ -80,7 +86,7 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     stats = compute_site_stats(ts)
     (outdir / "genotype_site_stats.txt").write_text(_format_site_stats(a.tree, stats))
 
-    # Extract/filter to biallelic + maf
+    # Extract/filter to biallelic + maf + (global) non-monomorphic
     hap1, hap2, G, kept_ind_ids, filt, kept_positions_bp, kept_site_ids = _extract_haps_and_diploid(
         ts, maf_threshold=float(maf_threshold)
     )
@@ -126,15 +132,6 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     hap_meta = _build_hap_meta(meta, has_hap2=True)
     hap_meta.to_pickle(outdir / "hap_meta.pkl")
 
-    # Save core arrays (raw)
-    np.save(outdir / "all_individuals.npy", G_subset)
-    np.save(outdir / "hap1.npy", hap1_subset)
-    np.save(outdir / "hap2.npy", hap2_subset if hap2_subset is not None else np.zeros_like(hap1_subset, dtype=np.float32))
-    np.save(outdir / "snp_index.npy", snp_idx)
-    np.save(outdir / "variant_positions_bp.npy", kept_positions_subset)
-    np.save(outdir / "variant_site_ids.npy", kept_site_ids_subset)
-    np.save(outdir / "ts_individual_ids.npy", kept_ind_ids.astype(np.int64))
-
     # Split: discovery -> train/val; target = non-discovery
     disc_train_idx, disc_val_idx, target_idx = _make_discovery_train_val_target_split(
         meta=meta,
@@ -143,38 +140,87 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         seed=int(a.split_seed),
     )
 
+    # Save indices (row indices only; safe to save before/after SNP filtering)
     np.save(outdir / "discovery_train_idx.npy", disc_train_idx.astype(np.int64))
     np.save(outdir / "discovery_val_idx.npy", disc_val_idx.astype(np.int64))
     np.save(outdir / "target_idx.npy", target_idx.astype(np.int64))
 
-    # Optional normalization (fit on discovery_train only)
-    norm_report: Dict[str, Any] = {"normalize": bool(a.normalize), "norm_mode": str(a.norm_mode)}
-    if a.normalize and a.norm_mode != "none":
-        G_disc_train = G_subset[disc_train_idx]
-        mean, scale = _fit_normalizer(G_disc_train, mode=a.norm_mode, eps=a.norm_eps, clip_std_min=a.norm_clip_std_min)
-        np.save(outdir / "norm_mean.npy", mean.astype(np.float32))
-        np.save(outdir / "norm_scale.npy", scale.astype(np.float32))  # std or denom depending on mode
+    # -------------------------------------------------------------------------
+    # CRITICAL: Drop SNPs monomorphic in discovery_train BEFORE normalization.
+    # This prevents HWE scale clipping (e.g. 0.001) from creating ~1000 values.
+    # -------------------------------------------------------------------------
+    num_snps_before = int(G_subset.shape[1])
+    G_disc_train = G_subset[disc_train_idx]
 
-        G_disc_train_n = _apply_normalizer(G_disc_train, mean, scale, mode=a.norm_mode)
-        G_disc_val_n = _apply_normalizer(G_subset[disc_val_idx], mean, scale, mode=a.norm_mode)
-        G_target_n = _apply_normalizer(G_subset[target_idx], mean, scale, mode=a.norm_mode)
+    p_train = G_disc_train.mean(axis=0, dtype=np.float64) / 2.0
+    keep_cols = (p_train > 0.0) & (p_train < 1.0)
 
-        np.save(outdir / "discovery_train.npy", G_disc_train_n.astype(np.float32))
-        np.save(outdir / "discovery_val.npy", G_disc_val_n.astype(np.float32))
-        np.save(outdir / "target.npy", G_target_n.astype(np.float32))
-
-        norm_report.update(
-            {
-                "fit_on": "discovery_train",
-                "eps": float(a.norm_eps),
-                "clip_std_min": float(a.norm_clip_std_min),
-            }
+    if int(keep_cols.sum()) == 0:
+        raise RuntimeError(
+            "All SNPs are monomorphic in discovery_train after subsetting/filtering. Nothing left to train on."
         )
-    else:
-        # Save raw splits
-        np.save(outdir / "discovery_train.npy", G_subset[disc_train_idx].astype(np.float32))
-        np.save(outdir / "discovery_val.npy", G_subset[disc_val_idx].astype(np.float32))
-        np.save(outdir / "target.npy", G_subset[target_idx].astype(np.float32))
+
+    G_subset = G_subset[:, keep_cols]
+    hap1_subset = hap1_subset[:, keep_cols]
+    if hap2_subset is not None:
+        hap2_subset = hap2_subset[:, keep_cols]
+
+    kept_positions_subset = kept_positions_subset[keep_cols]
+    kept_site_ids_subset = kept_site_ids_subset[keep_cols]
+    snp_idx = snp_idx[keep_cols]
+
+    num_snps_after = int(G_subset.shape[1])
+    (outdir / "train_mono_filter_report.txt").write_text(
+        f"num_snps_before={num_snps_before}\n"
+        f"num_snps_after={num_snps_after}\n"
+        f"num_dropped={num_snps_before - num_snps_after}\n"
+    )
+
+    # -------------------------------------------------------------------------
+    # Save SNP-aligned "raw" arrays AFTER train-monomorphic filtering
+    # (so raw + normalized all refer to the same SNP column set)
+    # -------------------------------------------------------------------------
+    np.save(outdir / "all_individuals.npy", G_subset)
+    np.save(outdir / "hap1.npy", hap1_subset)
+    np.save(
+        outdir / "hap2.npy",
+        hap2_subset if hap2_subset is not None else np.zeros_like(hap1_subset, dtype=np.float32),
+    )
+    np.save(outdir / "snp_index.npy", snp_idx)
+    np.save(outdir / "variant_positions_bp.npy", kept_positions_subset)
+    np.save(outdir / "variant_site_ids.npy", kept_site_ids_subset)
+    np.save(outdir / "ts_individual_ids.npy", kept_ind_ids.astype(np.int64))
+
+    # -------------------------------------------------------------------------
+    # ALWAYS normalize by HWE (af_residual), fit on discovery_train only
+    # -------------------------------------------------------------------------
+    norm_report: Dict[str, Any] = {
+        "normalize": True,
+        "norm_mode": "af_residual",
+        "fit_on": "discovery_train",
+        "eps": float(a.norm_eps),
+        "clip_std_min": float(a.norm_clip_std_min),
+        "num_snps_before_train_mono_filter": num_snps_before,
+        "num_snps_after_train_mono_filter": num_snps_after,
+        "num_snps_dropped_train_mono_filter": num_snps_before - num_snps_after,
+    }
+
+    G_disc_train = G_subset[disc_train_idx]  # recompute after SNP filtering
+    mean, scale = _fit_hwe_normalizer(
+        G_disc_train,
+        eps=a.norm_eps,
+        clip_std_min=a.norm_clip_std_min,
+    )
+    np.save(outdir / "norm_mean.npy", mean.astype(np.float32))   # 2p
+    np.save(outdir / "norm_scale.npy", scale.astype(np.float32)) # sqrt(2p(1-p))
+
+    G_disc_train_n = _apply_hwe_normalizer(G_disc_train, mean, scale)
+    G_disc_val_n = _apply_hwe_normalizer(G_subset[disc_val_idx], mean, scale)
+    G_target_n = _apply_hwe_normalizer(G_subset[target_idx], mean, scale)
+
+    np.save(outdir / "discovery_train.npy", G_disc_train_n.astype(np.float32))
+    np.save(outdir / "discovery_val.npy", G_disc_val_n.astype(np.float32))
+    np.save(outdir / "target.npy", G_target_n.astype(np.float32))
 
     (outdir / "normalization_report.json").write_text(json.dumps(norm_report, indent=2) + "\n")
 
@@ -192,8 +238,10 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         "n_discovery_val": int(disc_val_idx.size),
         "n_target": int(target_idx.size),
         "pop_counts": meta["population"].astype(str).value_counts().to_dict(),
-        "normalize": bool(a.normalize),
-        "norm_mode": str(a.norm_mode),
+        "normalize": True,
+        "norm_mode": "af_residual",
+        "num_snps_before_train_mono_filter": num_snps_before,
+        "num_snps_after_train_mono_filter": num_snps_after,
     }
     return summary
 
@@ -202,12 +250,11 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
 # Config helpers
 # =============================================================================
 
-def _load_maf_from_config(config_path: Optional[Path]) -> Optional[float]:
-    if config_path is None:
+def _load_maf_from_experiment_json(path: Optional[Path]) -> Optional[float]:
+    if path is None:
         return None
-    cfg = yaml.safe_load(Path(config_path).read_text())
-    data = cfg.get("data", {}) if isinstance(cfg, dict) else {}
-    maf = data.get("maf_threshold", None)
+    cfg = json.loads(Path(path).read_text())
+    maf = cfg.get("maf_threshold", None)
     return None if maf is None else float(maf)
 
 
@@ -224,6 +271,15 @@ def _resolve_discovery_pop(cli_discovery: Optional[str], experiment_json: Option
         return str(cli_discovery)
     disc = _load_discovery_from_experiment_json(experiment_json)
     return disc if disc is not None else "CEU"
+
+
+def _load_maf_from_config(config_path: Optional[Path]) -> Optional[float]:
+    if config_path is None:
+        return None
+    cfg = yaml.safe_load(Path(config_path).read_text())
+    data = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    maf = data.get("maf_threshold", None)
+    return None if maf is None else float(maf)
 
 
 def _format_site_stats(tree_path: Path, stats: Dict[str, Any]) -> str:
@@ -399,59 +455,33 @@ def _make_discovery_train_val_target_split(
 
 
 # =============================================================================
-# Normalization (fit on discovery_train only)
+# Normalization (HWE / af_residual only)
 # =============================================================================
 
-def _fit_normalizer(
+def _fit_hwe_normalizer(
     G_train: np.ndarray,
     *,
-    mode: str,
     eps: float,
     clip_std_min: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Returns (mean, scale) where:
-      - zscore_snp: mean=per-SNP mean, scale=per-SNP std (clipped)
-      - af_residual: mean=2p, scale=sqrt(2p(1-p)) (clipped)
-      - divide_by_2: mean=0, scale=2
+    HWE standardization ("af_residual"):
+
+      p_j = mean(G_train[:,j]) / 2
+      mean_j = 2 p_j
+      scale_j = sqrt( 2 p_j (1 - p_j) + eps )
+
+    Returns (mean, scale) as float32.
     """
-    mode = str(mode)
-    if mode == "zscore_snp":
-        mean = G_train.mean(axis=0, dtype=np.float64)
-        var = G_train.var(axis=0, dtype=np.float64)
-        std = np.sqrt(var + eps)
-        std = np.maximum(std, clip_std_min)
-        return mean.astype(np.float32), std.astype(np.float32)
-
-    if mode == "af_residual":
-        p = (G_train.mean(axis=0, dtype=np.float64) / 2.0)
-        mean = 2.0 * p
-        denom = np.sqrt(2.0 * p * (1.0 - p) + eps)
-        denom = np.maximum(denom, clip_std_min)
-        return mean.astype(np.float32), denom.astype(np.float32)
-
-    if mode == "divide_by_2":
-        mean = np.zeros((G_train.shape[1],), dtype=np.float32)
-        scale = np.full((G_train.shape[1],), 2.0, dtype=np.float32)
-        return mean, scale
-
-    if mode == "none":
-        mean = np.zeros((G_train.shape[1],), dtype=np.float32)
-        scale = np.ones((G_train.shape[1],), dtype=np.float32)
-        return mean, scale
-
-    raise ValueError(f"Unknown norm_mode: {mode}")
+    p = (G_train.mean(axis=0, dtype=np.float64) / 2.0)
+    mean = 2.0 * p
+    scale = np.sqrt(2.0 * p * (1.0 - p) + eps)
+    scale = np.maximum(scale, clip_std_min)
+    return mean.astype(np.float32), scale.astype(np.float32)
 
 
-def _apply_normalizer(G: np.ndarray, mean: np.ndarray, scale: np.ndarray, *, mode: str) -> np.ndarray:
-    mode = str(mode)
-    if mode in {"zscore_snp", "af_residual"}:
-        return (G - mean[None, :]) / scale[None, :]
-    if mode == "divide_by_2":
-        return G / 2.0
-    if mode == "none":
-        return G
-    raise ValueError(f"Unknown norm_mode: {mode}")
+def _apply_hwe_normalizer(G: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    return (G - mean[None, :]) / scale[None, :]
 
 
 # =============================================================================

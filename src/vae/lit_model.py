@@ -2,31 +2,38 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from src.vae.model import ConvVAE1D
-from src.vae.loss import VAELoss, mse_masked
+from src.vae.loss import mse_masked
+from src.masking import make_mask_and_apply
 
 
 class LitVAE(pl.LightningModule):
     """
-    Masked-inpainting VAE with *explicit* logging for:
-      - recon_masked (MSE on masked positions, evaluated vs original x)
-      - recon_unmasked (MSE on unmasked positions, evaluated vs original x)
-      - recon_weighted = w_m*recon_masked + w_u*recon_unmasked (the objective recon term)
-      - recon_nomask_all (baseline MSE when you feed x directly, no corruption)
-      - ratio_masked_over_nomask = recon_masked / recon_nomask_all  (best sanity plot)
+    Two-pass metrics:
+      (1) clean pass: recon_clean = model(x); mse_clean_all = MSE(recon_clean, x) over all positions
+      (2) masked/corrupted pass (optional): x_in, mask = corrupt(x); recon = model(x_in)
+          - mse_masked   = MSE on masked positions only
+          - mse_unmasked = MSE on unmasked positions only
+          - recon_objective = alpha*mse_masked + (1-alpha)*mse_unmasked
+          - total_loss = recon_objective + beta*KL
 
-    This makes it easy to compare "masked training" vs "normal reconstruction".
+    Logging (Option A):
+      - train_step/* logged per step
+      - train/* logged once per epoch (manual mean)
+      - val/* and target/* logged once per epoch (manual mean)
+      - add_dataloader_idx=False everywhere; val vs target distinguished by prefix
     """
 
     def __init__(self, cfg: Any):
         super().__init__()
 
+        # Save hyperparams
         if is_dataclass(cfg):
             self.save_hyperparameters(asdict(cfg))
         elif isinstance(cfg, dict):
@@ -46,253 +53,285 @@ class LitVAE(pl.LightningModule):
             use_batchnorm=getattr(cfg, "use_batchnorm", False),
         )
 
-        self.loss_fn = VAELoss(beta=float(getattr(cfg, "beta", 0.01)))
         self.example_input_array = torch.zeros(2, getattr(cfg, "input_len", 128))
 
+        # Option A buffers
+        self._train_buf: Dict[str, List[torch.Tensor]] = {}
+        self._val_buf: Dict[str, List[torch.Tensor]] = {}
+        self._target_buf: Dict[str, List[torch.Tensor]] = {}
+
     # -------------------------
-    # utilities
+    # helpers
     # -------------------------
     def _unpack_batch(self, batch: Any) -> torch.Tensor:
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         return x.float()
 
-    def _mask_enabled(self) -> bool:
-        return bool(getattr(self.cfg, "mask_enabled", False)) and int(getattr(self.cfg, "mask_block_len", 0)) > 0
-
-    def _make_contiguous_mask(self, B: int, L: int, *, seed: int) -> torch.Tensor:
-        """
-        Bool mask (B,L) with one contiguous True block per sample.
-        Deterministic given seed.
-        """
-        block_len = int(getattr(self.cfg, "mask_block_len", 0))
-        block_len = max(0, min(block_len, L))
-        if block_len == 0:
-            return torch.zeros((B, L), dtype=torch.bool, device=self.device)
-
-        g = torch.Generator(device=self.device)
-        g.manual_seed(int(seed))
-        starts = torch.randint(low=0, high=L - block_len + 1, size=(B,), generator=g, device=self.device)
-
-        ar = torch.arange(L, device=self.device).view(1, -1)
-        mask = (ar >= starts.view(-1, 1)) & (ar < (starts + block_len).view(-1, 1))
-        return mask
-
-    def _apply_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B,L) float
-        mask: (B,L) bool
-        """
-        fill = str(getattr(self.cfg, "mask_fill_value", "mean")).lower()
-
-        if fill == "zero":
-            fill_value = torch.zeros_like(x)
-
-        elif fill == "mean":
-            # per-SNP batch mean (detached)
-            fill_value = x.mean(dim=0, keepdim=True).expand_as(x).detach()
-
-        elif fill in ("random_af", "rand_af", "random"):
-            # sample corrupted genotypes from per-SNP allele frequency estimated from the batch
-            # assumes x is on {0,1,2} scale
-            p = (x.mean(dim=0).clamp(0.0, 2.0) / 2.0).detach()  # (L,)
-            b1 = torch.bernoulli(p.expand(x.size(0), -1))
-            b2 = torch.bernoulli(p.expand(x.size(0), -1))
-            fill_value = (b1 + b2).to(x.dtype)
-
-        else:
-            raise ValueError(f"Unknown mask_fill_value={fill!r}. Use 'zero', 'mean', or 'random_af'.")
-
-        xm = x.clone()
-        xm[mask] = fill_value[mask]
-        return xm
-
-    def _mse_all(self, x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 3:
-            x = x.squeeze(1)
-        if recon.dim() == 3:
-            recon = recon.squeeze(1)
-        return F.mse_loss(recon, x, reduction="mean")
+    def _to_2d(self, x: torch.Tensor) -> torch.Tensor:
+        return x.squeeze(1) if x.dim() == 3 else x
 
     def _assert_finite(self, name: str, t: torch.Tensor) -> None:
         if not torch.isfinite(t).all():
             raise RuntimeError(f"[NaN/Inf] {name} became non-finite")
 
-    # -------------------------
-    # core forward+loss
-    # -------------------------
-    def _forward_vae(self, x_in: torch.Tensor):
+    @staticmethod
+    def _mse_all(x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(recon, x, reduction="mean")
+
+    def _kl_standard_normal(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        kl_per = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+        return kl_per.sum(dim=1).mean()
+
+    def _training_cfg(self) -> Any:
+        return getattr(self.cfg, "training", None)
+
+    def _get_beta(self) -> float:
+        t = self._training_cfg()
+        return float(getattr(t, "beta", getattr(self.cfg, "beta", 0.01)))
+
+    def _get_lr(self) -> float:
+        t = self._training_cfg()
+        return float(getattr(t, "lr", getattr(self.cfg, "lr", 1e-3)))
+
+    def _get_wd(self) -> float:
+        t = self._training_cfg()
+        return float(getattr(t, "weight_decay", getattr(self.cfg, "weight_decay", 0.0)))
+
+    def _mask_cfg(self) -> Dict[str, Any]:
+        """
+        Reads nested cfg.masking.* if present, else falls back to legacy flat keys.
+        """
+        m = getattr(self.cfg, "masking", None)
+        if m is not None:
+            return {
+                "enabled": bool(getattr(m, "enabled", False)),
+                "alpha_masked": float(getattr(m, "alpha_masked", 1.0)),
+                "n_blocks": int(getattr(m, "n_blocks", 1)),
+                "block_len": getattr(m, "block_len", None),
+                "mask_frac": getattr(m, "mask_frac", None),
+                "allow_overlap": bool(getattr(m, "allow_overlap", True)),
+                "fill": str(getattr(m, "fill", getattr(m, "fill_value", "zero"))),
+                "gaussian_std": float(getattr(m, "gaussian_std", 0.1)),
+                "constant_value": float(getattr(m, "constant_value", 0.0)),
+            }
+
+        # legacy fallback
+        return {
+            "enabled": bool(getattr(self.cfg, "mask_enabled", False)),
+            "alpha_masked": float(getattr(self.cfg, "alpha_masked", 1.0)),
+            "n_blocks": 1,
+            "block_len": int(getattr(self.cfg, "mask_block_len", 0)) or None,
+            "mask_frac": None,
+            "allow_overlap": True,
+            "fill": str(getattr(self.cfg, "mask_fill_value", "zero")),
+            "gaussian_std": float(getattr(self.cfg, "mask_gaussian_std", 0.1)),
+            "constant_value": 0.0,
+        }
+
+    def _make_step_seed(self, stage: str, batch_idx: int) -> int:
+        base = int(getattr(self.cfg, "seed", 0))
+        stage_salt = 0 if stage == "train" else (1 if stage == "val" else 2)
+
+        if stage in {"val", "target"}:
+            # fixed masks across epochs -> stable validation curves
+            return base + 1_000_000 * stage_salt + int(batch_idx)
+
+        # training keeps changing each epoch
+        return base + 1_000_000 * stage_salt + 10_000 * int(self.current_epoch) + int(batch_idx)
+
+    def _forward(self, x_in: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         recon, mu, logvar = self.model(x_in)
         return recon, mu, logvar
 
-    def _compute_metrics_one_pass(
-        self,
-        *,
-        x: torch.Tensor,
-        x_in: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        recon: torch.Tensor,
-        mu: torch.Tensor,
-        logvar: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Computes recon_masked/unmasked (if mask is not None),
-        plus weighted recon objective and total loss (with KL).
-        """
-        if x.dim() == 3:
-            x0 = x.squeeze(1)
+    @staticmethod
+    def _buf_append(buf: Dict[str, List[torch.Tensor]], out: Dict[str, torch.Tensor], keys: List[str]) -> None:
+        for k in keys:
+            buf.setdefault(k, []).append(out[k].detach())
+
+    def _flush_buf(self, buf: Dict[str, List[torch.Tensor]], prefix: str) -> None:
+        for k, vs in buf.items():
+            if len(vs) == 0:
+                continue
+            mean_v = torch.stack(vs).mean()
+            self.log(
+                f"{prefix}/{k}",
+                mean_v,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=(prefix == "val" and k == "loss"),
+                logger=True,
+                add_dataloader_idx=False,
+                sync_dist=False,
+            )
+        buf.clear()
+
+    # -------------------------
+    # core step
+    # -------------------------
+    def _shared_step(self, batch: Any, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
+        x = self._unpack_batch(batch).to(self.device)
+        x = self._to_2d(x)
+        self._assert_finite("x", x)
+
+        B, L = x.shape
+        beta = self._get_beta()
+        eps = 1e-12
+
+        # (1) clean pass
+        recon_clean, mu_clean, logvar_clean = self._forward(x)
+        recon_clean = self._to_2d(recon_clean)
+        self._assert_finite("recon_clean", recon_clean)
+
+        mse_clean_all = self._mse_all(x, recon_clean)
+        kl_clean = self._kl_standard_normal(mu_clean, logvar_clean)
+
+        # (2) masked/corrupted pass
+        mcfg = self._mask_cfg()
+        seed = self._make_step_seed(stage, batch_idx)
+
+        if mcfg["enabled"] and (mcfg["block_len"] is not None or mcfg["mask_frac"] is not None):
+            x_in, mask, used_block_len = make_mask_and_apply(
+                x,
+                enabled=True,
+                n_blocks=int(mcfg["n_blocks"]),
+                block_len=mcfg["block_len"],
+                mask_frac=mcfg["mask_frac"],
+                allow_overlap=bool(mcfg["allow_overlap"]),
+                seed=int(seed),
+                fill=str(mcfg["fill"]),
+                gaussian_std=float(mcfg["gaussian_std"]),
+                constant_value=float(mcfg["constant_value"]),
+            )
         else:
-            x0 = x
-        if recon.dim() == 3:
-            r0 = recon.squeeze(1)
+            x_in = x
+            mask = torch.zeros((B, L), dtype=torch.bool, device=self.device)
+            used_block_len = 0
+
+        self._assert_finite("x_in", x_in)
+
+        recon, mu, logvar = self._forward(x_in)
+        recon = self._to_2d(recon)
+        self._assert_finite("recon", recon)
+
+        kl = self._kl_standard_normal(mu, logvar)
+
+        mse_corrupt_all = self._mse_all(x, recon)
+
+        if mask.any():
+            mse_mask = mse_masked(x, recon, mask)
+            mse_unmask = mse_masked(x, recon, ~mask)
         else:
-            r0 = recon
+            mse_mask = torch.tensor(0.0, device=self.device)
+            mse_unmask = mse_corrupt_all
 
-        # KL
-        _, base = self.loss_fn(x0, r0, mu, logvar)
-        kl = base["kl"]
+        alpha = float(mcfg["alpha_masked"])
+        # make alpha safe
+        alpha = max(0.0, min(1.0, alpha))
 
-        if mask is None:
-            recon_all = self._mse_all(x0, r0)
-            recon_masked = torch.tensor(0.0, device=self.device)
-            recon_unmasked = recon_all
-            recon_weighted = recon_all
-        else:
-            m = mask.bool()
-            recon_masked = mse_masked(x0, r0, m)
-            recon_unmasked = mse_masked(x0, r0, ~m)
+        recon_objective = alpha * mse_mask + (1.0 - alpha) * mse_unmask
+        loss = recon_objective + beta * kl
+        self._assert_finite("loss", loss)
 
-            w_m = float(getattr(self.cfg, "weight_masked", 1.0))
-            w_u = float(getattr(self.cfg, "weight_unmasked", 0.0))
-            recon_weighted = w_m * recon_masked + w_u * recon_unmasked
-            recon_all = self._mse_all(x0, r0)
+        # debug
+        mask_frac = mask.float().mean()
+        delta_in_l1 = (x_in - x).abs().mean()
 
-        beta = float(getattr(self.cfg, "beta", 0.01))
-        loss = recon_weighted + beta * kl
+        ratio_masked_over_clean = (mse_mask / (mse_clean_all + eps)) if mask.any() else torch.tensor(0.0, device=self.device)
 
         return {
             "loss": loss,
             "kl": kl,
-            "recon_all": recon_all,              # MSE over all sites for THIS pass
-            "recon_masked": recon_masked,        # MSE only on masked sites (0 if no mask)
-            "recon_unmasked": recon_unmasked,    # MSE only on unmasked sites
-            "recon_weighted": recon_weighted,    # the recon term used in objective
+            "recon_objective": recon_objective,
+            "mse_corrupt_all": mse_corrupt_all,
+            "mse_masked": mse_mask,
+            "mse_unmasked": mse_unmask,
+            "mse_clean_all": mse_clean_all,
+            "kl_clean": kl_clean,
+            "ratio_masked_over_clean": ratio_masked_over_clean,
+            "mask_frac": mask_frac,
+            "delta_in_l1": delta_in_l1,
+            "used_block_len": torch.tensor(float(used_block_len), device=self.device),
+            "x_max": x.max(),
+            "x_in_max": x_in.max(),
         }
 
-    def _shared_step(self, batch: Any, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
-        x = self._unpack_batch(batch).to(self.device)
-        self._assert_finite("x", x)
-
-        # ensure 2D (B,L)
-        if x.dim() == 3:
-            x = x.squeeze(1)
-
-        B, L = x.shape
-
-        # --- masked pass ---
-        mask = None
-        x_in = x
-        if self._mask_enabled():
-            # deterministic-but-changing masks across steps
-            base = int(getattr(self.cfg, "seed", 0))
-            # stage salt makes train/val masks differ but deterministic
-            stage_salt = 0 if stage == "train" else (1 if stage == "val" else 2)
-            seed = base + 1_000_000 * stage_salt + 10_000 * int(self.current_epoch) + int(batch_idx)
-            mask = self._make_contiguous_mask(B, L, seed=seed)
-            x_in = self._apply_mask(x, mask)
-
-        recon, mu, logvar = self._forward_vae(x_in)
-        self._assert_finite("recon(masked-pass)", recon)
-        self._assert_finite("mu", mu)
-        self._assert_finite("logvar", logvar)
-
-        masked_metrics = self._compute_metrics_one_pass(
-            x=x, x_in=x_in, mask=mask, recon=recon, mu=mu, logvar=logvar
-        )
-
-        # --- no-mask baseline pass (for clean comparison) ---
-        recon_nm, mu_nm, logvar_nm = self._forward_vae(x)
-        nomask_all = self._mse_all(x, recon_nm)
-
-        # --- debug: prove mask applied ---
-        if mask is None:
-            mask_frac = torch.tensor(0.0, device=self.device)
-            mask_delta_l1 = torch.tensor(0.0, device=self.device)
-        else:
-            mask_frac = mask.float().mean()
-            # how much did inputs change?
-            mask_delta_l1 = (x_in - x).abs().mean()
-
-        out = dict(masked_metrics)
-        out.update(
-            {
-                "recon_nomask_all": nomask_all,
-                "ratio_masked_over_nomask": (
-                    masked_metrics["recon_masked"] / (nomask_all + 1e-12)
-                    if mask is not None
-                    else torch.tensor(0.0, device=self.device)
-                ),
-                "debug_mask_frac": mask_frac,
-                "debug_mask_delta_l1": mask_delta_l1,
-                "debug_x_max": x.max(),
-                "debug_xin_max": x_in.max(),
-            }
-        )
-
-        self._assert_finite("loss", out["loss"])
-        return out
-
     # -------------------------
-    # lightning hooks
+    # Lightning hooks
     # -------------------------
-    def training_step(self, batch, batch_idx):
+    def on_train_epoch_start(self) -> None:
+        self._train_buf.clear()
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_buf.clear()
+        self._target_buf.clear()
+
+    def training_step(self, batch: Any, batch_idx: int):
         out = self._shared_step(batch, batch_idx=batch_idx, stage="train")
 
-        self.log("train/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/kl", out["kl"], on_step=True, on_epoch=True)
-        self.log("train/recon_weighted", out["recon_weighted"], on_step=True, on_epoch=True)
-        self.log("train/recon_all", out["recon_all"], on_step=True, on_epoch=True)
-        self.log("train/recon_masked", out["recon_masked"], on_step=True, on_epoch=True)
-        self.log("train/recon_unmasked", out["recon_unmasked"], on_step=True, on_epoch=True)
+        # train_step/* logs every step (no epoch)
+        step_keys = [
+            "loss", "kl", "recon_objective",
+            "mse_corrupt_all", "mse_masked", "mse_unmasked",
+            "mse_clean_all", "ratio_masked_over_clean",
+        ]
+        for k in step_keys:
+            self.log(
+                f"train_step/{k}",
+                out[k],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=(k == "loss"),
+                logger=True,
+                add_dataloader_idx=False,
+            )
 
-        # baseline + ratio (THIS is the plot you want)
-        self.log("train/recon_nomask_all", out["recon_nomask_all"], on_step=True, on_epoch=True)
-        self.log("train/ratio_masked_over_nomask", out["ratio_masked_over_nomask"], on_step=True, on_epoch=True)
+        # debug step logs
+        for k in ["mask_frac", "delta_in_l1", "used_block_len", "x_max", "x_in_max"]:
+            self.log(
+                f"debug/{k}",
+                out[k],
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                add_dataloader_idx=False,
+            )
 
-        # debugging proof
-        self.log("debug/mask_frac", out["debug_mask_frac"], on_step=True, on_epoch=True)
-        self.log("debug/mask_delta_l1", out["debug_mask_delta_l1"], on_step=True, on_epoch=True)
-        self.log("debug/x_max", out["debug_x_max"], on_step=True, on_epoch=True)
-        self.log("debug/xin_max", out["debug_xin_max"], on_step=True, on_epoch=True)
+        # accumulate for epoch means
+        self._buf_append(
+            self._train_buf,
+            out,
+            keys=step_keys + ["mask_frac", "delta_in_l1"],
+        )
 
         return out["loss"]
 
-    def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
+    def on_train_epoch_end(self) -> None:
+        self._flush_buf(self._train_buf, prefix="train")
+
+    def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         prefix = "val" if dataloader_idx == 0 else "target"
-        stage = "val" if dataloader_idx == 0 else "target"
+        stage = prefix  # seed salt
+
         out = self._shared_step(batch, batch_idx=batch_idx, stage=stage)
 
-        self.log(f"{prefix}/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=(dataloader_idx == 0))
-        self.log(f"{prefix}/kl", out["kl"], on_step=True, on_epoch=True)
-        self.log(f"{prefix}/recon_weighted", out["recon_weighted"], on_step=True, on_epoch=True)
-        self.log(f"{prefix}/recon_all", out["recon_all"], on_step=True, on_epoch=True)
-        self.log(f"{prefix}/recon_masked", out["recon_masked"], on_step=True, on_epoch=True)
-        self.log(f"{prefix}/recon_unmasked", out["recon_unmasked"], on_step=True, on_epoch=True)
-
-        self.log(f"{prefix}/recon_nomask_all", out["recon_nomask_all"], on_step=True, on_epoch=True)
-        self.log(f"{prefix}/ratio_masked_over_nomask", out["ratio_masked_over_nomask"], on_step=True, on_epoch=True)
-
-        # same debug metrics, but namespaced (so they appear with dataloader_idx)
-        self.log("debug/mask_frac", out["debug_mask_frac"], on_step=True, on_epoch=True)
-        self.log("debug/mask_delta_l1", out["debug_mask_delta_l1"], on_step=True, on_epoch=True)
-        self.log("debug/x_max", out["debug_x_max"], on_step=True, on_epoch=True)
-        self.log("debug/xin_max", out["debug_xin_max"], on_step=True, on_epoch=True)
+        keys = [
+            "loss", "kl", "recon_objective",
+            "mse_corrupt_all", "mse_masked", "mse_unmasked",
+            "mse_clean_all", "ratio_masked_over_clean",
+            "mask_frac", "delta_in_l1",
+        ]
+        buf = self._val_buf if prefix == "val" else self._target_buf
+        self._buf_append(buf, out, keys=keys)
 
         return out["loss"]
 
+    def on_validation_epoch_end(self) -> None:
+        self._flush_buf(self._val_buf, prefix="val")
+        self._flush_buf(self._target_buf, prefix="target")
+
     def configure_optimizers(self):
-        lr = float(getattr(self.cfg, "lr", 1e-3))
-        wd = float(getattr(self.cfg, "weight_decay", 0.0))
-        return torch.optim.Adam(self.parameters(), lr=lr, weight_decay=wd)
+        return torch.optim.Adam(self.parameters(), lr=self._get_lr(), weight_decay=self._get_wd())
 
     def forward(self, x):
         return self.model(x)

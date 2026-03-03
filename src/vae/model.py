@@ -141,8 +141,7 @@ class ConvVAE1D(nn.Module):
         elif y.size(1) < self.input_len:
             y = F.pad(y, (0, self.input_len - y.size(1)))
 
-        # Bound recon to [0,2] (dosage-like)
-        y = 2.0 * torch.sigmoid(y)
+        # For HWE-normalized inputs, recon should be real-valued
         return y
 
     def forward(self, x: torch.Tensor):

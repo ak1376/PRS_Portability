@@ -132,7 +132,7 @@ Path(f"{SIM_BASEDIR}/config.json").write_text(json.dumps(CFG, indent=2))
 VAE_DATA = CFG.get("vae_data", {}) or {}
 SUBSET_MODE   = VAE_DATA.get("subset_mode", "random")
 SUBSET_SEED   = int(VAE_DATA.get("subset_seed", 0))
-MAF_THRESHOLD = float(VAE_DATA.get("maf_threshold", 0.01))
+MAF_THRESHOLD = float(CFG.get("maf_threshold", 0.05))
 SUBSET_BP     = VAE_DATA.get("subset_bp", None)
 SUBSET_SNPS   = int(VAE_DATA.get("subset_snps", 10000))
 
@@ -174,11 +174,11 @@ rule all:
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",              sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json", sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- VAE training for every exp ---
+        # # --- VAE training for every exp ---
         expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- VAE diagnostics for every exp ---
-        expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
+        # # --- VAE diagnostics for every exp ---
+        # expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
 ##############################################################################
 # RULE simulate
@@ -254,8 +254,6 @@ rule build_inputs:
         val_frac      = 0.2,
         split_seed    = SUBSET_SEED,
 
-        normalize     = False,
-        norm_mode     = "none",
     threads: 1
     shell:
         r"""
@@ -279,8 +277,6 @@ rule build_inputs:
           --subset-seed "{params.subset_seed}" \
           --val-frac "{params.val_frac}" \
           --split-seed "{params.split_seed}" \
-          --normalize "{params.normalize}" \
-          --norm-mode "{params.norm_mode}" \
           $EXTRA_SUBSET_ARGS
 
         test -f "{output.geno}"
@@ -341,7 +337,7 @@ rule gwas:
         """
 
 ##############################################################################
-# RULE train_vae  (now per exp×sid×rep)
+# RULE train_vae  (per exp×sid×rep)
 ##############################################################################
 rule train_vae:
     input:
@@ -360,26 +356,33 @@ rule train_vae:
         done      = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     params:
         outdir = lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
+        # keep these knobs in one place; wrapper can forward or ignore
         accelerator = "gpu",
         devices     = "auto",
+        precision   = "32-true",  # let YAML override inside trainer; this is just a default
     threads: 1
     shell:
         r"""
         set -euo pipefail
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
-        export CUDA_VISIBLE_DEVICES=1
 
-        python -u "{TRAIN_VAE_SCRIPT}" \
+        mkdir -p "{params.outdir}"
+
+        # Call the snakemake wrapper (thin), which calls src/vae/train_vae.py
+        python -u "snakemake_scripts/train_vae_wrapper.py" \
           --train "{input.train}" \
           --val "{input.val}" \
           --target "{input.target}" \
           --hparams "{input.hparams}" \
           --outdir "{params.outdir}" \
           --accelerator "{params.accelerator}" \
-          --devices "{params.devices}"
+          --devices "{params.devices}" \
+          --precision "{params.precision}"
 
+        # save the exact exp yaml used for this run (grid-expanded)
         cp "{input.hparams}" "{output.grid_yaml}"
 
+        # sanity checks for snakemake
         test -f "{output.best_ckpt}"
         test -f "{output.summary}"
         test -f "{output.logs_ok}"

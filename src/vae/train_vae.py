@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
+"""
+snakemake_scripts/train_vae.py
+
+Minimal Lightning trainer that matches what src/vae/lit_model.py expects:
+- cfg has:
+  - cfg.input_len, cfg.latent_dim, cfg.hidden_channels, cfg.kernel_size, cfg.stride, cfg.padding, cfg.use_batchnorm
+  - cfg.seed
+  - cfg.training.{lr,beta,weight_decay,batch_size,max_epochs,log_every_n_steps,num_workers,accelerator,devices,strategy,precision}
+  - cfg.masking.{enabled,alpha_masked,n_blocks,allow_overlap,mask_frac,block_len,fill,gaussian_std,constant_value}
+
+It writes:
+- outdir/hparams.resolved.yaml
+- outdir/train_summary.json
+- outdir/checkpoints/best.ckpt
+- outdir/logs/version_*/metrics.csv and outdir/tb/version_*/events...
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -18,11 +36,10 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 import yaml
 
 from src.vae.lit_model import LitVAE
-from src.vae.model import VAEConfig
 
 
 # ----------------------------
-# IO helpers
+# utils
 # ----------------------------
 def read_yaml(path: Path) -> Dict[str, Any]:
     return yaml.safe_load(path.read_text()) or {}
@@ -33,7 +50,7 @@ def write_json(obj: Dict[str, Any], path: Path) -> None:
     path.write_text(json.dumps(obj, indent=2))
 
 
-def as_tuple_int(x: Any, name: str) -> Tuple[int, ...]:
+def as_tuple_int(x: Any, name: str) -> tuple[int, ...]:
     if isinstance(x, tuple):
         return tuple(int(v) for v in x)
     if isinstance(x, list):
@@ -41,15 +58,9 @@ def as_tuple_int(x: Any, name: str) -> Tuple[int, ...]:
     raise ValueError(f"{name} must be a list/tuple of ints, got {type(x)}")
 
 
-def make_loader(
-    X: np.ndarray,
-    batch_size: int,
-    *,
-    shuffle: bool,
-    num_workers: int = 0,
-) -> DataLoader:
-    X_t = torch.from_numpy(X).float()
-    ds = TensorDataset(X_t)  # yields (x,)
+def make_loader(X: np.ndarray, batch_size: int, *, shuffle: bool, num_workers: int) -> DataLoader:
+    Xt = torch.from_numpy(X).float()
+    ds = TensorDataset(Xt)
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -61,30 +72,41 @@ def make_loader(
     )
 
 
+def _maybe_int(x: Any) -> Any:
+    # allow YAML "1" -> 1, keep "auto" etc.
+    if isinstance(x, str) and x.isdigit():
+        return int(x)
+    return x
+
+
 # ----------------------------
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Train VAE with PyTorch Lightning (Snakemake-friendly).")
+    ap = argparse.ArgumentParser(description="Train VAE (Lightning) with minimal config plumbing.")
     ap.add_argument("--train", type=Path, required=True, help=".npy (N,L) train array")
     ap.add_argument("--val", type=Path, required=True, help=".npy (N,L) val array")
-    ap.add_argument("--target", type=Path, default=None, help="Optional .npy (N,L) target array for eval-only logging")
-    ap.add_argument("--hparams", type=Path, required=True, help="YAML with seed/model/training/masking sections")
+    ap.add_argument("--target", type=Path, default=None, help="Optional .npy (N,L) target array (2nd val dataloader)")
+    ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed")
     ap.add_argument("--outdir", type=Path, required=True)
 
-    # Optional overrides (default: honor YAML)
+    # small optional overrides (keeps script snakemake-friendly)
+    ap.add_argument("--no-progress-bar", action="store_true")
     ap.add_argument("--accelerator", type=str, default=None)
     ap.add_argument("--devices", type=str, default=None)
     ap.add_argument("--strategy", type=str, default=None)
     ap.add_argument("--precision", type=str, default=None)
-    ap.add_argument("--no-progress-bar", action="store_true")
+    ap.add_argument("--max-epochs", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--log-every-n-steps", type=int, default=None)
+    ap.add_argument("--num-workers", type=int, default=None)
 
     return ap.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    outdir = args.outdir
+    outdir: Path = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     hp = read_yaml(args.hparams)
@@ -96,7 +118,7 @@ def main() -> None:
     pl.seed_everything(seed, workers=True)
 
     # -------------------------
-    # Load arrays
+    # load arrays
     # -------------------------
     X_train = np.load(args.train)
     X_val = np.load(args.val)
@@ -110,10 +132,9 @@ def main() -> None:
 
     input_len = int(X_train.shape[1])
 
-    X_target = None
+    X_target: Optional[np.ndarray] = None
     if args.target is not None:
         X_target = np.load(args.target)
-
         if X_target.ndim != 2:
             raise ValueError(f"Expected 2D target array. Got target {X_target.shape}")
         if X_target.shape[1] != input_len:
@@ -122,58 +143,68 @@ def main() -> None:
             raise ValueError("Non-finite values found in target array.")
 
     # -------------------------
-    # Build cfg (includes masking knobs)
+    # resolve training knobs (with CLI overrides)
     # -------------------------
-    cfg = VAEConfig(
+    batch_size = int(args.batch_size if args.batch_size is not None else train_hp.get("batch_size", 256))
+    max_epochs = int(args.max_epochs if args.max_epochs is not None else train_hp.get("max_epochs", 50))
+    log_every_n_steps = int(
+        args.log_every_n_steps if args.log_every_n_steps is not None else train_hp.get("log_every_n_steps", 1)
+    )
+    num_workers = int(args.num_workers if args.num_workers is not None else train_hp.get("num_workers", 0))
+
+    accelerator = str(args.accelerator if args.accelerator is not None else train_hp.get("accelerator", "auto"))
+    devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
+    strategy = str(args.strategy if args.strategy is not None else train_hp.get("strategy", "auto"))
+    precision = str(args.precision if args.precision is not None else train_hp.get("precision", "32-true"))
+
+    devices = _maybe_int(devices)
+
+    # -------------------------
+    # build cfg for LitVAE
+    # -------------------------
+    cfg = SimpleNamespace(
+        # model
         input_len=input_len,
         latent_dim=int(model_hp.get("latent_dim", 32)),
         hidden_channels=as_tuple_int(model_hp.get("hidden_channels", [32, 64, 128]), "hidden_channels"),
         kernel_size=int(model_hp.get("kernel_size", 9)),
         stride=int(model_hp.get("stride", 2)),
         padding=int(model_hp.get("padding", 4)),
-        use_batchnorm=bool(model_hp.get("use_batchnorm", True)),
-        lr=float(train_hp.get("lr", 1e-3)),
-        beta=float(train_hp.get("beta", 1.0)),
-        weight_decay=float(train_hp.get("weight_decay", 0.0)),
-        # Masking
-        mask_enabled=bool(mask_hp.get("enabled", False)),
-        mask_block_len=int(mask_hp.get("block_len", 0)),
-        mask_fill_value=str(mask_hp.get("fill_value", "mean")),
-        weight_masked=float(mask_hp.get("weight_masked", 1.0)),
-        weight_unmasked=float(mask_hp.get("weight_unmasked", 0.0)),
+        use_batchnorm=bool(model_hp.get("use_batchnorm", False)),
+        # seed for deterministic masking
+        seed=seed,
+        # training (LitVAE will read cfg.training.*)
+        training=SimpleNamespace(
+            lr=float(train_hp.get("lr", 1e-3)),
+            beta=float(train_hp.get("beta", 0.01)),
+            weight_decay=float(train_hp.get("weight_decay", 0.0)),
+        ),
+        # masking (LitVAE will read cfg.masking.*)
+        masking=SimpleNamespace(
+            enabled=bool(mask_hp.get("enabled", False)),
+            alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
+            n_blocks=int(mask_hp.get("n_blocks", 1)),
+            allow_overlap=bool(mask_hp.get("allow_overlap", True)),
+            mask_frac=mask_hp.get("mask_frac", None),
+            block_len=mask_hp.get("block_len", None),
+            fill=str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
+            gaussian_std=float(mask_hp.get("gaussian_std", 0.1)),
+            constant_value=float(mask_hp.get("constant_value", 0.0)),
+        ),
     )
 
     # -------------------------
-    # Training HPs
-    # -------------------------
-    batch_size = int(train_hp.get("batch_size", 256))
-    max_epochs = int(train_hp.get("max_epochs", 50))
-    log_every_n_steps = int(train_hp.get("log_every_n_steps", 1))
-    num_workers = int(train_hp.get("num_workers", 0))
-
-    accelerator = str(args.accelerator) if args.accelerator is not None else str(train_hp.get("accelerator", "auto"))
-    devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
-    strategy = str(args.strategy) if args.strategy is not None else str(train_hp.get("strategy", "auto"))
-    precision = str(args.precision) if args.precision is not None else str(train_hp.get("precision", "32-true"))
-
-    # Normalize devices: allow "1" -> 1, keep "auto"
-    if isinstance(devices, str) and devices.isdigit():
-        devices = int(devices)
-
-    # -------------------------
-    # DataLoaders
+    # dataloaders
     # -------------------------
     train_loader = make_loader(X_train, batch_size, shuffle=True, num_workers=num_workers)
-
     val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
     val_dataloaders = [val_loader]
-
     if X_target is not None:
         target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
         val_dataloaders.append(target_loader)
 
     # -------------------------
-    # Write resolved YAML for plotting later (NOW includes masking)
+    # write resolved config (for plotting/debugging)
     # -------------------------
     resolved = {
         "seed": seed,
@@ -182,6 +213,9 @@ def main() -> None:
             "val": str(args.val),
             "target": (str(args.target) if args.target is not None else None),
             "input_len": input_len,
+            "n_train": int(X_train.shape[0]),
+            "n_val": int(X_val.shape[0]),
+            "n_target": (int(X_target.shape[0]) if X_target is not None else None),
         },
         "model": {
             "latent_dim": cfg.latent_dim,
@@ -191,19 +225,12 @@ def main() -> None:
             "padding": cfg.padding,
             "use_batchnorm": cfg.use_batchnorm,
         },
-        "masking": {
-            "enabled": cfg.mask_enabled,
-            "block_len": cfg.mask_block_len,
-            "fill_value": cfg.mask_fill_value,
-            "weight_masked": cfg.weight_masked,
-            "weight_unmasked": cfg.weight_unmasked,
-        },
         "training": {
             "batch_size": batch_size,
             "max_epochs": max_epochs,
-            "lr": cfg.lr,
-            "beta": cfg.beta,
-            "weight_decay": cfg.weight_decay,
+            "lr": cfg.training.lr,
+            "beta": cfg.training.beta,
+            "weight_decay": cfg.training.weight_decay,
             "precision": precision,
             "log_every_n_steps": log_every_n_steps,
             "num_workers": num_workers,
@@ -211,38 +238,47 @@ def main() -> None:
             "devices": devices,
             "strategy": strategy,
         },
+        "masking": {
+            "enabled": cfg.masking.enabled,
+            "alpha_masked": cfg.masking.alpha_masked,
+            "n_blocks": cfg.masking.n_blocks,
+            "allow_overlap": cfg.masking.allow_overlap,
+            "mask_frac": cfg.masking.mask_frac,
+            "block_len": cfg.masking.block_len,
+            "fill": cfg.masking.fill,
+            "gaussian_std": cfg.masking.gaussian_std,
+            "constant_value": cfg.masking.constant_value,
+        },
     }
     (outdir / "hparams.resolved.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False))
 
     # -------------------------
-    # Module
+    # module
     # -------------------------
     lit = LitVAE(cfg)
 
     # -------------------------
-    # Callbacks
+    # callbacks + loggers
     # -------------------------
     ckpt_dir = outdir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        monitor="val/loss_epoch/dataloader_idx_0",  # discovery val
+        monitor="val/loss",  # IMPORTANT: matches the rewritten lit_model.py
         mode="min",
         save_top_k=1,
         filename="vae-{epoch:03d}",
     )
+
     lr_cb = LearningRateMonitor(logging_interval="epoch")
 
-    # -------------------------
-    # Loggers (TensorBoard + CSV)
-    # -------------------------
-    tb_logger = TensorBoardLogger(save_dir=str(outdir), name="tb")   # outdir/tb/version_*/events...
-    csv_logger = CSVLogger(save_dir=str(outdir), name="logs")        # outdir/logs/version_*/metrics.csv
+    tb_logger = TensorBoardLogger(save_dir=str(outdir), name="tb")
+    csv_logger = CSVLogger(save_dir=str(outdir), name="logs")
     logger = [tb_logger, csv_logger]
 
     # -------------------------
-    # Trainer
+    # trainer
     # -------------------------
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -258,13 +294,10 @@ def main() -> None:
         enable_model_summary=False,
     )
 
-    # -------------------------
-    # Fit
-    # -------------------------
     trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
 
     # -------------------------
-    # Save summary + stable best.ckpt
+    # summary + stable best.ckpt
     # -------------------------
     summary = {
         "best_model_path": ckpt_cb.best_model_path,
@@ -279,9 +312,7 @@ def main() -> None:
     best_out = ckpt_dir / "best.ckpt"
     shutil.copy2(best, best_out)
 
-    # -------------------------
-    # Snakemake sanity outputs
-    # -------------------------
+    # sanity output (snakemake-friendly)
     logs_root = outdir / "logs"
     metrics = list(logs_root.glob("version_*/metrics.csv"))
     if not metrics:

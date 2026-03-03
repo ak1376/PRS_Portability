@@ -42,12 +42,13 @@
     "T_split"
   ], 
     "num_causal_variants": 100, 
-    "heritability": 0.9,
+    "heritability": 0.7,
     "trait_distribution": "normal",
     "trait_distribution_parameters": {
         "mean": 0,
         "std": 1
     },
+    "maf_threshold": 0.05,
     "engine": "msprime", 
     "species": "HomSap"
 }

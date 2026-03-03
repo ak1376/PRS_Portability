@@ -60,14 +60,6 @@ def parse_args() -> argparse.Namespace:
         help="Override discovery population label. If omitted, read from --experiment-config-json; else default CEU.",
     )
 
-    # NEW: normalization
-    ap.add_argument("--normalize", type=_str2bool, default=True)
-    ap.add_argument(
-        "--norm-mode",
-        type=str,
-        default="zscore_snp",
-        choices=["none", "zscore_snp", "af_residual", "divide_by_2"],
-    )
     ap.add_argument("--norm-eps", type=float, default=1e-6)
     ap.add_argument("--norm-clip-std-min", type=float, default=1e-3)
 
@@ -91,8 +83,6 @@ def main() -> None:
         val_frac=float(args.val_frac),
         split_seed=int(args.split_seed),
         discovery_pop=args.discovery_pop,
-        normalize=bool(args.normalize),
-        norm_mode=str(args.norm_mode),
         norm_eps=float(args.norm_eps),
         norm_clip_std_min=float(args.norm_clip_std_min),
     )
