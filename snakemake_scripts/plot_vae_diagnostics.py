@@ -70,8 +70,8 @@ def main() -> None:
         return
 
     # Legacy mode
-    if args.genotype is None or args.meta is None:
-        raise SystemExit("Legacy mode requires --genotype and --meta (or use --train-genotype/--val-genotype/--target-genotype).")
+    if args.genotype is None:
+        raise SystemExit("Legacy mode requires --genotype (or use split-mode args).")
 
     run_diagnostics(
         PlotArgs(

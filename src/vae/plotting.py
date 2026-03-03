@@ -2,29 +2,32 @@
 """
 src/vae/plotting.py
 
-One-file VAE diagnostics.
+Minimal VAE diagnostics (no heatmaps).
 
 What it does:
 - Reads Lightning CSVLogger metrics.csv from logdir/version_*/metrics.csv
-- Writes the plots you actually care about for masking:
-    * recon_masked_epoch.png
-    * recon_unmasked_epoch.png
-    * masked_over_unmasked_epoch.png
-    * recon_weighted_epoch.png   (this is the thing weight_masked changes)
-    * recon_all_epoch.png        (often hides masking; still useful context)
-- Also writes standard:
-    * loss_epoch.png, kl_epoch.png
-    * step plots (downsampled) for train/val/target if present
-- Loads best checkpoint using cfg from hparams.resolved.yaml
-- Computes recon on genotype arrays and writes recon_summary.txt
-- Heatmaps of abs error (per split) + backwards-compatible recon_abs_error_heatmap.png
+- Writes ONLY the meaningful plots for masked inpainting:
+    Epoch:
+      * loss_epoch.png
+      * recon_masked_epoch.png
+      * recon_unmasked_epoch.png
+      * masked_over_unmasked_epoch.png
+      * ratio_masked_over_nomask_epoch.png   (PRIMARY benchmark)
+      * recon_nomask_all_epoch.png           (baseline clean recon)
+    Steps (optional but handy when debugging training dynamics):
+      * loss_steps.png
+      * recon_masked_steps.png
+      * recon_unmasked_steps.png
+      * ratio_masked_over_nomask_steps.png
+- Computes recon on genotype arrays and writes recon_summary.txt with:
+      mse/mae for model and MAF baseline for CEU_train/CEU_val/YRI_target (or ALL)
 
 Assumptions:
-- Your training script writes:
+- Training writes:
     outdir/logs/version_*/metrics.csv
     outdir/hparams.resolved.yaml
-    outdir/checkpoints/best.ckpt   (or you pass an explicit checkpoint path)
-- Your LitVAE forward returns (recon, mu, logvar) OR the underlying model returns that.
+    outdir/checkpoints/best.ckpt
+- LitVAE wraps a .model returning (recon, mu, logvar) or recon directly.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,18 +75,27 @@ def load_metrics_csv(lightning_logs_dir: Path) -> pd.DataFrame:
     return pd.read_csv(metrics_path)
 
 
+def mse_masked_numpy(X: np.ndarray, R: np.ndarray, mask: np.ndarray) -> float:
+    """
+    X, R: (N,L)
+    mask: (N,L) boolean, True = evaluate here
+    """
+    if mask.sum() == 0:
+        return float("nan")
+    diff2 = (R - X) ** 2
+    return float(diff2[mask].mean())
+
+
+def mae_masked_numpy(X: np.ndarray, R: np.ndarray, mask: np.ndarray) -> float:
+    if mask.sum() == 0:
+        return float("nan")
+    diff = np.abs(R - X)
+    return float(diff[mask].mean())
+
 # ============================================================
 # Metric extraction helpers
 # ============================================================
 def _last_per_epoch(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
-    """
-    Return last logged value per epoch for a given metric column.
-
-    Works for columns like:
-      - train/loss_epoch
-      - val/recon_epoch/dataloader_idx_0
-      - target/recon_masked_epoch/dataloader_idx_1
-    """
     if "epoch" not in df.columns or "step" not in df.columns:
         return None
     if col not in df.columns:
@@ -109,7 +121,6 @@ def _series_with_fallbacks(df: pd.DataFrame, candidates: list[str]) -> Optional[
 
 
 def _extract_steps(df: pd.DataFrame, col: str, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Return (steps, values) for a step-level metric column (downsampled)."""
     if "step" not in df.columns or col not in df.columns:
         return None
 
@@ -270,14 +281,91 @@ def _plot_step_triplet(
     plt.close()
 
 
+def _plot_step_ratio(
+    df: pd.DataFrame,
+    outpath: Path,
+    title: str,
+    train_num: str,
+    train_den: str,
+    val_num_candidates: list[str],
+    val_den_candidates: list[str],
+    target_num_candidates: list[str],
+    target_den_candidates: list[str],
+    max_points: int,
+) -> None:
+    def safe_ratio_steps(numden: Optional[Tuple[np.ndarray, np.ndarray]], denden: Optional[Tuple[np.ndarray, np.ndarray]]):
+        if numden is None or denden is None:
+            return None
+        # Align by nearest indices after sorting (they should share steps but CSV can be sparse)
+        s1, v1 = numden
+        s2, v2 = denden
+        if s1.size == 0 or s2.size == 0:
+            return None
+        # Intersect on exact step values
+        common = np.intersect1d(s1, s2)
+        if common.size == 0:
+            return None
+        m1 = np.isin(s1, common)
+        m2 = np.isin(s2, common)
+        r = v1[m1] / (v2[m2] + 1e-12)
+        return common, r
+
+    tr_num = _extract_steps(df, train_num, max_points=max_points)
+    tr_den = _extract_steps(df, train_den, max_points=max_points)
+    tr = safe_ratio_steps(tr_num, tr_den)
+
+    va_num = None
+    for c in val_num_candidates:
+        va_num = _extract_steps(df, c, max_points=max_points)
+        if va_num is not None:
+            break
+    va_den = None
+    for c in val_den_candidates:
+        va_den = _extract_steps(df, c, max_points=max_points)
+        if va_den is not None:
+            break
+    va = safe_ratio_steps(va_num, va_den)
+
+    tg_num = None
+    for c in target_num_candidates:
+        tg_num = _extract_steps(df, c, max_points=max_points)
+        if tg_num is not None:
+            break
+    tg_den = None
+    for c in target_den_candidates:
+        tg_den = _extract_steps(df, c, max_points=max_points)
+        if tg_den is not None:
+            break
+    tg = safe_ratio_steps(tg_num, tg_den)
+
+    if tr is None and va is None and tg is None:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    if tr is not None:
+        ax.plot(tr[0], tr[1], label="Train (CEU)", linewidth=2)
+    if va is not None:
+        ax.plot(va[0], va[1], label="Val (CEU)", linewidth=2)
+    if tg is not None:
+        ax.plot(tg[0], tg[1], label="Target (YRI)", linewidth=2)
+
+    ax.set_title(title)
+    ax.set_xlabel("step")
+    ax.set_ylabel("ratio")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
+
+
 # ============================================================
-# Public plotting API
+# Public plotting API (MINIMAL)
 # ============================================================
 def plot_epoch_curves(df: pd.DataFrame, outdir: Path) -> None:
-    """
-    Minimal standard epoch plots.
-    (Masking-focused plots are in plot_masking_curves().)
-    """
     outdir.mkdir(parents=True, exist_ok=True)
 
     _plot_epoch_triplet(
@@ -290,57 +378,23 @@ def plot_epoch_curves(df: pd.DataFrame, outdir: Path) -> None:
         target_candidates=["target/loss_epoch/dataloader_idx_1", "target/loss_epoch"],
     )
 
-    _plot_epoch_triplet(
-        df,
-        outdir / "kl_epoch.png",
-        title="KL term (epoch)",
-        ylabel="kl",
-        train_candidates=["train/kl_epoch"],
-        val_candidates=["val/kl_epoch/dataloader_idx_0", "val/kl_epoch"],
-        target_candidates=["target/kl_epoch/dataloader_idx_1", "target/kl_epoch"],
-    )
 
-
-def plot_masking_curves(df: pd.DataFrame, outdir: Path) -> None:
+def plot_masking_epoch_curves(df: pd.DataFrame, outdir: Path) -> None:
     """
-    The plots you actually want for masked vs unmasked comparisons.
+    Minimal set for evaluating masking. These are the only ones I'd keep.
     """
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # What you optimize (weighted masked/unmasked, usually called train/recon)
-    _plot_epoch_triplet(
-        df,
-        outdir / "recon_weighted_epoch.png",
-        title="Weighted recon objective (epoch) — affected by weight_masked/weight_unmasked",
-        ylabel="recon_weighted",
-        train_candidates=["train/recon_epoch"],
-        val_candidates=["val/recon_epoch/dataloader_idx_0", "val/recon_epoch"],
-        target_candidates=["target/recon_epoch/dataloader_idx_1", "target/recon_epoch"],
-    )
-
-    # Recon on ALL SNPs (easy to look identical even when masking helps)
-    _plot_epoch_triplet(
-        df,
-        outdir / "recon_all_epoch.png",
-        title="Recon on ALL SNPs (epoch) — can hide masking effects",
-        ylabel="recon_all",
-        train_candidates=["train/recon_all_epoch"],
-        val_candidates=["val/recon_all_epoch/dataloader_idx_0", "val/recon_all_epoch"],
-        target_candidates=["target/recon_all_epoch/dataloader_idx_1", "target/recon_all_epoch"],
-    )
-
-    # Masked-only recon
     _plot_epoch_triplet(
         df,
         outdir / "recon_masked_epoch.png",
-        title="Recon on MASKED SNPs (epoch) — should improve if masking helps",
+        title="Recon on MASKED SNPs (epoch)",
         ylabel="recon_masked",
         train_candidates=["train/recon_masked_epoch"],
         val_candidates=["val/recon_masked_epoch/dataloader_idx_0", "val/recon_masked_epoch"],
         target_candidates=["target/recon_masked_epoch/dataloader_idx_1", "target/recon_masked_epoch"],
     )
 
-    # Unmasked-only recon
     _plot_epoch_triplet(
         df,
         outdir / "recon_unmasked_epoch.png",
@@ -351,11 +405,10 @@ def plot_masking_curves(df: pd.DataFrame, outdir: Path) -> None:
         target_candidates=["target/recon_unmasked_epoch/dataloader_idx_1", "target/recon_unmasked_epoch"],
     )
 
-    # Ratio
     _plot_epoch_ratio(
         df,
         outdir / "masked_over_unmasked_epoch.png",
-        title="MASKED / UNMASKED recon (epoch) — best single masking sanity plot",
+        title="MASKED / UNMASKED recon (epoch)",
         train_num=["train/recon_masked_epoch"],
         train_den=["train/recon_unmasked_epoch"],
         val_num=["val/recon_masked_epoch/dataloader_idx_0", "val/recon_masked_epoch"],
@@ -364,8 +417,32 @@ def plot_masking_curves(df: pd.DataFrame, outdir: Path) -> None:
         target_den=["target/recon_unmasked_epoch/dataloader_idx_1", "target/recon_unmasked_epoch"],
     )
 
+    _plot_epoch_triplet(
+        df,
+        outdir / "recon_nomask_all_epoch.png",
+        title="No-mask recon MSE on ALL SNPs (epoch) — clean baseline pass",
+        ylabel="recon_nomask_all",
+        train_candidates=["train/recon_nomask_all_epoch"],
+        val_candidates=["val/recon_nomask_all_epoch/dataloader_idx_0", "val/recon_nomask_all_epoch"],
+        target_candidates=["target/recon_nomask_all_epoch/dataloader_idx_1", "target/recon_nomask_all_epoch"],
+    )
+
+    # PRIMARY benchmark: should go DOWN with learning (and ideally < 1 at some point)
+    _plot_epoch_triplet(
+        df,
+        outdir / "ratio_masked_over_nomask_epoch.png",
+        title="Masked / No-mask recon (epoch) — PRIMARY benchmark",
+        ylabel="ratio_masked_over_nomask",
+        train_candidates=["train/ratio_masked_over_nomask_epoch"],
+        val_candidates=["val/ratio_masked_over_nomask_epoch/dataloader_idx_0", "val/ratio_masked_over_nomask_epoch"],
+        target_candidates=["target/ratio_masked_over_nomask_epoch/dataloader_idx_1", "target/ratio_masked_over_nomask_epoch"],
+    )
+
 
 def plot_step_curves(df: pd.DataFrame, outdir: Path, max_points: int = 5000) -> None:
+    """
+    Keep steps super minimal: 1 loss plot + 1 ratio plot.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
 
     _plot_step_triplet(
@@ -379,58 +456,16 @@ def plot_step_curves(df: pd.DataFrame, outdir: Path, max_points: int = 5000) -> 
         max_points=max_points,
     )
 
-    _plot_step_triplet(
+    _plot_step_ratio(
         df,
-        outdir / "recon_weighted_steps.png",
-        title="Weighted recon objective (steps)",
-        ylabel="recon_weighted",
-        train_col="train/recon_step",
-        val_cols=["val/recon_step/dataloader_idx_0", "val/recon_step"],
-        target_cols=["target/recon_step/dataloader_idx_1", "target/recon_step"],
-        max_points=max_points,
-    )
-
-    _plot_step_triplet(
-        df,
-        outdir / "recon_all_steps.png",
-        title="Recon on ALL SNPs (steps)",
-        ylabel="recon_all",
-        train_col="train/recon_all_step",
-        val_cols=["val/recon_all_step/dataloader_idx_0", "val/recon_all_step"],
-        target_cols=["target/recon_all_step/dataloader_idx_1", "target/recon_all_step"],
-        max_points=max_points,
-    )
-
-    _plot_step_triplet(
-        df,
-        outdir / "recon_masked_steps.png",
-        title="Recon on MASKED SNPs (steps)",
-        ylabel="recon_masked",
-        train_col="train/recon_masked_step",
-        val_cols=["val/recon_masked_step/dataloader_idx_0", "val/recon_masked_step"],
-        target_cols=["target/recon_masked_step/dataloader_idx_1", "target/recon_masked_step"],
-        max_points=max_points,
-    )
-
-    _plot_step_triplet(
-        df,
-        outdir / "recon_unmasked_steps.png",
-        title="Recon on UNMASKED SNPs (steps)",
-        ylabel="recon_unmasked",
-        train_col="train/recon_unmasked_step",
-        val_cols=["val/recon_unmasked_step/dataloader_idx_0", "val/recon_unmasked_step"],
-        target_cols=["target/recon_unmasked_step/dataloader_idx_1", "target/recon_unmasked_step"],
-        max_points=max_points,
-    )
-
-    _plot_step_triplet(
-        df,
-        outdir / "kl_steps.png",
-        title="KL term (steps)",
-        ylabel="kl",
-        train_col="train/kl_step",
-        val_cols=["val/kl_step/dataloader_idx_0", "val/kl_step"],
-        target_cols=["target/kl_step/dataloader_idx_1", "target/kl_step"],
+        outdir / "ratio_masked_over_nomask_steps.png",
+        title="Masked / No-mask recon (steps) — PRIMARY benchmark",
+        train_num="train/recon_masked_step",
+        train_den="train/recon_nomask_all_step",
+        val_num_candidates=["val/recon_masked_step/dataloader_idx_0", "val/recon_masked_step"],
+        val_den_candidates=["val/recon_nomask_all_step/dataloader_idx_0", "val/recon_nomask_all_step"],
+        target_num_candidates=["target/recon_masked_step/dataloader_idx_1", "target/recon_masked_step"],
+        target_den_candidates=["target/recon_nomask_all_step/dataloader_idx_1", "target/recon_nomask_all_step"],
         max_points=max_points,
     )
 
@@ -458,7 +493,6 @@ def load_cfg_from_resolved_yaml(resolved_yaml: Path) -> VAEConfig:
         lr=float(training.get("lr", 1e-3)),
         beta=float(training.get("beta", 1.0)),
         weight_decay=float(training.get("weight_decay", 0.0)),
-        # masking (safe defaults)
         mask_enabled=bool(masking.get("enabled", False)),
         mask_block_len=int(masking.get("block_len", 0)),
         mask_fill_value=str(masking.get("fill_value", "mean")),
@@ -478,10 +512,6 @@ def load_litvae_checkpoint(ckpt: Path, cfg: VAEConfig) -> LitVAE:
 
 @torch.no_grad()
 def compute_recon(lit: LitVAE, X: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
-    """
-    Runs the underlying model in eval mode and returns recon as numpy array (N,L).
-    """
-    # Use the underlying torch module if LitVAE wraps it
     model = getattr(lit, "model", lit)
     model.eval().to(device)
 
@@ -496,14 +526,65 @@ def compute_recon(lit: LitVAE, X: np.ndarray, device: torch.device, batch_size: 
 
     return torch.cat(outs, dim=0).numpy()
 
+@torch.no_grad()
+def compute_recon_masked_eval(
+    lit: LitVAE,
+    X: np.ndarray,
+    *,
+    device: torch.device,
+    batch_size: int,
+    stage: str,          # "train" | "val" | "target"
+    epoch: int,          # use 0 for diagnostics
+    base_seed: int,      # cfg.seed
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      recon: (N,L) model output when fed masked inputs
+      mask:  (N,L) bool numpy array of which positions were masked
+    """
+    lit.eval().to(device)
+    model = lit  # use LitVAE utilities for masking
+
+    Xt = torch.from_numpy(X).float()
+    recons: list[torch.Tensor] = []
+    masks: list[torch.Tensor] = []
+
+    stage_salt = 0 if stage == "train" else (1 if stage == "val" else 2)
+
+    for i in range(0, Xt.shape[0], batch_size):
+        xb = Xt[i : i + batch_size].to(device)
+        if xb.dim() == 3:
+            xb = xb.squeeze(1)
+        B, L = xb.shape
+
+        # recreate the exact seed schedule you used in training
+        # (epoch fixed for diagnostics; batch_idx = i//batch_size)
+        batch_idx = i // batch_size
+        seed = int(base_seed) + 1_000_000 * stage_salt + 10_000 * int(epoch) + int(batch_idx)
+
+        if model._mask_enabled():
+            m = model._make_contiguous_mask(B, L, seed=seed)  # (B,L) bool on device
+            x_in = model._apply_mask(xb, m)
+        else:
+            m = torch.zeros((B, L), dtype=torch.bool, device=device)
+            x_in = xb
+
+        recon, mu, logvar = model.model(x_in)  # ConvVAE1D forward
+        if recon.dim() == 3:
+            recon = recon.squeeze(1)
+
+        recons.append(recon.detach().cpu())
+        masks.append(m.detach().cpu())
+
+    R = torch.cat(recons, dim=0).numpy()
+    M = torch.cat(masks, dim=0).numpy().astype(bool)
+    return R, M
+
 
 # ============================================================
-# Baseline: MAF predictor
+# Baseline: MAF predictor + summary
 # ============================================================
-def maf_baseline_predict(X_train: np.ndarray, X_eval: np.ndarray) -> np.ndarray:
-    """
-    Predict genotype by 2*p where p is allele frequency estimated from training.
-    """
+def maf_baseline_predict(X_train: np.ndarray) -> np.ndarray:
     p = np.mean(X_train, axis=0) / 2.0
     return (2.0 * p[None, :]).astype(np.float32)
 
@@ -521,9 +602,11 @@ def write_recon_summary(
     splits: Dict[str, np.ndarray],
     recon: Dict[str, np.ndarray],
     maf_pred: Dict[str, np.ndarray],
+    masks: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     lines: list[str] = []
-    lines.append("# split\tmetric\tmodel\tmaf_baseline")
+    lines.append("# split\tmetric\tmodel\tmaf_baseline\twhere")
+
     for name in ["CEU_train", "CEU_val", "YRI_target", "ALL"]:
         if name not in splits:
             continue
@@ -531,53 +614,36 @@ def write_recon_summary(
         R = recon[name]
         B = maf_pred[name]
 
-        if not np.isfinite(R).all():
-            lines.append(f"{name}\tWARN\tmodel_recon_has_nan_or_inf\t-")
+        # full matrix
+        lines.append(f"{name}\tmse\t{_mse(R, X):.6g}\t{_mse(B, X):.6g}\tall")
+        lines.append(f"{name}\tmae\t{_mae(R, X):.6g}\t{_mae(B, X):.6g}\tall")
 
-        lines.append(f"{name}\tmse\t{_mse(R, X):.6g}\t{_mse(B, X):.6g}")
-        lines.append(f"{name}\tmae\t{_mae(R, X):.6g}\t{_mae(B, X):.6g}")
+        # masked-only (if available)
+        if masks is not None and name in masks:
+            M = masks[name]
+            lines.append(f"{name}\tmse\t{mse_masked_numpy(X, R, M):.6g}\t{mse_masked_numpy(X, B, M):.6g}\tmasked_only")
+            lines.append(f"{name}\tmae\t{mae_masked_numpy(X, R, M):.6g}\t{mae_masked_numpy(X, B, M):.6g}\tmasked_only")
+            # useful ratio
+            denom = mse_masked_numpy(X, B, M)
+            num = mse_masked_numpy(X, R, M)
+            if np.isfinite(num) and np.isfinite(denom) and denom > 0:
+                lines.append(f"{name}\tratio_mse_model_over_maf\t{(num/denom):.6g}\t-\tmasked_only")
 
     (outdir / "recon_summary.txt").write_text("\n".join(lines) + "\n")
-
-
-def plot_recon_heatmap(X: np.ndarray, R: np.ndarray, outpath: Path, n_show: int = 32) -> None:
-    abs_err = np.abs(R - X)
-    chosen = np.arange(min(n_show, X.shape[0]))
-    H = abs_err[chosen, :]
-
-    plt.figure(figsize=(10, 4))
-    plt.imshow(H, aspect="auto")
-    plt.colorbar()
-    plt.xlabel("site")
-    plt.ylabel("individual")
-    plt.title("abs(recon - true)")
-    outpath.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=200)
-    plt.close()
-
 
 # ============================================================
 # Entrypoint
 # ============================================================
 @dataclass
 class PlotArgs:
-    # where to find metrics.csv:
-    # expects logdir/version_*/metrics.csv
     logdir: Path
-
-    # model loading
     checkpoint: Path
     resolved_hparams: Path
-
     outdir: Path
 
-    # split-mode inputs (preferred)
     train_genotype: Optional[Path] = None
     val_genotype: Optional[Path] = None
     target_genotype: Optional[Path] = None
-
-    # legacy single input
     genotype: Optional[Path] = None
 
     batch_size: int = 256
@@ -586,15 +652,27 @@ class PlotArgs:
 
 
 def run_diagnostics(a: PlotArgs) -> None:
+    """
+    Diagnostics:
+      1) Plot Lightning curves from metrics.csv
+      2) Compute recon + MAF baseline and write recon_summary.txt
+
+    Notes:
+      - If you want summary metrics to reflect your *masked-inpainting* objective,
+        compute recon using your masked-eval helper (compute_recon_masked_eval) so
+        recon is produced from x_in (masked) not from clean x.
+      - If you don't have compute_recon_masked_eval, you can swap it to compute_recon(...)
+        and set masks=None (but then "masked" metrics in the summary won't be meaningful).
+    """
     a.outdir.mkdir(parents=True, exist_ok=True)
 
     # ---- plots from Lightning logs ----
     df = load_metrics_csv(a.logdir)
     plot_epoch_curves(df, a.outdir)
-    plot_masking_curves(df, a.outdir)
+    plot_masking_epoch_curves(df, a.outdir)
     plot_step_curves(df, a.outdir, max_points=a.max_step_points)
 
-    # ---- load genotype arrays ----
+    # ---- load genotype arrays (for recon_summary.txt) ----
     splits: Dict[str, np.ndarray] = {}
     if any(p is not None for p in [a.train_genotype, a.val_genotype, a.target_genotype]):
         if a.train_genotype is None or a.val_genotype is None or a.target_genotype is None:
@@ -607,7 +685,6 @@ def run_diagnostics(a: PlotArgs) -> None:
             raise ValueError("Provide either split-mode genotypes or legacy genotype.")
         splits["ALL"] = np.load(a.genotype).astype(np.float32)
 
-    # sanity
     for k, X in splits.items():
         if X.ndim != 2:
             raise ValueError(f"{k} expected shape (N,L), got {X.shape}")
@@ -621,32 +698,52 @@ def run_diagnostics(a: PlotArgs) -> None:
     cfg = load_cfg_from_resolved_yaml(a.resolved_hparams)
     lit = load_litvae_checkpoint(a.checkpoint, cfg)
 
-    # ---- recon per split ----
+    # ---- recon (+ masks for masked-only summary metrics) ----
     recon: Dict[str, np.ndarray] = {}
+    masks: Dict[str, np.ndarray] = {}
+
+    # Deterministic snapshot for diagnostics
+    base_seed = int(getattr(cfg, "seed", 0))
+    epoch_for_eval = 0
+
     for name, X in splits.items():
-        recon[name] = compute_recon(lit, X, device=device, batch_size=a.batch_size)
+        # Map split name -> stage salt used in LitVAE._shared_step
+        stage = "train" if name == "CEU_train" else ("val" if name == "CEU_val" else "target")
+
+        # Preferred: evaluate the same way you train (masked input)
+        R, M = compute_recon_masked_eval(
+            lit,
+            X,
+            device=device,
+            batch_size=a.batch_size,
+            stage=stage,
+            epoch=epoch_for_eval,
+            base_seed=base_seed,
+        )
+        recon[name] = R
+        masks[name] = M
+
+        # If you *don't* have compute_recon_masked_eval yet, use this fallback:
+        # recon[name] = compute_recon(lit, X, device=device, batch_size=a.batch_size)
+        # (and later set masks=None)
 
     # ---- MAF baseline (train-based if possible) ----
     maf_pred: Dict[str, np.ndarray] = {}
     if "CEU_train" in splits:
-        Xtr = splits["CEU_train"]
-        for name, X in splits.items():
-            maf_pred[name] = maf_baseline_predict(Xtr, X)
+        base = maf_baseline_predict(splits["CEU_train"])  # expected shape (1,L)
     else:
-        X0 = next(iter(splits.values()))
-        for name, X in splits.items():
-            maf_pred[name] = maf_baseline_predict(X0, X)
+        base = maf_baseline_predict(next(iter(splits.values())))  # expected shape (1,L)
+
+    for name, X in splits.items():
+        if base.ndim != 2 or base.shape[0] != 1 or base.shape[1] != X.shape[1]:
+            raise ValueError(f"maf_baseline_predict returned {base.shape}, expected (1, L={X.shape[1]})")
+        maf_pred[name] = np.repeat(base, repeats=X.shape[0], axis=0).astype(np.float32)
 
     # ---- summary ----
-    write_recon_summary(a.outdir, splits=splits, recon=recon, maf_pred=maf_pred)
-
-    # ---- heatmaps ----
-    if "CEU_train" in splits:
-        plot_recon_heatmap(splits["CEU_train"], recon["CEU_train"], a.outdir / "recon_abs_error_heatmap_ceu_train.png")
-        plot_recon_heatmap(splits["CEU_val"], recon["CEU_val"], a.outdir / "recon_abs_error_heatmap_ceu_val.png")
-        plot_recon_heatmap(splits["YRI_target"], recon["YRI_target"], a.outdir / "recon_abs_error_heatmap_yri_target.png")
-        # backwards compatible default
-        plot_recon_heatmap(splits["CEU_val"], recon["CEU_val"], a.outdir / "recon_abs_error_heatmap.png")
-    else:
-        name = next(iter(splits.keys()))
-        plot_recon_heatmap(splits[name], recon[name], a.outdir / "recon_abs_error_heatmap.png")
+    write_recon_summary(
+        a.outdir,
+        splits=splits,
+        recon=recon,
+        maf_pred=maf_pred,
+        masks=masks,  # change to None if you used the compute_recon fallback
+    )

@@ -178,7 +178,7 @@ class LitVAE(pl.LightningModule):
             "recon_weighted": recon_weighted,    # the recon term used in objective
         }
 
-    def _shared_step(self, batch: Any) -> Dict[str, torch.Tensor]:
+    def _shared_step(self, batch: Any, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
         x = self._unpack_batch(batch).to(self.device)
         self._assert_finite("x", x)
 
@@ -193,7 +193,10 @@ class LitVAE(pl.LightningModule):
         x_in = x
         if self._mask_enabled():
             # deterministic-but-changing masks across steps
-            seed = int(getattr(self.cfg, "seed", 0)) + int(self.global_step)
+            base = int(getattr(self.cfg, "seed", 0))
+            # stage salt makes train/val masks differ but deterministic
+            stage_salt = 0 if stage == "train" else (1 if stage == "val" else 2)
+            seed = base + 1_000_000 * stage_salt + 10_000 * int(self.current_epoch) + int(batch_idx)
             mask = self._make_contiguous_mask(B, L, seed=seed)
             x_in = self._apply_mask(x, mask)
 
@@ -242,7 +245,7 @@ class LitVAE(pl.LightningModule):
     # lightning hooks
     # -------------------------
     def training_step(self, batch, batch_idx):
-        out = self._shared_step(batch)
+        out = self._shared_step(batch, batch_idx=batch_idx, stage="train")
 
         self.log("train/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/kl", out["kl"], on_step=True, on_epoch=True)
@@ -264,8 +267,9 @@ class LitVAE(pl.LightningModule):
         return out["loss"]
 
     def validation_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        out = self._shared_step(batch)
         prefix = "val" if dataloader_idx == 0 else "target"
+        stage = "val" if dataloader_idx == 0 else "target"
+        out = self._shared_step(batch, batch_idx=batch_idx, stage=stage)
 
         self.log(f"{prefix}/loss", out["loss"], on_step=True, on_epoch=True, prog_bar=(dataloader_idx == 0))
         self.log(f"{prefix}/kl", out["kl"], on_step=True, on_epoch=True)

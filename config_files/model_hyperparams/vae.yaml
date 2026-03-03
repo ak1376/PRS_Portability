@@ -1,16 +1,16 @@
 model:
   latent_dim: 64
-  hidden_channels: [64, 128, 256]
+  hidden_channels: [64, 128]
   kernel_size: 17
   stride: 2
   padding: 8
-  use_batchnorm: false
+  use_batchnorm: false   # <- simplest
 
 training:
   batch_size: 64
-  max_epochs: 50
-  lr: 0.001  
-  beta: 0.01 
+  max_epochs: 100
+  lr: 3e-4
+  beta: 0.001
   weight_decay: 1e-5
   precision: "32-true"
   log_every_n_steps: 1
@@ -18,9 +18,45 @@ training:
 
 masking:
   enabled: true
-  block_len: 1000          # contiguous SNP block length to mask
-  fill_value: "mean"      # "mean" or "zero"
-  weight_masked: 10.0      # knob: emphasize masked reconstruction
-  weight_unmasked: 0.0    # knob: also score unmasked if >0
+  block_len: 256
+  fill_value: "zero"
+  weight_masked: 3.0
+  weight_unmasked: 0.0
 
 seed: 0
+
+# --------------------------
+# NEW: grid definition
+# --------------------------
+grid:
+  enabled: false
+
+  # how experiment names are built
+  # (optional; if omitted we’ll use key=value pieces)
+  name:
+    prefix: "vae"
+    sep: "__"
+
+  # list of sweep dimensions
+  # each item is: path + values
+  # path uses dot notation into this YAML
+  dims:
+    - path: "masking.block_len"
+      values: [64, 128, 256, 512, 1024]
+      tag: "block"
+
+    # - path: "model.latent_dim"
+    #   values: [32, 64]
+    #   tag: "z"          # optional alias for naming
+
+    # - path: "training.beta"
+    #   values: [0.005, 0.01, 1.0]
+    #   tag: "beta"
+
+    # - path: "masking.fill_value"
+    #   values: ["mean", "zero"]
+    #   tag: "fill"
+
+    # - path: "masking.weight_masked"
+    #   values: [0.0, 0.5, 1.0]
+    #   tag: "wm"

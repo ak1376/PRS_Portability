@@ -1,16 +1,102 @@
 # Snakefile
+from __future__ import annotations
+
 import json
+import itertools
+import copy
 from pathlib import Path
 
+import yaml
+
 ##############################################################################
-# Scripts + Config
+# VAE YAML grid expansion (reuses your vae.yaml + optional grid: section)
+##############################################################################
+BASE_VAE_YAML = Path("config_files/model_hyperparams/vae.yaml")
+BASE_VAE = yaml.safe_load(BASE_VAE_YAML.read_text())
+
+GEN_VAE_DIR = Path("config_files/generated_vae")
+GEN_VAE_DIR.mkdir(parents=True, exist_ok=True)
+
+def set_by_path(d: dict, path: str, value):
+    keys = path.split(".")
+    cur = d
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+
+def tagify(v):
+    # floats: 0.005 -> 0p005 ; 10.0 -> 10
+    if isinstance(v, float):
+        s = f"{v:g}"
+        return s.replace(".", "p")
+    return str(v)
+
+def exp_yaml_path(exp: str) -> Path:
+    return GEN_VAE_DIR / f"{exp}.yaml"
+
+GRID = BASE_VAE.get("grid", {}) or {}
+GRID_ENABLED = bool(GRID.get("enabled", False))
+DIMS = GRID.get("dims", []) or []
+
+if GRID_ENABLED and len(DIMS) == 0:
+    raise ValueError("vae.yaml has grid.enabled=true but grid.dims is empty")
+
+def make_exp_name(assignments):
+    name_cfg = GRID.get("name", {}) or {}
+    prefix = name_cfg.get("prefix", "vae")
+    sep = name_cfg.get("sep", "__")
+
+    parts = []
+    for dim, val in assignments:
+        tag = dim.get("tag", None)
+        pth = dim["path"]
+        key = tag if tag else pth.split(".")[-1]
+        parts.append(f"{key}{tagify(val)}")
+    return prefix + sep + sep.join(parts)
+
+EXP_SPECS: list[tuple[str, list[tuple[dict, object]]]] = []
+if GRID_ENABLED:
+    values_lists = [dim["values"] for dim in DIMS]
+    for combo in itertools.product(*values_lists):
+        assignments = list(zip(DIMS, combo))
+        exp = make_exp_name(assignments)
+
+        # build YAML for this exp (base + overrides)
+        cfg = copy.deepcopy(BASE_VAE)
+        cfg.pop("grid", None)  # remove grid section from per-exp YAML
+
+        for dim, val in assignments:
+            set_by_path(cfg, dim["path"], val)
+
+        # provenance stamps
+        cfg["_generated_from"] = str(BASE_VAE_YAML)
+        cfg["_exp_name"] = exp
+
+        exp_yaml_path(exp).write_text(yaml.safe_dump(cfg, sort_keys=False))
+        EXP_SPECS.append((exp, assignments))
+
+    EXP_NAMES = [e for e, _ in EXP_SPECS]
+else:
+    exp = "default"
+    cfg = copy.deepcopy(BASE_VAE)
+    cfg.pop("grid", None)
+    cfg["_generated_from"] = str(BASE_VAE_YAML)
+    cfg["_exp_name"] = exp
+    exp_yaml_path(exp).write_text(yaml.safe_dump(cfg, sort_keys=False))
+    EXP_NAMES = [exp]
+
+
+##############################################################################
+# Scripts + Experiment Config (demography/simulation)
 ##############################################################################
 SIM_SCRIPT   = "snakemake_scripts/simulation.py"
 BUILD_INPUTS = "snakemake_scripts/build_genotypes_for_vae.py"
 GWAS_SCRIPT  = "snakemake_scripts/run_gwas.py"
 
 TRAIN_VAE_SCRIPT = "snakemake_scripts/train_vae.py"
-PLOT_WRAPPER     = "snakemake_scripts/plot_vae_diagnostics.py" # provided below
+PLOT_WRAPPER     = "snakemake_scripts/plot_vae_diagnostics.py"
 
 EXP_CFG = "config_files/experiment_config_IM_symmetric.json"
 CFG = json.loads(Path(EXP_CFG).read_text())
@@ -22,8 +108,8 @@ MODEL = CFG["demographic_model"]
 NUM_DRAWS = int(CFG.get("num_draws", 1))
 REPS      = int(CFG.get("num_replicates", 1))
 
-SID_RANGE = range(NUM_DRAWS)   # sid = 0..num_draws-1
-REP_RANGE = range(REPS)        # rep = 0..num_replicates-1
+SID_RANGE = range(NUM_DRAWS)
+REP_RANGE = range(REPS)
 
 ##############################################################################
 # Directories
@@ -31,6 +117,7 @@ REP_RANGE = range(REPS)        # rep = 0..num_replicates-1
 SIM_BASEDIR  = f"experiments/{MODEL}/simulations"
 GENO_BASEDIR = f"experiments/{MODEL}/processed_data"
 GWAS_BASEDIR = f"experiments/{MODEL}/gwas"
+# NOTE: VAE now includes exp name
 VAE_BASEDIR  = f"experiments/{MODEL}/vae"
 
 Path(SIM_BASEDIR).mkdir(parents=True, exist_ok=True)
@@ -46,26 +133,14 @@ VAE_DATA = CFG.get("vae_data", {}) or {}
 SUBSET_MODE   = VAE_DATA.get("subset_mode", "random")
 SUBSET_SEED   = int(VAE_DATA.get("subset_seed", 0))
 MAF_THRESHOLD = float(VAE_DATA.get("maf_threshold", 0.01))
-SUBSET_BP     = VAE_DATA.get("subset_bp", None)         # if not None, used instead of subset_snps
+SUBSET_BP     = VAE_DATA.get("subset_bp", None)
 SUBSET_SNPS   = int(VAE_DATA.get("subset_snps", 10000))
 
 ##############################################################################
-# GWAS settings (optional; defaults here)
+# GWAS settings
 ##############################################################################
 GWAS_CFG = CFG.get("gwas", {}) or {}
 DISCOVERY_POP = GWAS_CFG.get("discovery_pop", "CEU")
-
-##############################################################################
-# VAE training config (optional; defaults here)
-##############################################################################
-MODEL_CFG_YAML = "config_files/model_hyperparams/vae.yaml"
-SEED_DEFAULT   = int(CFG.get("seed", 0))
-TRAINING_CFG   = CFG.get("training", {}) or {}
-MAX_EPOCHS     = int(TRAINING_CFG.get("max_epochs", 50))
-BATCH_SIZE     = int(TRAINING_CFG.get("batch_size", 256))
-NUM_WORKERS    = int(TRAINING_CFG.get("num_workers", 4))
-PRECISION      = str(TRAINING_CFG.get("precision", "16-mixed"))
-LOG_EVERY_N    = int(TRAINING_CFG.get("log_every_n_steps", 10))
 
 ##############################################################################
 # RULE all
@@ -90,31 +165,23 @@ rule all:
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/genotype_site_stats.txt",   sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/site_filter_report.txt",    sid=SID_RANGE, rep=REP_RANGE),
 
-        # --- NEW splits (always produced; raw or normalized depending on params) ---
+        # --- splits ---
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train_idx.npy", sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val_idx.npy",   sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target_idx.npy",          sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",     sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",       sid=SID_RANGE, rep=REP_RANGE),
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",              sid=SID_RANGE, rep=REP_RANGE),
-
-        # always exists (Pattern A)
         expand(f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json", sid=SID_RANGE, rep=REP_RANGE),
 
-        # # --- GWAS outputs ---
-        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_results.csv",   sid=SID_RANGE, rep=REP_RANGE),
-        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_manhattan.png", sid=SID_RANGE, rep=REP_RANGE),
-        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_qq.png",        sid=SID_RANGE, rep=REP_RANGE),
-        # expand(f"{GWAS_BASEDIR}/{{sid}}/rep{{rep}}/gwas_af_diff.png",   sid=SID_RANGE, rep=REP_RANGE),
+        # --- VAE training for every exp ---
+        expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
-        # # --- VAE training ---
-        expand(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done", sid=SID_RANGE, rep=REP_RANGE),
-
-        # # --- VAE diagnostics ---
-        expand(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/.done", sid=SID_RANGE, rep=REP_RANGE),
+        # --- VAE diagnostics for every exp ---
+        expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
 ##############################################################################
-# RULE simulate – one sim per sid×rep
+# RULE simulate
 ##############################################################################
 rule simulate:
     input:
@@ -145,6 +212,9 @@ rule simulate:
         touch "{output.done}"
         """
 
+##############################################################################
+# RULE build_inputs
+##############################################################################
 rule build_inputs:
     input:
         cfg   = EXP_CFG,
@@ -164,7 +234,6 @@ rule build_inputs:
         stats_txt = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/genotype_site_stats.txt",
         filt_txt  = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/site_filter_report.txt",
 
-        # NEW splits
         disc_train_idx = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train_idx.npy",
         disc_val_idx   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val_idx.npy",
         target_idx     = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target_idx.npy",
@@ -172,7 +241,6 @@ rule build_inputs:
         disc_val_npy   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target_npy     = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
 
-        # always exists (Pattern A)
         norm_report    = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json",
     params:
         outdir        = lambda wc: f"{GENO_BASEDIR}/{wc.sid}/rep{wc.rep}",
@@ -186,9 +254,8 @@ rule build_inputs:
         val_frac      = 0.2,
         split_seed    = SUBSET_SEED,
 
-        # Pattern A toggle: flip this True/False and nothing else changes
         normalize     = False,
-        norm_mode     = "none",        # or "zscore_snp"
+        norm_mode     = "none",
     threads: 1
     shell:
         r"""
@@ -216,7 +283,6 @@ rule build_inputs:
           --norm-mode "{params.norm_mode}" \
           $EXTRA_SUBSET_ARGS
 
-        # sanity checks
         test -f "{output.geno}"
         test -f "{output.hap1}"
         test -f "{output.hap2}"
@@ -228,7 +294,6 @@ rule build_inputs:
         test -f "{output.site_ids}"
         test -f "{output.stats_txt}"
         test -f "{output.filt_txt}"
-
         test -f "{output.disc_train_idx}"
         test -f "{output.disc_val_idx}"
         test -f "{output.target_idx}"
@@ -239,7 +304,7 @@ rule build_inputs:
         """
 
 ##############################################################################
-# RULE gwas – run GWAS per sid×rep using processed genotype matrix
+# RULE gwas
 ##############################################################################
 rule gwas:
     input:
@@ -276,25 +341,25 @@ rule gwas:
         """
 
 ##############################################################################
-# RULE train_vae – train + validate Lightning model (per sid×rep)
+# RULE train_vae  (now per exp×sid×rep)
 ##############################################################################
-
 rule train_vae:
     input:
         train       = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
         val         = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
-        target      = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",  # <-- NEW (YRI eval-only)
+        target      = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
         norm_report = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/normalization_report.json",
-        hparams     = MODEL_CFG_YAML,
+        hparams     = lambda wc: str(exp_yaml_path(wc.exp)),
     output:
-        best_ckpt = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
-        summary   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/train_summary.json",
-        logs_ok   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/logs_ok.txt",
-        logs_dir  = directory(f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/logs"),
-        resolved  = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
-        done      = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done",
+        best_ckpt = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
+        summary   = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/train_summary.json",
+        logs_ok   = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/logs_ok.txt",
+        logs_dir  = directory(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/logs"),
+        resolved  = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
+        grid_yaml = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.grid.yaml",
+        done      = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     params:
-        outdir = lambda wc: f"{VAE_BASEDIR}/{wc.sid}/rep{wc.rep}",
+        outdir = lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
         accelerator = "gpu",
         devices     = "auto",
     threads: 1
@@ -304,7 +369,7 @@ rule train_vae:
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
         export CUDA_VISIBLE_DEVICES=1
 
-        python -u "snakemake_scripts/train_vae.py" \
+        python -u "{TRAIN_VAE_SCRIPT}" \
           --train "{input.train}" \
           --val "{input.val}" \
           --target "{input.target}" \
@@ -313,34 +378,37 @@ rule train_vae:
           --accelerator "{params.accelerator}" \
           --devices "{params.devices}"
 
+        cp "{input.hparams}" "{output.grid_yaml}"
+
         test -f "{output.best_ckpt}"
         test -f "{output.summary}"
         test -f "{output.logs_ok}"
         test -f "{output.resolved}"
+        test -f "{output.grid_yaml}"
         test -d "{output.logs_dir}"
         touch "{output.done}"
         """
 
 ##############################################################################
-# RULE vae_diagnostics – plot curves + recon diagnostics (per sid×rep)
+# RULE vae_diagnostics  (now per exp×sid×rep)
 ##############################################################################
 rule vae_diagnostics:
     input:
         train    = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
         val      = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target   = f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
-        ckpt     = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
-        logdir   = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/logs",
-        resolved = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
-        done     = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/.train_done",
+        ckpt     = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
+        logdir   = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/logs",
+        resolved = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
+        done     = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     output:
-        loss_epoch = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/loss_epoch.png",
-        heatmap    = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/recon_abs_error_heatmap.png",
-        summary    = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/recon_summary.txt",
-        done       = f"{VAE_BASEDIR}/{{sid}}/rep{{rep}}/diagnostics/.done",
+        loss_epoch = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/loss_epoch.png",
+        summary    = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/recon_summary.txt",
+        ratio      = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/ratio_masked_over_nomask_epoch.png",
+        done       = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done",
     params:
-        outdir = lambda wc: f"{VAE_BASEDIR}/{wc.sid}/rep{wc.rep}/diagnostics",
-        batch_size = 64,  # TODO: Change later
+        outdir = lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/diagnostics",
+        batch_size = 64,
         max_step_points = 5000,
     threads: 1
     shell:
@@ -349,7 +417,7 @@ rule vae_diagnostics:
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
         mkdir -p "{params.outdir}"
 
-        python -u "snakemake_scripts/plot_vae_diagnostics.py" \
+        python -u "{PLOT_WRAPPER}" \
           --logdir "{input.logdir}" \
           --checkpoint "{input.ckpt}" \
           --resolved-hparams "{input.resolved}" \
@@ -359,10 +427,10 @@ rule vae_diagnostics:
           --outdir "{params.outdir}" \
           --batch-size "{params.batch_size}" \
           --max-step-points "{params.max_step_points}" \
-          --device auto
+          --device cpu
 
         test -f "{output.loss_epoch}"
-        test -f "{output.heatmap}"
         test -f "{output.summary}"
+        test -f "{output.ratio}"
         touch "{output.done}"
         """
