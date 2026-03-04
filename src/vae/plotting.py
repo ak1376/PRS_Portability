@@ -37,6 +37,73 @@ from src.vae.model import VAEConfig
 
 
 # =========================
+# Reconstruction scatter plot
+# =========================
+def save_recon_scatter(
+    recon_npz: Path,
+    outpath: Path,
+    *,
+    alpha: float = 0.3,
+    point_size: float = 5,
+    max_points: int = 50000,
+) -> dict:
+    """
+    Create scatter plot of true vs reconstructed values at masked positions.
+    Returns dict with stats (corr, mse, n_masked).
+    """
+    data = np.load(recon_npz)
+    x_true = data["x_true"]
+    recon = data["recon"]
+    mask = data["mask"]
+
+    # Extract values at masked positions
+    true_masked = x_true[mask]
+    recon_masked = recon[mask]
+
+    n_masked = len(true_masked)
+    if n_masked == 0:
+        return {"corr": float("nan"), "mse": float("nan"), "n_masked": 0}
+
+    corr = float(np.corrcoef(true_masked, recon_masked)[0, 1])
+    mse = float(np.mean((true_masked - recon_masked) ** 2))
+
+    # Subsample if too many points
+    if n_masked > max_points:
+        idx = np.random.choice(n_masked, max_points, replace=False)
+        true_plot = true_masked[idx]
+        recon_plot = recon_masked[idx]
+    else:
+        true_plot = true_masked
+        recon_plot = recon_masked
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(true_plot, recon_plot, alpha=alpha, s=point_size, c="steelblue", edgecolors="none")
+
+    # Add diagonal line
+    lims = [
+        min(ax.get_xlim()[0], ax.get_ylim()[0]),
+        max(ax.get_xlim()[1], ax.get_ylim()[1]),
+    ]
+    ax.plot(lims, lims, "k--", alpha=0.5, label="y = x")
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+
+    ax.set_xlabel("True value (at masked positions)", fontsize=12)
+    ax.set_ylabel("Reconstructed value", fontsize=12)
+    ax.set_title(f"VAE Reconstruction at Masked Positions\nCorr={corr:.3f}, MSE={mse:.4f}, N={n_masked:,}", fontsize=12)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    plt.tight_layout()
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return {"corr": corr, "mse": mse, "n_masked": n_masked}
+
+
+# =========================
 # Metrics.csv loading
 # =========================
 def find_latest_version_dir(lightning_logs_dir: Path) -> Path:
@@ -457,6 +524,7 @@ class Args:
     target_genotype: Optional[Path]
     batch_size: int
     device: str
+    recon_dir: Optional[Path] = None  # directory with {split}_recon.npz files
 
 
 def run(a: Args) -> None:
@@ -528,6 +596,24 @@ def run(a: Args) -> None:
         masks=(masks if masks_available else None),
     )
 
+    # ---- 3) reconstruction scatter plots from saved recon artifacts ----
+    if a.recon_dir is not None and a.recon_dir.exists():
+        scatter_stats = {}
+        for split in ["train", "val", "target"]:
+            npz_path = a.recon_dir / f"{split}_recon.npz"
+            if npz_path.exists():
+                out_png = a.outdir / "plots" / f"recon_scatter_{split}.png"
+                stats = save_recon_scatter(npz_path, out_png)
+                scatter_stats[split] = stats
+                print(f"Saved {out_png} (corr={stats['corr']:.4f}, mse={stats['mse']:.4f})")
+
+        # Write scatter stats summary
+        if scatter_stats:
+            lines = ["split\tcorr\tmse\tn_masked"]
+            for split, s in scatter_stats.items():
+                lines.append(f"{split}\t{s['corr']:.6f}\t{s['mse']:.6f}\t{s['n_masked']}")
+            (a.outdir / "recon_scatter_stats.txt").write_text("\n".join(lines) + "\n")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -540,6 +626,8 @@ def main() -> None:
     ap.add_argument("--train-genotype", type=Path, required=True, help="discovery_train.npy")
     ap.add_argument("--val-genotype", type=Path, required=True, help="discovery_val.npy")
     ap.add_argument("--target-genotype", type=Path, default=None, help="optional target.npy (e.g. YRI)")
+
+    ap.add_argument("--recon-dir", type=Path, default=None, help="directory with {split}_recon.npz files")
 
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -557,6 +645,7 @@ def main() -> None:
             target_genotype=args.target_genotype,
             batch_size=args.batch_size,
             device=args.device,
+            recon_dir=args.recon_dir,
         )
     )
 

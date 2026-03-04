@@ -36,6 +36,7 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 import yaml
 
 from src.vae.lit_model import LitVAE
+from src.masking import make_mask_and_apply
 
 
 # ----------------------------
@@ -80,6 +81,98 @@ def _maybe_int(x: Any) -> Any:
 
 
 # ----------------------------
+# Reconstruction saving helpers
+# ----------------------------
+def _model_recon(lit: LitVAE, x: torch.Tensor) -> torch.Tensor:
+    """
+    Run LitVAE's underlying model and return recon with shape (B, L).
+    """
+    lit.eval()
+    with torch.no_grad():
+        out = lit.model(x)
+        # Handle different forward signatures: recon, (recon, mu, logvar), or dict
+        if isinstance(out, torch.Tensor):
+            recon = out
+        elif isinstance(out, (tuple, list)):
+            recon = out[0]
+        elif isinstance(out, dict):
+            recon = out.get("recon", out.get("x_recon"))
+        else:
+            raise RuntimeError(f"Unexpected model output type: {type(out)}")
+    if recon.ndim != 2:
+        recon = recon.view(recon.shape[0], -1)
+    return recon
+
+
+def dump_recon_artifacts(
+    *,
+    outdir: Path,
+    lit: LitVAE,
+    X: np.ndarray,
+    split_name: str,
+    n_samples: int,
+    seed: int,
+    mask_cfg: Dict[str, Any],
+) -> None:
+    """
+    Save reconstruction artifacts for analysis.
+    
+    Saves recon/{split}_recon.npz with:
+      - x_true: ground truth (n_samples, L)
+      - x_masked: masked input fed to VAE (n_samples, L)
+      - mask: boolean mask where True = masked position (n_samples, L)
+      - recon: VAE reconstruction (n_samples, L)
+    
+    This allows scatterplots of recon vs x_true at masked positions.
+    """
+    out_recon_dir = outdir / "recon"
+    out_recon_dir.mkdir(parents=True, exist_ok=True)
+
+    if X.shape[0] == 0:
+        return
+
+    n = min(int(n_samples), X.shape[0])
+    x_true = X[:n].astype(np.float32, copy=False)
+    device = lit.device
+
+    x_true_t = torch.from_numpy(x_true).to(device=device, dtype=torch.float32)
+
+    # Apply masking using the same masking code as training
+    split_offset = {"train": 11_111, "val": 22_222, "target": 33_333}.get(split_name, 0)
+    dump_seed = int(seed) + int(split_offset)
+
+    x_masked_t, mask_t, _ = make_mask_and_apply(
+        x_true_t,
+        enabled=mask_cfg.get("enabled", False),
+        n_blocks=mask_cfg.get("n_blocks", 1),
+        block_len=mask_cfg.get("block_len"),
+        mask_frac=mask_cfg.get("mask_frac"),
+        allow_overlap=mask_cfg.get("allow_overlap", True),
+        seed=dump_seed,
+        fill=mask_cfg.get("fill", "zero"),
+        gaussian_std=mask_cfg.get("gaussian_std", 0.1),
+        constant_value=mask_cfg.get("constant_value", 0.0),
+    )
+
+    # Get reconstruction from masked input
+    recon_t = _model_recon(lit, x_masked_t)
+
+    # Convert to numpy
+    x_masked = x_masked_t.detach().cpu().numpy().astype(np.float32)
+    mask = mask_t.detach().cpu().numpy().astype(np.bool_)
+    recon = recon_t.detach().cpu().numpy().astype(np.float32)
+
+    np.savez_compressed(
+        out_recon_dir / f"{split_name}_recon.npz",
+        x_true=x_true,
+        x_masked=x_masked,
+        mask=mask,
+        recon=recon,
+    )
+    print(f"Saved {split_name} reconstructions to {out_recon_dir / f'{split_name}_recon.npz'}")
+
+
+# ----------------------------
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
@@ -100,6 +193,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
+
+    # reconstruction saving
+    ap.add_argument("--save-recon", action="store_true", help="Save reconstruction artifacts after training")
+    ap.add_argument("--recon-n", type=int, default=100, help="Number of samples to save for reconstruction analysis")
+    ap.add_argument("--recon-splits", type=str, default="val,target", help="Comma-separated splits to save: train,val,target")
 
     return ap.parse_args()
 
@@ -321,6 +419,57 @@ def main() -> None:
 
     print("Best checkpoint:", best_out)
     print("TensorBoard logdir:", outdir / "tb")
+
+    # -------------------------
+    # Save reconstruction artifacts (optional)
+    # -------------------------
+    if args.save_recon:
+        # Load best model for reconstruction
+        lit_best = LitVAE.load_from_checkpoint(str(best_out), cfg=cfg)
+        lit_best.eval()
+        
+        # Move to appropriate device
+        if torch.cuda.is_available() and accelerator != "cpu":
+            lit_best = lit_best.to("cuda")
+        
+        # Parse which splits to save
+        splits_to_save = [s.strip().lower() for s in args.recon_splits.split(",") if s.strip()]
+        
+        # Prepare mask config dict for dump_recon_artifacts
+        mask_cfg_dict = {
+            "enabled": bool(mask_hp.get("enabled", False)),
+            "n_blocks": int(mask_hp.get("n_blocks", 1)),
+            "block_len": mask_hp.get("block_len"),
+            "mask_frac": mask_hp.get("mask_frac"),
+            "allow_overlap": bool(mask_hp.get("allow_overlap", True)),
+            "fill": str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
+            "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
+            "constant_value": float(mask_hp.get("constant_value", 0.0)),
+        }
+        
+        for split in splits_to_save:
+            if split == "train":
+                X = X_train
+            elif split == "val":
+                X = X_val
+            elif split == "target":
+                if X_target is None:
+                    print(f"Skipping target split (no target data provided)")
+                    continue
+                X = X_target
+            else:
+                print(f"Unknown split '{split}', skipping")
+                continue
+            
+            dump_recon_artifacts(
+                outdir=outdir,
+                lit=lit_best,
+                X=X,
+                split_name=split,
+                n_samples=args.recon_n,
+                seed=seed,
+                mask_cfg=mask_cfg_dict,
+            )
 
 
 if __name__ == "__main__":

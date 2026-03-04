@@ -353,42 +353,53 @@ rule train_vae:
         logs_dir  = directory(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/logs"),
         resolved  = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
         grid_yaml = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.grid.yaml",
+        # NEW: recon outputs (optional, but tracked if you enable it)
+        recon_dir = directory(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/recon"),
         done      = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     params:
         outdir = lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
-        # keep these knobs in one place; wrapper can forward or ignore
         accelerator = "gpu",
         devices     = "auto",
-        precision   = "32-true",  # let YAML override inside trainer; this is just a default
-    threads: 1
+        precision   = "32-true",
+        save_recon  = True,
+        recon_n     = 16,
+        recon_splits = "train,val,target",
     shell:
         r"""
         set -euo pipefail
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
-
         mkdir -p "{params.outdir}"
 
-        # Call the snakemake wrapper (thin), which calls src/vae/train_vae.py
-        python -u "snakemake_scripts/train_vae_wrapper.py" \
-          --train "{input.train}" \
-          --val "{input.val}" \
-          --target "{input.target}" \
-          --hparams "{input.hparams}" \
-          --outdir "{params.outdir}" \
-          --accelerator "{params.accelerator}" \
-          --devices "{params.devices}" \
-          --precision "{params.precision}"
+        RECON_ARGS=""
+        if [ "{params.save_recon}" = "True" ]; then
+        RECON_ARGS="--save-recon --recon-n {params.recon_n} --recon-splits {params.recon_splits}"
+        fi
 
-        # save the exact exp yaml used for this run (grid-expanded)
+        python -u "snakemake_scripts/train_vae_wrapper.py" \
+        --train "{input.train}" \
+        --val "{input.val}" \
+        --target "{input.target}" \
+        --hparams "{input.hparams}" \
+        --outdir "{params.outdir}" \
+        --accelerator "{params.accelerator}" \
+        --devices "{params.devices}" \
+        --precision "{params.precision}" \
+        $RECON_ARGS
+
         cp "{input.hparams}" "{output.grid_yaml}"
 
-        # sanity checks for snakemake
         test -f "{output.best_ckpt}"
         test -f "{output.summary}"
         test -f "{output.logs_ok}"
         test -f "{output.resolved}"
         test -f "{output.grid_yaml}"
         test -d "{output.logs_dir}"
+
+        if [ "{params.save_recon}" = "True" ]; then
+        test -d "{output.recon_dir}"
+        test -f "{output.recon_dir}/val_recon.npz"
+        fi
+
         touch "{output.done}"
         """
 
@@ -403,6 +414,7 @@ rule vae_diagnostics:
         ckpt     = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
         logdir   = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/logs",
         resolved = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
+        recon_dir = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/recon",
         done     = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     output:
         # Notebook-equivalent plots (epoch-mean curves + scatters)
@@ -410,6 +422,8 @@ rule vae_diagnostics:
         masked_mse = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/masked_mse_mean.png",
         clean_mse  = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/clean_mse_mean.png",
         kl_logy    = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/kl_mean_logy.png",
+        # Reconstruction scatter plots
+        scatter_val = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/recon_scatter_val.png",
         summary    = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/recon_summary.txt",
         done       = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done",
     params:
@@ -432,6 +446,7 @@ rule vae_diagnostics:
           --train-genotype "{input.train}" \
           --val-genotype "{input.val}" \
           --target-genotype "{input.target}" \
+          --recon-dir "{input.recon_dir}" \
           --outdir "{params.outdir}" \
           --batch-size "{params.batch_size}" \
           --max-step-points "{params.max_step_points}" \
@@ -442,6 +457,7 @@ rule vae_diagnostics:
         test -f "{output.masked_mse}"
         test -f "{output.clean_mse}"
         test -f "{output.kl_logy}"
+        test -f "{output.scatter_val}"
         test -f "{output.summary}"
 
         touch "{output.done}"

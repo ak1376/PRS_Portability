@@ -20,6 +20,7 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 import yaml
 
 from src.vae.lit_model import LitVAE
+from src.masking import make_mask_and_apply
 
 
 # ----------------------------
@@ -71,6 +72,58 @@ def make_loader(X: np.ndarray, batch_size: int, *, shuffle: bool, num_workers: i
     )
 
 
+def dump_recon_artifacts(
+    lit: LitVAE,
+    X: np.ndarray,
+    outdir: Path,
+    split: str,
+    n: int,
+    mask_cfg: Dict[str, Any],
+    seed: int,
+) -> None:
+    """
+    Save x_true, x_masked, mask, recon for `n` samples.
+    Uses masking settings from mask_cfg (taken from LitVAE._mask_cfg()).
+    Saves to outdir/recon/{split}_recon.npz
+    """
+    device = next(lit.parameters()).device
+    lit.eval()
+
+    # limit samples
+    X_sub = X[:n]
+    x_true = torch.from_numpy(X_sub).float().to(device)
+
+    # apply masking with same settings as training
+    x_in, mask, _ = make_mask_and_apply(
+        x_true,
+        enabled=mask_cfg["enabled"],
+        n_blocks=mask_cfg["n_blocks"],
+        block_len=mask_cfg["block_len"],
+        mask_frac=mask_cfg["mask_frac"],
+        allow_overlap=mask_cfg["allow_overlap"],
+        seed=seed,
+        fill=mask_cfg["fill"],
+        gaussian_std=mask_cfg["gaussian_std"],
+        constant_value=mask_cfg["constant_value"],
+    )
+
+    with torch.no_grad():
+        recon, _, _ = lit(x_in)  # forward returns (recon, mu, logvar)
+
+    # Save to recon/ subdirectory
+    recon_dir = outdir / "recon"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+    out_path = recon_dir / f"{split}_recon.npz"
+    np.savez_compressed(
+        out_path,
+        x_true=x_true.cpu().numpy(),
+        x_masked=x_in.cpu().numpy(),
+        mask=mask.cpu().numpy(),
+        recon=recon.cpu().numpy(),
+    )
+    print(f"Saved reconstruction artifacts to {out_path}")
+
+
 # ----------------------------
 # CLI
 # ----------------------------
@@ -92,6 +145,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
+
+    # reconstruction artifacts
+    ap.add_argument("--save-recon", action="store_true", help="Save reconstruction artifacts after training")
+    ap.add_argument("--recon-n", type=int, default=64, help="Number of samples to include in recon artifacts")
+    ap.add_argument("--recon-splits", type=str, default="val", help="Comma-separated list: train,val,target")
     return ap.parse_args()
 
 
@@ -147,6 +205,9 @@ def main() -> None:
     devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
     strategy = str(args.strategy if args.strategy is not None else train_hp.get("strategy", "auto"))
     precision = str(args.precision if args.precision is not None else train_hp.get("precision", "32-true"))
+    gradient_clip_val = _none_if_null(train_hp.get("gradient_clip_val", None))
+    if gradient_clip_val is not None:
+        gradient_clip_val = float(gradient_clip_val)
 
     devices = _maybe_int(devices)
 
@@ -296,6 +357,7 @@ def main() -> None:
         devices=devices,
         strategy=strategy,
         precision=precision,
+        gradient_clip_val=gradient_clip_val,
         callbacks=[ckpt_cb, lr_cb],
         logger=logger,
         log_every_n_steps=log_every_n_steps,
@@ -330,6 +392,27 @@ def main() -> None:
 
     print("Best checkpoint:", best_out)
     print("TensorBoard logdir:", outdir / "tb")
+
+    # -------------------------
+    # optional reconstruction artifacts
+    # -------------------------
+    if args.save_recon:
+        splits = [s.strip() for s in args.recon_splits.split(",")]
+        split_data = {"train": X_train, "val": X_val, "target": X_target}
+        for split in splits:
+            X_split = split_data.get(split)
+            if X_split is None:
+                print(f"Skipping split '{split}' (no data)")
+                continue
+            dump_recon_artifacts(
+                lit=lit,
+                X=X_split,
+                outdir=outdir,
+                split=split,
+                n=args.recon_n,
+                mask_cfg=mcfg,
+                seed=seed,
+            )
 
 
 if __name__ == "__main__":

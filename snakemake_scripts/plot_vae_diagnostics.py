@@ -26,6 +26,8 @@ def main() -> None:
     ap.add_argument("--val-genotype", type=Path, required=True)
     ap.add_argument("--target-genotype", type=Path, default=None)
 
+    ap.add_argument("--recon-dir", type=Path, default=None, help="directory with {split}_recon.npz files")
+
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
 
@@ -47,6 +49,7 @@ def main() -> None:
             target_genotype=a.target_genotype,
             batch_size=a.batch_size,
             device=a.device,
+            recon_dir=a.recon_dir,
         )
     )
 

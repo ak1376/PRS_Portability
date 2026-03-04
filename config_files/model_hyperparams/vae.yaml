@@ -1,16 +1,18 @@
 model:
-  latent_dim: 64
-  hidden_channels: [64, 128]
-  kernel_size: 17
-  stride: 2
-  padding: 8
+  latent_dim: 256
+  hidden_channels: [64, 128, 256, 256]
+  kernel_size: 33
+  stride: 4
+  padding: 16
   use_batchnorm: false
 
 training:
   batch_size: 32
-  lr: 3e-4
-  beta: 0.001
+  max_epochs: 200
+  lr: 1e-4              # Lower LR for stability
+  beta: 0.0001          # Start with very low beta
   weight_decay: 1e-5
+  gradient_clip_val: 1.0  # Clip gradients to prevent explosion
 
 masking:
   enabled: true
@@ -20,7 +22,7 @@ masking:
 
   # geometry
   mode: "contiguous"
-  n_blocks: 4
+  n_blocks: 16
   allow_overlap: true
 
   # length control (choose ONE)
@@ -35,7 +37,7 @@ masking:
 seed: 0
 
 grid:
-  enabled: true
+  enabled: false
   name:
     prefix: "vae"
     sep: "__"
