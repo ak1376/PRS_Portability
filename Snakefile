@@ -178,7 +178,7 @@ rule all:
         expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
         # # --- VAE diagnostics for every exp ---
-        # expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
+        expand(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done", exp=EXP_NAMES, sid=SID_RANGE, rep=REP_RANGE),
 
 ##############################################################################
 # RULE simulate
@@ -393,7 +393,7 @@ rule train_vae:
         """
 
 ##############################################################################
-# RULE vae_diagnostics  (now per exp×sid×rep)
+# RULE vae_diagnostics  (per exp×sid×rep)
 ##############################################################################
 rule vae_diagnostics:
     input:
@@ -405,13 +405,18 @@ rule vae_diagnostics:
         resolved = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.resolved.yaml",
         done     = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
     output:
-        loss_epoch = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/loss_epoch.png",
+        # Notebook-equivalent plots (epoch-mean curves + scatters)
+        loss_epoch = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/epoch_loss_mean.png",
+        masked_mse = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/masked_mse_mean.png",
+        clean_mse  = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/clean_mse_mean.png",
+        kl_logy    = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/kl_mean_logy.png",
         summary    = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/recon_summary.txt",
-        ratio      = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/ratio_masked_over_nomask_epoch.png",
         done       = f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done",
     params:
         outdir = lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/diagnostics",
         batch_size = 64,
+        device = "cpu",
+        # keep for backwards compatibility; wrapper accepts it even if unused
         max_step_points = 5000,
     threads: 1
     shell:
@@ -430,10 +435,14 @@ rule vae_diagnostics:
           --outdir "{params.outdir}" \
           --batch-size "{params.batch_size}" \
           --max-step-points "{params.max_step_points}" \
-          --device cpu
+          --device "{params.device}"
 
+        # Ensure key outputs exist
         test -f "{output.loss_epoch}"
+        test -f "{output.masked_mse}"
+        test -f "{output.clean_mse}"
+        test -f "{output.kl_logy}"
         test -f "{output.summary}"
-        test -f "{output.ratio}"
+
         touch "{output.done}"
         """

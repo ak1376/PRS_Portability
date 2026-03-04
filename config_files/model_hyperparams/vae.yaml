@@ -1,4 +1,3 @@
-# YAML (rewrite)
 model:
   latent_dim: 64
   hidden_channels: [64, 128]
@@ -8,49 +7,47 @@ model:
   use_batchnorm: false
 
 training:
-  batch_size: 8
-  max_epochs: 50
+  batch_size: 32
   lr: 3e-4
   beta: 0.001
   weight_decay: 1e-5
-  precision: "32-true"
-  log_every_n_steps: 1
-  num_workers: 4
 
 masking:
   enabled: true
-  alpha_masked: 1.0   # 1.0 = pure inpainting
+
+  # objective weighting
+  alpha_masked: 1.0
 
   # geometry
-  mode: "contiguous"       # currently only contiguous blocks are implemented
-  n_blocks: 4              # NEW: number of blocks per sample
-  allow_overlap: true      # NEW: allow blocks to overlap (simpler; overlap reduces realized masked fraction)
+  mode: "contiguous"
+  n_blocks: 4
+  allow_overlap: true
 
   # length control (choose ONE)
-  mask_frac: 0.10          # NEW (recommended): total fraction of SNPs to mask per sample
-  block_len: null          # if set (int), overrides mask_frac and is interpreted as per-block length
+  mask_frac: 0.20      # total fraction masked per sample
+  block_len: null      # if set (int), overrides mask_frac and is PER-BLOCK length
 
-  # corruption / fill (recommended for HWE-normalized inputs)
-  fill: "gaussian"         # gaussian | zero | mean | constant
-  gaussian_std: 0.1        # NEW: std of Gaussian noise in normalized space
-  constant_value: 0.0      # used only if fill == "constant"
+  # corruption / fill
+  fill: "gaussian"     # gaussian | zero | mean | constant
+  gaussian_std: 0.1
+  constant_value: 0.0
 
 seed: 0
 
 grid:
-  enabled: false
+  enabled: true
   name:
     prefix: "vae"
     sep: "__"
   dims:
     - path: "masking.mask_frac"
-      values: [0.01, 0.02, 0.05, 0.1]
+      values: [0.01, 0.10, 0.20, 0.30, 0.5, 0.8]
       tag: "mf"
 
-    - path: "masking.n_blocks"
-      values: [1, 2, 4, 8]
-      tag: "nb"
+    # - path: "masking.n_blocks"
+    #   values: [1, 2, 4, 8]
+    #   tag: "nb"
 
-    - path: "masking.gaussian_std"
-      values: [0.05, 0.1, 0.2]
-      tag: "gs"
+    # - path: "masking.gaussian_std"
+    #   values: [0.05, 0.1, 0.2]
+    #   tag: "gs"
