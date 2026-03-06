@@ -227,14 +227,20 @@ def main() -> None:
     if block_len == 0:
         block_len = None
 
+    # Handle padding - can be None for auto-calculation in FullyConvVAE1D
+    padding_val = model_hp.get("padding", 4)
+    if padding_val is not None:
+        padding_val = int(padding_val)
+
     cfg = SimpleNamespace(
         # model (flat)
         input_len=input_len,
+        model_type=str(model_hp.get("model_type", "conv")),  # "conv" or "fully_conv"
         latent_dim=int(model_hp.get("latent_dim", 32)),
         hidden_channels=as_tuple_int(model_hp.get("hidden_channels", [32, 64, 128]), "hidden_channels"),
         kernel_size=int(model_hp.get("kernel_size", 9)),
         stride=int(model_hp.get("stride", 2)),
-        padding=int(model_hp.get("padding", 4)),
+        padding=padding_val,
         use_batchnorm=bool(model_hp.get("use_batchnorm", False)),
         # training (flat: LitVAE uses getattr(cfg, "lr"/"beta"/"weight_decay"))
         lr=float(train_hp.get("lr", 1e-3)),
@@ -294,6 +300,7 @@ def main() -> None:
             "n_target": (int(X_target.shape[0]) if X_target is not None else None),
         },
         "model": {
+            "model_type": cfg.model_type,
             "latent_dim": cfg.latent_dim,
             "hidden_channels": list(cfg.hidden_channels),
             "kernel_size": cfg.kernel_size,

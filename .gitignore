@@ -6,3 +6,4 @@ src/transformer/__pycache__/
 src/vae/__pycache__/
 debugging_scripts/
 config_files/generated_vae
+debug_output/

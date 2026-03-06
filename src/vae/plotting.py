@@ -345,14 +345,20 @@ def load_cfg_from_resolved_yaml(resolved_yaml: Path) -> VAEConfig:
     if any(h <= 0 for h in hidden_channels):
         raise ValueError(f"model.hidden_channels must be positive ints in {resolved_yaml}: got {hidden_channels}")
 
+    # Handle padding - can be None for fully_conv model
+    padding_val = model.get("padding", 4)
+    if padding_val is not None:
+        padding_val = _as_int(padding_val, default=4)
+
     return VAEConfig(
         input_len=input_len,
         latent_dim=_as_int(model.get("latent_dim"), default=32),
         hidden_channels=hidden_channels,
         kernel_size=_as_int(model.get("kernel_size"), default=9),
         stride=_as_int(model.get("stride"), default=2),
-        padding=_as_int(model.get("padding"), default=4),
+        padding=padding_val,
         use_batchnorm=_as_bool(model.get("use_batchnorm"), default=True),
+        model_type=str(model.get("model_type", "conv")),
 
         lr=_as_float(training.get("lr"), default=1e-3),
         beta=_as_float(training.get("beta"), default=1.0),

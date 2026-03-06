@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
-from src.vae.model import ConvVAE1D
+from src.vae.model import ConvVAE1D, FullyConvVAE1D
 from src.vae.loss import mse_masked
 from src.masking import make_mask_and_apply
 
@@ -43,15 +43,29 @@ class LitVAE(pl.LightningModule):
 
         self.cfg = cfg
 
-        self.model = ConvVAE1D(
-            input_len=cfg.input_len,
-            latent_dim=getattr(cfg, "latent_dim", 32),
-            hidden_channels=getattr(cfg, "hidden_channels", (32, 64, 128)),
-            kernel_size=getattr(cfg, "kernel_size", 9),
-            stride=getattr(cfg, "stride", 2),
-            padding=getattr(cfg, "padding", 4),
-            use_batchnorm=getattr(cfg, "use_batchnorm", False),
-        )
+        # Choose model type: "conv" (original) or "fully_conv" (no linear bottleneck)
+        model_type = getattr(cfg, "model_type", "conv")
+        
+        if model_type == "fully_conv":
+            self.model = FullyConvVAE1D(
+                input_len=cfg.input_len,
+                latent_dim=getattr(cfg, "latent_dim", 32),  # interpreted as latent_channels
+                hidden_channels=getattr(cfg, "hidden_channels", (32, 64, 128)),
+                kernel_size=getattr(cfg, "kernel_size", 33),
+                stride=getattr(cfg, "stride", 4),
+                padding=getattr(cfg, "padding", None),
+                use_batchnorm=getattr(cfg, "use_batchnorm", True),
+            )
+        else:
+            self.model = ConvVAE1D(
+                input_len=cfg.input_len,
+                latent_dim=getattr(cfg, "latent_dim", 32),
+                hidden_channels=getattr(cfg, "hidden_channels", (32, 64, 128)),
+                kernel_size=getattr(cfg, "kernel_size", 9),
+                stride=getattr(cfg, "stride", 2),
+                padding=getattr(cfg, "padding", 4),
+                use_batchnorm=getattr(cfg, "use_batchnorm", False),
+            )
 
         self.example_input_array = torch.zeros(2, getattr(cfg, "input_len", 128))
 
@@ -79,9 +93,15 @@ class LitVAE(pl.LightningModule):
         return F.mse_loss(recon, x, reduction="mean")
 
     def _kl_standard_normal(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """
+        KL divergence from standard normal.
+        Works with both 2D (B, Z) and 3D (B, C, L) tensors.
+        """
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         kl_per = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-        return kl_per.sum(dim=1).mean()
+        # Flatten all dims except batch and sum
+        kl_per_sample = kl_per.view(kl_per.shape[0], -1).sum(dim=1)
+        return kl_per_sample.mean()
 
     def _training_cfg(self) -> Any:
         return getattr(self.cfg, "training", None)

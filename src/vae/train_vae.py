@@ -254,20 +254,31 @@ def main() -> None:
     devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
     strategy = str(args.strategy if args.strategy is not None else train_hp.get("strategy", "auto"))
     precision = str(args.precision if args.precision is not None else train_hp.get("precision", "32-true"))
+    
+    # Gradient clipping (None means no clipping)
+    gradient_clip_val = train_hp.get("gradient_clip_val", None)
+    if gradient_clip_val is not None:
+        gradient_clip_val = float(gradient_clip_val)
 
     devices = _maybe_int(devices)
 
     # -------------------------
     # build cfg for LitVAE
     # -------------------------
+    # Handle padding - can be None for auto-calculation in FullyConvVAE1D
+    padding_val = model_hp.get("padding", 4)
+    if padding_val is not None:
+        padding_val = int(padding_val)
+    
     cfg = SimpleNamespace(
         # model
         input_len=input_len,
+        model_type=str(model_hp.get("model_type", "conv")),  # "conv" or "fully_conv"
         latent_dim=int(model_hp.get("latent_dim", 32)),
         hidden_channels=as_tuple_int(model_hp.get("hidden_channels", [32, 64, 128]), "hidden_channels"),
         kernel_size=int(model_hp.get("kernel_size", 9)),
         stride=int(model_hp.get("stride", 2)),
-        padding=int(model_hp.get("padding", 4)),
+        padding=padding_val,
         use_batchnorm=bool(model_hp.get("use_batchnorm", False)),
         # seed for deterministic masking
         seed=seed,
@@ -384,6 +395,7 @@ def main() -> None:
         devices=devices,
         strategy=strategy,
         precision=precision,
+        gradient_clip_val=gradient_clip_val,
         callbacks=[ckpt_cb, lr_cb],
         logger=logger,
         log_every_n_steps=log_every_n_steps,
