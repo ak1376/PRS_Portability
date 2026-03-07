@@ -527,6 +527,31 @@ def _accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return float("nan")
     return float(np.mean(y_true == y_pred))
 
+def balanced_accuracy_summary_lines(
+    split: str,
+    x_true: np.ndarray,
+    pred_cls: np.ndarray,
+    mask: np.ndarray,
+) -> list[str]:
+    x_true_cls = np.clip(np.rint(x_true), 0, 2).astype(np.int64)
+
+    lines = []
+    lines.append(
+        f"{split}: bal_acc_all={_balanced_accuracy_3class(x_true_cls, pred_cls):.4f}"
+    )
+
+    if mask.sum() > 0:
+        lines.append(
+            f"{split}: bal_acc_masked={_balanced_accuracy_3class(x_true_cls[mask], pred_cls[mask]):.4f}"
+        )
+
+    unmasked = ~mask
+    if unmasked.sum() > 0:
+        lines.append(
+            f"{split}: bal_acc_unmasked={_balanced_accuracy_3class(x_true_cls[unmasked], pred_cls[unmasked]):.4f}"
+        )
+
+    return lines
 
 def _balanced_accuracy_3class(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if y_true.size == 0:
@@ -748,8 +773,35 @@ def summarize_one_split(
             f"{_balanced_accuracy_3class(xt_m_cls, cb_m_cls):.6g}\tmasked_only"
         )
 
-    return lines
+    # unmasked only
+    unmasked = ~mask
+    if unmasked.sum() > 0:
+        xt_u_cont = x_true_cont[unmasked]
+        pr_u_cont = pred_dosage[unmasked]
+        db_u_cont = dosage_base[unmasked]
 
+        xt_u_cls = x_true_cls[unmasked]
+        pr_u_cls = pred_cls[unmasked]
+        cb_u_cls = class_base[unmasked]
+
+        lines.append(
+            f"{name}\tmse\t{_mse(pr_u_cont, xt_u_cont):.6g}\t{_mse(db_u_cont, xt_u_cont):.6g}\tunmasked_only"
+        )
+        lines.append(
+            f"{name}\tmae\t{_mae(pr_u_cont, xt_u_cont):.6g}\t{_mae(db_u_cont, xt_u_cont):.6g}\tunmasked_only"
+        )
+        lines.append(
+            f"{name}\tcorr\t{_corr(pr_u_cont, xt_u_cont):.6g}\t{_corr(db_u_cont, xt_u_cont):.6g}\tunmasked_only"
+        )
+        lines.append(
+            f"{name}\tacc\t{_accuracy(xt_u_cls, pr_u_cls):.6g}\t{_accuracy(xt_u_cls, cb_u_cls):.6g}\tunmasked_only"
+        )
+        lines.append(
+            f"{name}\tbalanced_acc\t{_balanced_accuracy_3class(xt_u_cls, pr_u_cls):.6g}\t"
+            f"{_balanced_accuracy_3class(xt_u_cls, cb_u_cls):.6g}\tunmasked_only"
+        )
+
+    return lines
 
 # =========================================================
 # main run()
@@ -776,6 +828,7 @@ def run(a: Args) -> None:
     # 3) reconstruction summaries from recon_dir
     summary_lines = ["# split\tmetric\tmodel\tmaf_baseline\twhere"]
     scatter_stats_lines = ["split\tcorr\tmse\tn_masked"]
+    bal_acc_lines = []
 
     if a.recon_dir is not None and a.recon_dir.exists():
         split_to_true = {
@@ -834,6 +887,15 @@ def run(a: Args) -> None:
                 )
             )
 
+            bal_acc_lines.extend(
+                balanced_accuracy_summary_lines(
+                    split=split,
+                    x_true=x_true,
+                    pred_cls=pred_cls,
+                    mask=mask,
+                )
+            )
+
             scatter_png = a.outdir / "plots" / f"recon_scatter_{split}.png"
             stats = save_recon_scatter(npz_path, scatter_png, seed=0)
             scatter_stats_lines.append(
@@ -860,6 +922,9 @@ def run(a: Args) -> None:
 
     (a.outdir / "recon_summary.txt").write_text("\n".join(summary_lines) + "\n")
     (a.outdir / "recon_scatter_stats.txt").write_text("\n".join(scatter_stats_lines) + "\n")
+    (a.outdir / "recon_summary.txt").write_text("\n".join(summary_lines) + "\n")
+    if bal_acc_lines:
+        (a.outdir / "balanced_accuracy_summary.txt").write_text("\n".join(bal_acc_lines) + "\n")
 
 
 def main() -> None:

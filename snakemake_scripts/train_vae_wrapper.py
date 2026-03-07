@@ -108,12 +108,6 @@ def dump_recon_artifacts(
         - x_masked
         - mask
         - recon
-
-    Note:
-      `recon` is intentionally kept in the older generic format because
-      src/vae/plotting.py now supports both:
-        - old format: recon
-        - newer format: pred/prob_0/prob_1/prob_2
     """
     if X.shape[0] == 0:
         return
@@ -191,6 +185,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
 
+    # Overfit debugging (CLI override of YAML)
+    ap.add_argument("--overfit-one-batch", action="store_true",
+                    help="Train on one repeated batch only")
+    ap.add_argument("--overfit-n", type=int, default=None,
+                    help="Number of examples to keep in overfit mode; defaults to batch_size")
+
     # Optional reconstruction artifacts
     ap.add_argument("--save-recon", action="store_true", help="Save reconstruction artifacts after training")
     ap.add_argument("--recon-n", type=int, default=64, help="Number of samples to include in recon artifacts")
@@ -254,7 +254,39 @@ def main() -> None:
     if gradient_clip_val is not None:
         gradient_clip_val = float(gradient_clip_val)
 
+    # YAML defaults
+    yaml_overfit_one_batch = bool(train_hp.get("overfit_one_batch", False))
+    yaml_overfit_n = train_hp.get("overfit_n", None)
+    if yaml_overfit_n is not None:
+        yaml_overfit_n = int(yaml_overfit_n)
+
+    # CLI overrides YAML if provided
+    overfit_one_batch = bool(args.overfit_one_batch or yaml_overfit_one_batch)
+    overfit_n = int(args.overfit_n) if args.overfit_n is not None else yaml_overfit_n
+
     devices = _maybe_int(devices)
+
+    # -------------------------
+    # Optional overfit-one-batch mode
+    # -------------------------
+    if overfit_one_batch:
+        n_overfit = int(overfit_n) if overfit_n is not None else batch_size
+        if n_overfit <= 0:
+            raise ValueError("overfit_n must be positive")
+        n_overfit = min(n_overfit, int(X_train.shape[0]))
+
+        X_train = X_train[:n_overfit].copy()
+        X_val = X_train.copy()
+        if X_target is not None:
+            X_target = X_train.copy()
+
+        batch_size = int(X_train.shape[0])
+
+        print(f"[OVERFIT MODE] Using one repeated batch of size {batch_size}")
+        print(f"[OVERFIT MODE] train shape:  {X_train.shape}")
+        print(f"[OVERFIT MODE] val shape:    {X_val.shape}")
+        if X_target is not None:
+            print(f"[OVERFIT MODE] target shape: {X_target.shape}")
 
     # -------------------------
     # Resolve masking knobs
@@ -300,7 +332,12 @@ def main() -> None:
     # -------------------------
     # Dataloaders
     # -------------------------
-    train_loader = make_loader(X_train, batch_size, shuffle=True, num_workers=num_workers)
+    train_loader = make_loader(
+        X_train,
+        batch_size,
+        shuffle=(not overfit_one_batch),
+        num_workers=num_workers,
+    )
     val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
 
     val_dataloaders = [val_loader]
@@ -357,6 +394,8 @@ def main() -> None:
             "devices": devices,
             "strategy": strategy,
             "gradient_clip_val": gradient_clip_val,
+            "overfit_one_batch": overfit_one_batch,
+            "overfit_n": overfit_n,
         },
         "masking": {
             "enabled": cfg.masking.enabled,

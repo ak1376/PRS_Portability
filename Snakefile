@@ -353,7 +353,7 @@ rule train_vae:
     params:
         outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
         accelerator="gpu",
-        devices="auto",
+        devices="1",
         precision="32-true",
         save_recon=True,
         recon_n=16,
@@ -415,8 +415,9 @@ rule vae_diagnostics:
         masked_mse=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/masked_mse_mean.png",
         clean_mse=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/clean_mse_mean.png",
         kl_logy=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/kl_mean_logy.png",
-        scatter_val=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/recon_scatter_val.png",
+        scatter_val=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/plots/scatter_val_masked_vs_clean.png",
         summary=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/recon_summary.txt",
+        bal_summary=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/balanced_accuracy_summary.txt",
         done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/diagnostics/.done",
     params:
         outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/diagnostics",
@@ -449,6 +450,7 @@ rule vae_diagnostics:
         test -f "{output.kl_logy}"
         test -f "{output.scatter_val}"
         test -f "{output.summary}"
+        test -f "{output.bal_summary}"
 
         touch "{output.done}"
         """

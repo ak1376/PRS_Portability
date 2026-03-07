@@ -314,7 +314,11 @@ class LitVAE(pl.LightningModule):
         alpha = float(mcfg["alpha_masked"])
         alpha = max(0.0, min(1.0, alpha))
 
-        recon_objective = alpha * ce_mask + (1.0 - alpha) * ce_unmask
+        if mask.any():
+            recon_objective = alpha * ce_mask + (1.0 - alpha) * ce_unmask
+        else:
+            recon_objective = ce_corrupt_all
+
         loss = recon_objective + beta * kl
         self._assert_finite("loss", loss)
 
