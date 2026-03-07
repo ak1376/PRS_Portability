@@ -1,64 +1,35 @@
 model:
-  model_type: "fully_conv"           # Use fully convolutional VAE (no linear bottleneck)
-  latent_dim: 256                    # More latent channels for better reconstruction
-  hidden_channels: [64, 128, 256]    # Wider network for more capacity
-  kernel_size: 33                    # Large receptive field
-  stride: 2                          # REDUCED stride: 2^3=8x compression instead of 64x
-  padding: null                      # Auto-calculate (kernel_size // 2)
-  use_batchnorm: true                # Batchnorm for stability
+  model_type: "fully_conv"
+  latent_dim: 32
+  hidden_channels: [32]
+  kernel_size: 9
+  stride: 2
+  padding: 4
+  use_batchnorm: false
 
 training:
-  batch_size: 64                     # Larger batch for stability
-  max_epochs: 100                    # More epochs
-  lr: 5e-4                           # Slightly lower LR for stability
-  beta: 0.0001                       # Very small β - prioritize reconstruction
-  weight_decay: 0.0                  # No weight decay
+  batch_size: 64
+  max_epochs: 100
+  lr: 5e-4
+  beta: 0.0
+  weight_decay: 0.0
   gradient_clip_val: 1.0
+  precision: "32-true"
+  log_every_n_steps: 10
+  num_workers: 0
 
 masking:
   enabled: false
-
-  # objective weighting - train on BOTH masked and unmasked positions
-  alpha_masked: 0.8                  # 80% weight on masked, 20% on unmasked
-
-  # geometry
+  alpha_masked: 1.0
   mode: "contiguous"
-  n_blocks: 8                        # Fewer, larger blocks
-  allow_overlap: false               # No overlap for cleaner signal
-
-  # length control (choose ONE)
-  mask_frac: 0.15                    # Slightly lower mask fraction
-  block_len: null                    # if set (int), overrides mask_frac and is PER-BLOCK length
-
-  # corruption / fill - MATCH DATA DISTRIBUTION
-  fill: "gaussian"                   # gaussian | zero | mean | constant
-  gaussian_std: 1.0                  # Match HWE-normalized std ≈ 1
-  constant_value: 0.0
+  n_blocks: 2
+  allow_overlap: false
+  mask_frac: null
+  block_len: 100
+  fill: "constant"
+  gaussian_std: 0.0
+  constant_value: -1.0
 
 seed: 0
-
 grid:
-  enabled: false                     # Run single config first to validate
-  name:
-    prefix: "vae"
-    sep: "__"
-  dims:
-    - path: "model.stride"
-      values: [2, 3]
-      tag: "s"
-
-    - path: "model.latent_dim"
-      values: [128, 256, 512]
-      tag: "z"
-
-    # - path: "masking.mask_frac"
-    #   values: [0.01, 0.10, 0.20, 0.30, 0.5, 0.8]
-    #   tag: "mf"
-
-    # - path: "masking.n_blocks"
-    #   values: [1, 2, 4, 8]
-    #   tag: "nb"
-
-    # - path: "masking.gaussian_std"
-    #   values: [0.05, 0.1, 0.2]
-    #   tag: "gs"
+  enabled: false

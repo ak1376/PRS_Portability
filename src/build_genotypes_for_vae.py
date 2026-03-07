@@ -191,38 +191,46 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
     np.save(outdir / "variant_site_ids.npy", kept_site_ids_subset)
     np.save(outdir / "ts_individual_ids.npy", kept_ind_ids.astype(np.int64))
 
-    # -------------------------------------------------------------------------
-    # ALWAYS normalize by HWE (af_residual), fit on discovery_train only
-    # -------------------------------------------------------------------------
-    norm_report: Dict[str, Any] = {
-        "normalize": True,
-        "norm_mode": "af_residual",
-        "fit_on": "discovery_train",
-        "eps": float(a.norm_eps),
-        "clip_std_min": float(a.norm_clip_std_min),
-        "num_snps_before_train_mono_filter": num_snps_before,
-        "num_snps_after_train_mono_filter": num_snps_after,
-        "num_snps_dropped_train_mono_filter": num_snps_before - num_snps_after,
-    }
-
     G_disc_train = G_subset[disc_train_idx]  # recompute after SNP filtering
-    mean, scale = _fit_hwe_normalizer(
-        G_disc_train,
-        eps=a.norm_eps,
-        clip_std_min=a.norm_clip_std_min,
-    )
-    np.save(outdir / "norm_mean.npy", mean.astype(np.float32))   # 2p
-    np.save(outdir / "norm_scale.npy", scale.astype(np.float32)) # sqrt(2p(1-p))
+    G_disc_val = G_subset[disc_val_idx]
+    G_target = G_subset[target_idx]
 
-    G_disc_train_n = _apply_hwe_normalizer(G_disc_train, mean, scale)
-    G_disc_val_n = _apply_hwe_normalizer(G_subset[disc_val_idx], mean, scale)
-    G_target_n = _apply_hwe_normalizer(G_subset[target_idx], mean, scale)
+    np.save(outdir / "discovery_train.npy", G_disc_train.astype(np.float32))
+    np.save(outdir / "discovery_val.npy", G_disc_val.astype(np.float32))
+    np.save(outdir / "target.npy", G_target.astype(np.float32))
 
-    np.save(outdir / "discovery_train.npy", G_disc_train_n.astype(np.float32))
-    np.save(outdir / "discovery_val.npy", G_disc_val_n.astype(np.float32))
-    np.save(outdir / "target.npy", G_target_n.astype(np.float32))
+    # # -------------------------------------------------------------------------
+    # # ALWAYS normalize by HWE (af_residual), fit on discovery_train only
+    # # -------------------------------------------------------------------------
+    # norm_report: Dict[str, Any] = {
+    #     "normalize": True,
+    #     "norm_mode": "af_residual",
+    #     "fit_on": "discovery_train",
+    #     "eps": float(a.norm_eps),
+    #     "clip_std_min": float(a.norm_clip_std_min),
+    #     "num_snps_before_train_mono_filter": num_snps_before,
+    #     "num_snps_after_train_mono_filter": num_snps_after,
+    #     "num_snps_dropped_train_mono_filter": num_snps_before - num_snps_after,
+    # }
 
-    (outdir / "normalization_report.json").write_text(json.dumps(norm_report, indent=2) + "\n")
+    # G_disc_train = G_subset[disc_train_idx]  # recompute after SNP filtering
+    # mean, scale = _fit_hwe_normalizer(
+    #     G_disc_train,
+    #     eps=a.norm_eps,
+    #     clip_std_min=a.norm_clip_std_min,
+    # )
+    # np.save(outdir / "norm_mean.npy", mean.astype(np.float32))   # 2p
+    # np.save(outdir / "norm_scale.npy", scale.astype(np.float32)) # sqrt(2p(1-p))
+
+    # G_disc_train_n = _apply_hwe_normalizer(G_disc_train, mean, scale)
+    # G_disc_val_n = _apply_hwe_normalizer(G_subset[disc_val_idx], mean, scale)
+    # G_target_n = _apply_hwe_normalizer(G_subset[target_idx], mean, scale)
+
+    # np.save(outdir / "discovery_train.npy", G_disc_train_n.astype(np.float32))
+    # np.save(outdir / "discovery_val.npy", G_disc_val_n.astype(np.float32))
+    # np.save(outdir / "target.npy", G_target_n.astype(np.float32))
+
+    # (outdir / "normalization_report.json").write_text(json.dumps(norm_report, indent=2) + "\n")
 
     summary = {
         "outdir": str(outdir),
@@ -238,7 +246,7 @@ def build_genotypes_for_vae(a: BuildGenotypesArgs) -> Dict[str, Any]:
         "n_discovery_val": int(disc_val_idx.size),
         "n_target": int(target_idx.size),
         "pop_counts": meta["population"].astype(str).value_counts().to_dict(),
-        "normalize": True,
+        "normalize": False,
         "norm_mode": "af_residual",
         "num_snps_before_train_mono_filter": num_snps_before,
         "num_snps_after_train_mono_filter": num_snps_after,
@@ -458,30 +466,30 @@ def _make_discovery_train_val_target_split(
 # Normalization (HWE / af_residual only)
 # =============================================================================
 
-def _fit_hwe_normalizer(
-    G_train: np.ndarray,
-    *,
-    eps: float,
-    clip_std_min: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    HWE standardization ("af_residual"):
+# def _fit_hwe_normalizer(
+#     G_train: np.ndarray,
+#     *,
+#     eps: float,
+#     clip_std_min: float,
+# ) -> Tuple[np.ndarray, np.ndarray]:
+#     """
+#     HWE standardization ("af_residual"):
 
-      p_j = mean(G_train[:,j]) / 2
-      mean_j = 2 p_j
-      scale_j = sqrt( 2 p_j (1 - p_j) + eps )
+#       p_j = mean(G_train[:,j]) / 2
+#       mean_j = 2 p_j
+#       scale_j = sqrt( 2 p_j (1 - p_j) + eps )
 
-    Returns (mean, scale) as float32.
-    """
-    p = (G_train.mean(axis=0, dtype=np.float64) / 2.0)
-    mean = 2.0 * p
-    scale = np.sqrt(2.0 * p * (1.0 - p) + eps)
-    scale = np.maximum(scale, clip_std_min)
-    return mean.astype(np.float32), scale.astype(np.float32)
+#     Returns (mean, scale) as float32.
+#     """
+#     p = (G_train.mean(axis=0, dtype=np.float64) / 2.0)
+#     mean = 2.0 * p
+#     scale = np.sqrt(2.0 * p * (1.0 - p) + eps)
+#     scale = np.maximum(scale, clip_std_min)
+#     return mean.astype(np.float32), scale.astype(np.float32)
 
 
-def _apply_hwe_normalizer(G: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    return (G - mean[None, :]) / scale[None, :]
+# def _apply_hwe_normalizer(G: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
+#     return (G - mean[None, :]) / scale[None, :]
 
 
 # =============================================================================

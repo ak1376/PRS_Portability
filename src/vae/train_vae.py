@@ -2,18 +2,19 @@
 """
 snakemake_scripts/train_vae.py
 
-Minimal Lightning trainer that matches what src/vae/lit_model.py expects:
-- cfg has:
-  - cfg.input_len, cfg.latent_dim, cfg.hidden_channels, cfg.kernel_size, cfg.stride, cfg.padding, cfg.use_batchnorm
-  - cfg.seed
-  - cfg.training.{lr,beta,weight_decay,batch_size,max_epochs,log_every_n_steps,num_workers,accelerator,devices,strategy,precision}
-  - cfg.masking.{enabled,alpha_masked,n_blocks,allow_overlap,mask_frac,block_len,fill,gaussian_std,constant_value}
+Minimal Lightning trainer for genotype-classification VAE.
+
+Expected model behavior:
+- input: masked genotype array (N, L), values in {0,1,2} plus mask token (e.g. -1) after masking
+- output: logits of shape (B, 3, L)
 
 It writes:
 - outdir/hparams.resolved.yaml
 - outdir/train_summary.json
 - outdir/checkpoints/best.ckpt
-- outdir/logs/version_*/metrics.csv and outdir/tb/version_*/events...
+- outdir/logs/version_*/metrics.csv
+- outdir/tb/version_*/events...
+- optionally recon/{split}_recon.npz with predicted genotype classes
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
-
+from src.vae.diagnostics_callback import ReconDiagnosticsCallback
 import yaml
 
 from src.vae.lit_model import LitVAE
@@ -74,34 +75,56 @@ def make_loader(X: np.ndarray, batch_size: int, *, shuffle: bool, num_workers: i
 
 
 def _maybe_int(x: Any) -> Any:
-    # allow YAML "1" -> 1, keep "auto" etc.
     if isinstance(x, str) and x.isdigit():
         return int(x)
     return x
 
+def compute_class_weights(X: np.ndarray) -> torch.Tensor:
+    vals = X.astype(np.int64).ravel()
+    counts = np.bincount(vals, minlength=3).astype(np.float32)
+    counts = np.clip(counts, 1.0, None)
+
+    total = counts.sum()
+    weights = total / (3.0 * counts)
+
+    print("Class counts:", counts.tolist())
+    print("Class freqs:", (counts / total).tolist())
+    print("Class weights:", weights.tolist())
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 # ----------------------------
-# Reconstruction saving helpers
+# Prediction-saving helpers
 # ----------------------------
-def _model_recon(lit: LitVAE, x: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def _model_predict_classes(
+    lit: LitVAE,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Run LitVAE's underlying model and return recon with shape (B, L).
+    Run LitVAE's underlying model and return:
+      - pred_classes: (B, L) integer predicted genotype classes
+      - probs:        (B, 3, L) probabilities
     """
     lit.eval()
-    with torch.no_grad():
-        out = lit.model(x)
-        # Handle different forward signatures: recon, (recon, mu, logvar), or dict
-        if isinstance(out, torch.Tensor):
-            recon = out
-        elif isinstance(out, (tuple, list)):
-            recon = out[0]
-        elif isinstance(out, dict):
-            recon = out.get("recon", out.get("x_recon"))
-        else:
-            raise RuntimeError(f"Unexpected model output type: {type(out)}")
-    if recon.ndim != 2:
-        recon = recon.view(recon.shape[0], -1)
-    return recon
+    out = lit.model(x)
+
+    if isinstance(out, torch.Tensor):
+        logits = out
+    elif isinstance(out, (tuple, list)):
+        logits = out[0]
+    elif isinstance(out, dict):
+        logits = out.get("logits", out.get("recon", out.get("x_recon")))
+    else:
+        raise RuntimeError(f"Unexpected model output type: {type(out)}")
+
+    if logits.ndim != 3 or logits.shape[1] != 3:
+        raise RuntimeError(f"Expected logits with shape (B,3,L), got {tuple(logits.shape)}")
+
+    probs = torch.softmax(logits, dim=1)
+    pred_classes = torch.argmax(logits, dim=1)  # (B, L)
+
+    return pred_classes, probs
 
 
 def dump_recon_artifacts(
@@ -115,15 +138,16 @@ def dump_recon_artifacts(
     mask_cfg: Dict[str, Any],
 ) -> None:
     """
-    Save reconstruction artifacts for analysis.
-    
+    Save prediction artifacts for analysis.
+
     Saves recon/{split}_recon.npz with:
-      - x_true: ground truth (n_samples, L)
-      - x_masked: masked input fed to VAE (n_samples, L)
-      - mask: boolean mask where True = masked position (n_samples, L)
-      - recon: VAE reconstruction (n_samples, L)
-    
-    This allows scatterplots of recon vs x_true at masked positions.
+      - x_true:      ground truth genotype classes (n_samples, L)
+      - x_masked:    masked input fed to model (n_samples, L)
+      - mask:        boolean mask where True = masked position (n_samples, L)
+      - pred:        predicted genotype classes (n_samples, L)
+      - prob_0:      predicted P(genotype=0), shape (n_samples, L)
+      - prob_1:      predicted P(genotype=1), shape (n_samples, L)
+      - prob_2:      predicted P(genotype=2), shape (n_samples, L)
     """
     out_recon_dir = outdir / "recon"
     out_recon_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +161,6 @@ def dump_recon_artifacts(
 
     x_true_t = torch.from_numpy(x_true).to(device=device, dtype=torch.float32)
 
-    # Apply masking using the same masking code as training
     split_offset = {"train": 11_111, "val": 22_222, "target": 33_333}.get(split_name, 0)
     dump_seed = int(seed) + int(split_offset)
 
@@ -154,22 +177,24 @@ def dump_recon_artifacts(
         constant_value=mask_cfg.get("constant_value", 0.0),
     )
 
-    # Get reconstruction from masked input
-    recon_t = _model_recon(lit, x_masked_t)
+    pred_t, probs_t = _model_predict_classes(lit, x_masked_t)
 
-    # Convert to numpy
     x_masked = x_masked_t.detach().cpu().numpy().astype(np.float32)
     mask = mask_t.detach().cpu().numpy().astype(np.bool_)
-    recon = recon_t.detach().cpu().numpy().astype(np.float32)
+    pred = pred_t.detach().cpu().numpy().astype(np.int64)
+    probs = probs_t.detach().cpu().numpy().astype(np.float32)  # (N,3,L)
 
     np.savez_compressed(
         out_recon_dir / f"{split_name}_recon.npz",
-        x_true=x_true,
+        x_true=x_true.astype(np.int64),
         x_masked=x_masked,
         mask=mask,
-        recon=recon,
+        pred=pred,
+        prob_0=probs[:, 0, :],
+        prob_1=probs[:, 1, :],
+        prob_2=probs[:, 2, :],
     )
-    print(f"Saved {split_name} reconstructions to {out_recon_dir / f'{split_name}_recon.npz'}")
+    print(f"Saved {split_name} predictions to {out_recon_dir / f'{split_name}_recon.npz'}")
 
 
 # ----------------------------
@@ -183,7 +208,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed")
     ap.add_argument("--outdir", type=Path, required=True)
 
-    # small optional overrides (keeps script snakemake-friendly)
     ap.add_argument("--no-progress-bar", action="store_true")
     ap.add_argument("--accelerator", type=str, default=None)
     ap.add_argument("--devices", type=str, default=None)
@@ -194,9 +218,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
 
-    # reconstruction saving
-    ap.add_argument("--save-recon", action="store_true", help="Save reconstruction artifacts after training")
-    ap.add_argument("--recon-n", type=int, default=100, help="Number of samples to save for reconstruction analysis")
+    ap.add_argument("--save-recon", action="store_true", help="Save prediction artifacts after training")
+    ap.add_argument("--recon-n", type=int, default=100, help="Number of samples to save for prediction analysis")
     ap.add_argument("--recon-splits", type=str, default="val,target", help="Comma-separated splits to save: train,val,target")
 
     return ap.parse_args()
@@ -228,6 +251,15 @@ def main() -> None:
     if not np.isfinite(X_train).all() or not np.isfinite(X_val).all():
         raise ValueError("Non-finite values found in train/val arrays.")
 
+    # classification sanity check
+    valid_vals = {0, 1, 2}
+    train_unique = set(np.unique(X_train).tolist())
+    val_unique = set(np.unique(X_val).tolist())
+    if not train_unique.issubset(valid_vals):
+        raise ValueError(f"Train array must contain only genotype classes 0/1/2. Found: {sorted(train_unique)}")
+    if not val_unique.issubset(valid_vals):
+        raise ValueError(f"Val array must contain only genotype classes 0/1/2. Found: {sorted(val_unique)}")
+
     input_len = int(X_train.shape[1])
 
     X_target: Optional[np.ndarray] = None
@@ -239,9 +271,12 @@ def main() -> None:
             raise ValueError(f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}")
         if not np.isfinite(X_target).all():
             raise ValueError("Non-finite values found in target array.")
+        target_unique = set(np.unique(X_target).tolist())
+        if not target_unique.issubset(valid_vals):
+            raise ValueError(f"Target array must contain only genotype classes 0/1/2. Found: {sorted(target_unique)}")
 
     # -------------------------
-    # resolve training knobs (with CLI overrides)
+    # resolve training knobs
     # -------------------------
     batch_size = int(args.batch_size if args.batch_size is not None else train_hp.get("batch_size", 256))
     max_epochs = int(args.max_epochs if args.max_epochs is not None else train_hp.get("max_epochs", 50))
@@ -254,8 +289,7 @@ def main() -> None:
     devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
     strategy = str(args.strategy if args.strategy is not None else train_hp.get("strategy", "auto"))
     precision = str(args.precision if args.precision is not None else train_hp.get("precision", "32-true"))
-    
-    # Gradient clipping (None means no clipping)
+
     gradient_clip_val = train_hp.get("gradient_clip_val", None)
     if gradient_clip_val is not None:
         gradient_clip_val = float(gradient_clip_val)
@@ -265,30 +299,25 @@ def main() -> None:
     # -------------------------
     # build cfg for LitVAE
     # -------------------------
-    # Handle padding - can be None for auto-calculation in FullyConvVAE1D
     padding_val = model_hp.get("padding", 4)
     if padding_val is not None:
         padding_val = int(padding_val)
-    
+
     cfg = SimpleNamespace(
-        # model
         input_len=input_len,
-        model_type=str(model_hp.get("model_type", "conv")),  # "conv" or "fully_conv"
+        model_type=str(model_hp.get("model_type", "conv")),
         latent_dim=int(model_hp.get("latent_dim", 32)),
         hidden_channels=as_tuple_int(model_hp.get("hidden_channels", [32, 64, 128]), "hidden_channels"),
         kernel_size=int(model_hp.get("kernel_size", 9)),
         stride=int(model_hp.get("stride", 2)),
         padding=padding_val,
         use_batchnorm=bool(model_hp.get("use_batchnorm", False)),
-        # seed for deterministic masking
         seed=seed,
-        # training (LitVAE will read cfg.training.*)
         training=SimpleNamespace(
             lr=float(train_hp.get("lr", 1e-3)),
             beta=float(train_hp.get("beta", 0.01)),
             weight_decay=float(train_hp.get("weight_decay", 0.0)),
         ),
-        # masking (LitVAE will read cfg.masking.*)
         masking=SimpleNamespace(
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
@@ -313,7 +342,7 @@ def main() -> None:
         val_dataloaders.append(target_loader)
 
     # -------------------------
-    # write resolved config (for plotting/debugging)
+    # write resolved config
     # -------------------------
     resolved = {
         "seed": seed,
@@ -366,6 +395,10 @@ def main() -> None:
     # -------------------------
     lit = LitVAE(cfg)
 
+    class_weights = compute_class_weights(X_train)
+    lit.set_class_weights(class_weights)
+    print("Using class weights:", class_weights.tolist())
+
     # -------------------------
     # callbacks + loggers
     # -------------------------
@@ -374,7 +407,7 @@ def main() -> None:
 
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        monitor="val/loss",  # IMPORTANT: matches the rewritten lit_model.py
+        monitor="val/loss",
         mode="min",
         save_top_k=1,
         filename="vae-{epoch:03d}",
@@ -396,7 +429,7 @@ def main() -> None:
         strategy=strategy,
         precision=precision,
         gradient_clip_val=gradient_clip_val,
-        callbacks=[ckpt_cb, lr_cb],
+        callbacks=[ckpt_cb, lr_cb, diag_cb],
         logger=logger,
         log_every_n_steps=log_every_n_steps,
         default_root_dir=str(outdir),
@@ -422,7 +455,6 @@ def main() -> None:
     best_out = ckpt_dir / "best.ckpt"
     shutil.copy2(best, best_out)
 
-    # sanity output (snakemake-friendly)
     logs_root = outdir / "logs"
     metrics = list(logs_root.glob("version_*/metrics.csv"))
     if not metrics:
@@ -433,21 +465,21 @@ def main() -> None:
     print("TensorBoard logdir:", outdir / "tb")
 
     # -------------------------
-    # Save reconstruction artifacts (optional)
+    # Save prediction artifacts (optional)
     # -------------------------
     if args.save_recon:
-        # Load best model for reconstruction
-        lit_best = LitVAE.load_from_checkpoint(str(best_out), cfg=cfg)
+        lit_best = LitVAE(cfg)
+        lit_best.set_class_weights(class_weights)
+        obj = torch.load(best_out, map_location="cpu")
+        state = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
+        lit_best.load_state_dict(state, strict=True)
         lit_best.eval()
-        
-        # Move to appropriate device
+
         if torch.cuda.is_available() and accelerator != "cpu":
             lit_best = lit_best.to("cuda")
-        
-        # Parse which splits to save
+
         splits_to_save = [s.strip().lower() for s in args.recon_splits.split(",") if s.strip()]
-        
-        # Prepare mask config dict for dump_recon_artifacts
+
         mask_cfg_dict = {
             "enabled": bool(mask_hp.get("enabled", False)),
             "n_blocks": int(mask_hp.get("n_blocks", 1)),
@@ -458,7 +490,14 @@ def main() -> None:
             "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
             "constant_value": float(mask_hp.get("constant_value", 0.0)),
         }
-        
+
+        diag_cb = ReconDiagnosticsCallback(
+            X_val_diag=X_val[:64],
+            outdir=outdir / "diagnostics_live",
+            mask_cfg=mask_cfg_dict,
+            seed=seed + 999999,
+        )
+
         for split in splits_to_save:
             if split == "train":
                 X = X_train
@@ -466,13 +505,13 @@ def main() -> None:
                 X = X_val
             elif split == "target":
                 if X_target is None:
-                    print(f"Skipping target split (no target data provided)")
+                    print("Skipping target split (no target data provided)")
                     continue
                 X = X_target
             else:
                 print(f"Unknown split '{split}', skipping")
                 continue
-            
+
             dump_recon_artifacts(
                 outdir=outdir,
                 lit=lit_best,

@@ -2,38 +2,44 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from src.vae.model import ConvVAE1D, FullyConvVAE1D
-from src.vae.loss import mse_masked
+from src.vae.loss import cross_entropy_masked
 from src.masking import make_mask_and_apply
 
 
 class LitVAE(pl.LightningModule):
     """
-    Two-pass metrics:
-      (1) clean pass: recon_clean = model(x); mse_clean_all = MSE(recon_clean, x) over all positions
-      (2) masked/corrupted pass (optional): x_in, mask = corrupt(x); recon = model(x_in)
-          - mse_masked   = MSE on masked positions only
-          - mse_unmasked = MSE on unmasked positions only
-          - recon_objective = alpha*mse_masked + (1-alpha)*mse_unmasked
-          - total_loss = recon_objective + beta*KL
+    Classification version of LitVAE.
 
-    Logging (Option A):
+    Expected model behavior:
+      - input: x_in with shape (B, L) or (B, 1, L)
+      - output: logits with shape (B, 3, L)
+      - targets: integer genotype classes in {0,1,2}
+
+    Two-pass metrics:
+      (1) clean pass: logits_clean = model(x)
+          - ce_clean_all = cross-entropy over all positions
+      (2) masked/corrupted pass: x_in, mask = corrupt(x); logits = model(x_in)
+          - ce_masked   = CE on masked positions only
+          - ce_unmasked = CE on unmasked positions only
+          - recon_objective = alpha * ce_masked + (1-alpha) * ce_unmasked
+          - total_loss = recon_objective + beta * KL
+
+    Logging:
       - train_step/* logged per step
-      - train/* logged once per epoch (manual mean)
-      - val/* and target/* logged once per epoch (manual mean)
-      - add_dataloader_idx=False everywhere; val vs target distinguished by prefix
+      - train/* logged once per epoch
+      - val/* and target/* logged once per epoch
     """
 
     def __init__(self, cfg: Any):
         super().__init__()
 
-        # Save hyperparams
         if is_dataclass(cfg):
             self.save_hyperparameters(asdict(cfg))
         elif isinstance(cfg, dict):
@@ -43,13 +49,12 @@ class LitVAE(pl.LightningModule):
 
         self.cfg = cfg
 
-        # Choose model type: "conv" (original) or "fully_conv" (no linear bottleneck)
         model_type = getattr(cfg, "model_type", "conv")
-        
+
         if model_type == "fully_conv":
             self.model = FullyConvVAE1D(
                 input_len=cfg.input_len,
-                latent_dim=getattr(cfg, "latent_dim", 32),  # interpreted as latent_channels
+                latent_dim=getattr(cfg, "latent_dim", 32),
                 hidden_channels=getattr(cfg, "hidden_channels", (32, 64, 128)),
                 kernel_size=getattr(cfg, "kernel_size", 33),
                 stride=getattr(cfg, "stride", 4),
@@ -69,10 +74,13 @@ class LitVAE(pl.LightningModule):
 
         self.example_input_array = torch.zeros(2, getattr(cfg, "input_len", 128))
 
-        # Option A buffers
         self._train_buf: Dict[str, List[torch.Tensor]] = {}
         self._val_buf: Dict[str, List[torch.Tensor]] = {}
         self._target_buf: Dict[str, List[torch.Tensor]] = {}
+
+        # Optional class weights for genotype classes {0,1,2}.
+        # Set externally from the training/debug script via model.set_class_weights(...).
+        self.class_weights: Optional[torch.Tensor] = None
 
     # -------------------------
     # helpers
@@ -88,18 +96,63 @@ class LitVAE(pl.LightningModule):
         if not torch.isfinite(t).all():
             raise RuntimeError(f"[NaN/Inf] {name} became non-finite")
 
+    def _assert_valid_targets(self, target: torch.Tensor) -> None:
+        bad = ~((target == 0) | (target == 1) | (target == 2))
+        if bad.any():
+            vals = torch.unique(target[bad]).detach().cpu().tolist()
+            raise RuntimeError(f"Targets must be in {{0,1,2}}. Found invalid values: {vals[:10]}")
+
+    def set_class_weights(self, class_weights: torch.Tensor | None) -> None:
+        """
+        Store global class weights for genotype classes {0,1,2}.
+        Expected shape: (3,)
+        """
+        if class_weights is None:
+            self.class_weights = None
+            return
+
+        if class_weights.numel() != 3:
+            raise ValueError(f"class_weights must have shape (3,), got {tuple(class_weights.shape)}")
+
+        self.class_weights = class_weights.detach().float()
+
+    def _get_class_weights(self) -> torch.Tensor | None:
+        if self.class_weights is None:
+            return None
+        return self.class_weights.to(self.device)
+
     @staticmethod
-    def _mse_all(x: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-        return F.mse_loss(recon, x, reduction="mean")
+    def _ce_all(
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        class_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        logits: (B, 3, L)
+        target: (B, L)
+        """
+        if class_weights is not None:
+            class_weights = class_weights.to(device=logits.device, dtype=logits.dtype)
+        return F.cross_entropy(logits, target, weight=class_weights, reduction="mean")
+
+    @staticmethod
+    def _masked_accuracy(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B, 3, L)
+        target: (B, L)
+        mask:   (B, L) bool
+        """
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+        if not mask.any():
+            return torch.tensor(0.0, device=logits.device)
+
+        pred = logits.argmax(dim=1)  # (B, L)
+        return (pred[mask] == target[mask]).float().mean()
 
     def _kl_standard_normal(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        KL divergence from standard normal.
-        Works with both 2D (B, Z) and 3D (B, C, L) tensors.
-        """
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         kl_per = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
-        # Flatten all dims except batch and sum
         kl_per_sample = kl_per.view(kl_per.shape[0], -1).sum(dim=1)
         return kl_per_sample.mean()
 
@@ -119,9 +172,6 @@ class LitVAE(pl.LightningModule):
         return float(getattr(t, "weight_decay", getattr(self.cfg, "weight_decay", 0.0)))
 
     def _mask_cfg(self) -> Dict[str, Any]:
-        """
-        Reads nested cfg.masking.* if present, else falls back to legacy flat keys.
-        """
         m = getattr(self.cfg, "masking", None)
         if m is not None:
             return {
@@ -136,7 +186,6 @@ class LitVAE(pl.LightningModule):
                 "constant_value": float(getattr(m, "constant_value", 0.0)),
             }
 
-        # legacy fallback
         return {
             "enabled": bool(getattr(self.cfg, "mask_enabled", False)),
             "alpha_masked": float(getattr(self.cfg, "alpha_masked", 1.0)),
@@ -154,15 +203,13 @@ class LitVAE(pl.LightningModule):
         stage_salt = 0 if stage == "train" else (1 if stage == "val" else 2)
 
         if stage in {"val", "target"}:
-            # fixed masks across epochs -> stable validation curves
             return base + 1_000_000 * stage_salt + int(batch_idx)
 
-        # training keeps changing each epoch
         return base + 1_000_000 * stage_salt + 10_000 * int(self.current_epoch) + int(batch_idx)
 
     def _forward(self, x_in: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        recon, mu, logvar = self.model(x_in)
-        return recon, mu, logvar
+        logits, mu, logvar = self.model(x_in)
+        return logits, mu, logvar
 
     @staticmethod
     def _buf_append(buf: Dict[str, List[torch.Tensor]], out: Dict[str, torch.Tensor], keys: List[str]) -> None:
@@ -190,20 +237,24 @@ class LitVAE(pl.LightningModule):
     # core step
     # -------------------------
     def _shared_step(self, batch: Any, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
-        x = self._unpack_batch(batch).to(self.device)
+        x = self._unpack_batch(batch).to(self.device)   # raw 0/1/2 genotypes as float
         x = self._to_2d(x)
         self._assert_finite("x", x)
+
+        target = x.long()
+        self._assert_valid_targets(target)
 
         B, L = x.shape
         beta = self._get_beta()
         eps = 1e-12
+        class_weights = self._get_class_weights()
 
         # (1) clean pass
-        recon_clean, mu_clean, logvar_clean = self._forward(x)
-        recon_clean = self._to_2d(recon_clean)
-        self._assert_finite("recon_clean", recon_clean)
+        logits_clean, mu_clean, logvar_clean = self._forward(x)
+        self._assert_finite("logits_clean", logits_clean)
 
-        mse_clean_all = self._mse_all(x, recon_clean)
+        ce_clean_all = self._ce_all(logits_clean, target, class_weights=class_weights)
+        acc_clean_all = (logits_clean.argmax(dim=1) == target).float().mean()
         kl_clean = self._kl_standard_normal(mu_clean, logvar_clean)
 
         # (2) masked/corrupted pass
@@ -230,43 +281,60 @@ class LitVAE(pl.LightningModule):
 
         self._assert_finite("x_in", x_in)
 
-        recon, mu, logvar = self._forward(x_in)
-        recon = self._to_2d(recon)
-        self._assert_finite("recon", recon)
+        logits, mu, logvar = self._forward(x_in)
+        self._assert_finite("logits", logits)
 
         kl = self._kl_standard_normal(mu, logvar)
 
-        mse_corrupt_all = self._mse_all(x, recon)
+        ce_corrupt_all = self._ce_all(logits, target, class_weights=class_weights)
+        acc_corrupt_all = (logits.argmax(dim=1) == target).float().mean()
 
         if mask.any():
-            mse_mask = mse_masked(x, recon, mask)
-            mse_unmask = mse_masked(x, recon, ~mask)
+            ce_mask = cross_entropy_masked(
+                logits,
+                target,
+                mask,
+                class_weights=class_weights,
+            )
+            ce_unmask = cross_entropy_masked(
+                logits,
+                target,
+                ~mask,
+                class_weights=class_weights,
+            )
+
+            acc_mask = self._masked_accuracy(logits, target, mask)
+            acc_unmask = self._masked_accuracy(logits, target, ~mask)
         else:
-            mse_mask = torch.tensor(0.0, device=self.device)
-            mse_unmask = mse_corrupt_all
+            ce_mask = torch.tensor(0.0, device=self.device)
+            ce_unmask = ce_corrupt_all
+            acc_mask = torch.tensor(0.0, device=self.device)
+            acc_unmask = acc_corrupt_all
 
         alpha = float(mcfg["alpha_masked"])
-        # make alpha safe
         alpha = max(0.0, min(1.0, alpha))
 
-        recon_objective = alpha * mse_mask + (1.0 - alpha) * mse_unmask
+        recon_objective = alpha * ce_mask + (1.0 - alpha) * ce_unmask
         loss = recon_objective + beta * kl
         self._assert_finite("loss", loss)
 
-        # debug
         mask_frac = mask.float().mean()
         delta_in_l1 = (x_in - x).abs().mean()
 
-        ratio_masked_over_clean = (mse_mask / (mse_clean_all + eps)) if mask.any() else torch.tensor(0.0, device=self.device)
+        ratio_masked_over_clean = (ce_mask / (ce_clean_all + eps)) if mask.any() else torch.tensor(0.0, device=self.device)
 
         return {
             "loss": loss,
             "kl": kl,
             "recon_objective": recon_objective,
-            "mse_corrupt_all": mse_corrupt_all,
-            "mse_masked": mse_mask,
-            "mse_unmasked": mse_unmask,
-            "mse_clean_all": mse_clean_all,
+            "ce_corrupt_all": ce_corrupt_all,
+            "ce_masked": ce_mask,
+            "ce_unmasked": ce_unmask,
+            "ce_clean_all": ce_clean_all,
+            "acc_corrupt_all": acc_corrupt_all,
+            "acc_masked": acc_mask,
+            "acc_unmasked": acc_unmask,
+            "acc_clean_all": acc_clean_all,
             "kl_clean": kl_clean,
             "ratio_masked_over_clean": ratio_masked_over_clean,
             "mask_frac": mask_frac,
@@ -289,11 +357,11 @@ class LitVAE(pl.LightningModule):
     def training_step(self, batch: Any, batch_idx: int):
         out = self._shared_step(batch, batch_idx=batch_idx, stage="train")
 
-        # train_step/* logs every step (no epoch)
         step_keys = [
             "loss", "kl", "recon_objective",
-            "mse_corrupt_all", "mse_masked", "mse_unmasked",
-            "mse_clean_all", "ratio_masked_over_clean",
+            "ce_corrupt_all", "ce_masked", "ce_unmasked", "ce_clean_all",
+            "acc_corrupt_all", "acc_masked", "acc_unmasked", "acc_clean_all",
+            "ratio_masked_over_clean",
         ]
         for k in step_keys:
             self.log(
@@ -306,7 +374,6 @@ class LitVAE(pl.LightningModule):
                 add_dataloader_idx=False,
             )
 
-        # debug step logs
         for k in ["mask_frac", "delta_in_l1", "used_block_len", "x_max", "x_in_max"]:
             self.log(
                 f"debug/{k}",
@@ -317,7 +384,6 @@ class LitVAE(pl.LightningModule):
                 add_dataloader_idx=False,
             )
 
-        # accumulate for epoch means
         self._buf_append(
             self._train_buf,
             out,
@@ -331,14 +397,15 @@ class LitVAE(pl.LightningModule):
 
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         prefix = "val" if dataloader_idx == 0 else "target"
-        stage = prefix  # seed salt
+        stage = prefix
 
         out = self._shared_step(batch, batch_idx=batch_idx, stage=stage)
 
         keys = [
             "loss", "kl", "recon_objective",
-            "mse_corrupt_all", "mse_masked", "mse_unmasked",
-            "mse_clean_all", "ratio_masked_over_clean",
+            "ce_corrupt_all", "ce_masked", "ce_unmasked", "ce_clean_all",
+            "acc_corrupt_all", "acc_masked", "acc_unmasked", "acc_clean_all",
+            "ratio_masked_over_clean",
             "mask_frac", "delta_in_l1",
         ]
         buf = self._val_buf if prefix == "val" else self._target_buf

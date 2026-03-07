@@ -13,39 +13,29 @@ import torch
 
 @dataclass(frozen=True)
 class MaskingConfig:
-    """
-    Masking configuration for contiguous block masking.
-
-    Key ideas:
-      - You can specify either `mask_frac` (total fraction of SNPs to mask) OR `block_len`.
-      - You can mask multiple blocks per sample via `n_blocks`.
-      - If `mask_frac` is used, we compute a per-block length so that the *expected*
-        total masked SNPs per sample is ~mask_frac * L (overlap may reduce realized fraction).
-      - Blocks start anywhere in [0, L-1] and are truncated at the end if needed.
-      - Fill supports gaussian noise (recommended for HWE-normalized inputs).
-    """
     enabled: bool = False
 
     # geometry
-    mode: str = "contiguous"      # currently only "contiguous" is implemented
+    mode: str = "contiguous"
     n_blocks: int = 1
     allow_overlap: bool = True
 
-    # length control (choose one)
-    mask_frac: Optional[float] = None  # total fraction of SNPs to mask per sample (recommended)
-    block_len: Optional[int] = None    # per-block length; overrides mask_frac if not None
+    # length control
+    mask_frac: Optional[float] = None
+    block_len: Optional[int] = None
 
     # fill / corruption
-    fill: str = "gaussian"        # gaussian | zero | mean | constant
-    gaussian_std: float = 0.1     # used when fill=="gaussian"
-    constant_value: float = 0.0   # used when fill=="constant"
+    fill: str = "gaussian"        # gaussian | zero | mean | constant | mask_token
+    gaussian_std: float = 0.1
+    constant_value: float = 0.0
+    mask_token_value: float = -1.0
 
-    # objective weights (used by your model, not by this module directly)
+    # objective weights
     weight_masked: float = 1.0
     weight_unmasked: float = 0.0
 
     # numerics / misc
-    seed: Optional[int] = None    # if provided, can be combined with epoch/batch seeds upstream
+    seed: Optional[int] = None
 
 
 # =============================================================================
@@ -183,6 +173,7 @@ def apply_mask(
     fill: str = "gaussian",
     gaussian_std: float = 0.1,
     constant_value: float = 0.0,
+    mask_token_value: float = -1.0,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
     """
@@ -190,11 +181,12 @@ def apply_mask(
 
     Supports x shaped (B, L) or (B, 1, L). Mask must be (B, L).
 
-    Fill strategies (recommended for HWE-normalized data: gaussian):
+    Fill strategies:
       - "gaussian": N(0, gaussian_std^2) on masked positions
       - "zero": 0 on masked positions
       - "mean": per-SNP batch mean (detached) on masked positions
       - "constant": constant_value on masked positions
+      - "mask_token": mask_token_value on masked positions
 
     Returns:
         x_masked: same shape as x
@@ -227,6 +219,9 @@ def apply_mask(
     elif fill in {"constant", "const"}:
         fv = torch.full_like(x2, float(constant_value))
 
+    elif fill in {"mask_token", "token", "sentinel"}:
+        fv = torch.full_like(x2, float(mask_token_value))
+
     elif fill in {"gaussian", "noise", "normal"}:
         sigma = float(gaussian_std)
         if sigma < 0:
@@ -243,7 +238,7 @@ def apply_mask(
             fv = torch.randn(x2.shape, device=x2.device, dtype=x2.dtype) * sigma
 
     else:
-        raise ValueError(f"Unknown fill={fill!r}. Use gaussian|zero|mean|constant.")
+        raise ValueError(f"Unknown fill={fill!r}. Use gaussian|zero|mean|constant|mask_token.")
 
     xm[mask] = fv[mask]
     return xm.unsqueeze(1) if squeeze_back else xm
@@ -261,6 +256,7 @@ def make_mask_and_apply(
     fill: str,
     gaussian_std: float,
     constant_value: float,
+    mask_token_value: float = -1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
     Convenience helper for your Lightning model.
@@ -304,6 +300,7 @@ def make_mask_and_apply(
         fill=fill,
         gaussian_std=float(gaussian_std),
         constant_value=float(constant_value),
+        mask_token_value=float(mask_token_value),
         seed=seed,
     )
 

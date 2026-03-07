@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /sietch_colab/akapoor/PRS_Portability/src/vae/training.py
+# /sietch_colab/akapoor/PRS_Portability/src/vae/train_vae_wrapper.py
 from __future__ import annotations
 
 import argparse
@@ -19,13 +19,14 @@ from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 import yaml
 
-from src.vae.lit_model import LitVAE
 from src.masking import make_mask_and_apply
+from src.vae.lit_model import LitVAE
 
 
-# ----------------------------
+# =========================================================
 # IO helpers
-# ----------------------------
+# =========================================================
+
 def read_yaml(path: Path) -> Dict[str, Any]:
     return yaml.safe_load(path.read_text()) or {}
 
@@ -50,13 +51,16 @@ def _maybe_int(x: Any) -> Any:
 
 
 def _none_if_null(x: Any) -> Any:
-    # YAML null -> None (safe), but also treat ""/"None" as None
     if x is None:
         return None
     if isinstance(x, str) and x.strip().lower() in {"none", "null", ""}:
         return None
     return x
 
+
+# =========================================================
+# Data helpers
+# =========================================================
 
 def make_loader(X: np.ndarray, batch_size: int, *, shuffle: bool, num_workers: int) -> DataLoader:
     Xt = torch.from_numpy(X).float()
@@ -72,6 +76,20 @@ def make_loader(X: np.ndarray, batch_size: int, *, shuffle: bool, num_workers: i
     )
 
 
+def _load_2d_array(path: Path, name: str) -> np.ndarray:
+    arr = np.load(path)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array for {name}. Got shape {arr.shape}")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"Non-finite values found in {name}")
+    return arr
+
+
+# =========================================================
+# Reconstruction artifact dumping
+# =========================================================
+
+@torch.no_grad()
 def dump_recon_artifacts(
     lit: LitVAE,
     X: np.ndarray,
@@ -82,51 +100,78 @@ def dump_recon_artifacts(
     seed: int,
 ) -> None:
     """
-    Save x_true, x_masked, mask, recon for `n` samples.
-    Uses masking settings from mask_cfg (taken from LitVAE._mask_cfg()).
-    Saves to outdir/recon/{split}_recon.npz
-    """
-    device = next(lit.parameters()).device
-    lit.eval()
+    Save x_true, x_masked, mask, recon for up to `n` samples.
 
-    # limit samples
-    X_sub = X[:n]
+    Output format:
+      outdir/recon/{split}_recon.npz with keys:
+        - x_true
+        - x_masked
+        - mask
+        - recon
+
+    Note:
+      `recon` is intentionally kept in the older generic format because
+      src/vae/plotting.py now supports both:
+        - old format: recon
+        - newer format: pred/prob_0/prob_1/prob_2
+    """
+    if X.shape[0] == 0:
+        return
+
+    lit.eval()
+    device = next(lit.parameters()).device
+
+    n_use = min(int(n), int(X.shape[0]))
+    X_sub = X[:n_use]
+
     x_true = torch.from_numpy(X_sub).float().to(device)
 
-    # apply masking with same settings as training
     x_in, mask, _ = make_mask_and_apply(
         x_true,
-        enabled=mask_cfg["enabled"],
-        n_blocks=mask_cfg["n_blocks"],
+        enabled=bool(mask_cfg["enabled"]),
+        n_blocks=int(mask_cfg["n_blocks"]),
         block_len=mask_cfg["block_len"],
         mask_frac=mask_cfg["mask_frac"],
-        allow_overlap=mask_cfg["allow_overlap"],
-        seed=seed,
-        fill=mask_cfg["fill"],
-        gaussian_std=mask_cfg["gaussian_std"],
-        constant_value=mask_cfg["constant_value"],
+        allow_overlap=bool(mask_cfg["allow_overlap"]),
+        seed=int(seed),
+        fill=str(mask_cfg["fill"]),
+        gaussian_std=float(mask_cfg["gaussian_std"]),
+        constant_value=float(mask_cfg["constant_value"]),
     )
 
-    with torch.no_grad():
-        recon, _, _ = lit(x_in)  # forward returns (recon, mu, logvar)
+    out = lit(x_in)
+    if isinstance(out, torch.Tensor):
+        recon = out
+    elif isinstance(out, (tuple, list)):
+        recon = out[0]
+    elif isinstance(out, dict):
+        if "recon" in out:
+            recon = out["recon"]
+        elif "logits" in out:
+            recon = out["logits"]
+        else:
+            raise RuntimeError(f"Unexpected dict output keys from model: {list(out.keys())}")
+    else:
+        raise RuntimeError(f"Unexpected output type from LitVAE forward: {type(out)}")
 
-    # Save to recon/ subdirectory
     recon_dir = outdir / "recon"
     recon_dir.mkdir(parents=True, exist_ok=True)
+
     out_path = recon_dir / f"{split}_recon.npz"
     np.savez_compressed(
         out_path,
-        x_true=x_true.cpu().numpy(),
-        x_masked=x_in.cpu().numpy(),
-        mask=mask.cpu().numpy(),
-        recon=recon.cpu().numpy(),
+        x_true=x_true.detach().cpu().numpy(),
+        x_masked=x_in.detach().cpu().numpy(),
+        mask=mask.detach().cpu().numpy(),
+        recon=recon.detach().cpu().numpy(),
     )
     print(f"Saved reconstruction artifacts to {out_path}")
 
 
-# ----------------------------
+# =========================================================
 # CLI
-# ----------------------------
+# =========================================================
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Lightweight VAE training wrapper (Snakemake-friendly).")
     ap.add_argument("--train", type=Path, required=True, help=".npy (N,L) train array")
@@ -135,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed sections")
     ap.add_argument("--outdir", type=Path, required=True)
 
-    # optional overrides (nice for quick debugging)
+    # Optional overrides
     ap.add_argument("--no-progress-bar", action="store_true")
     ap.add_argument("--accelerator", type=str, default=None)
     ap.add_argument("--devices", type=str, default=None)
@@ -146,12 +191,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
 
-    # reconstruction artifacts
+    # Optional reconstruction artifacts
     ap.add_argument("--save-recon", action="store_true", help="Save reconstruction artifacts after training")
     ap.add_argument("--recon-n", type=int, default=64, help="Number of samples to include in recon artifacts")
     ap.add_argument("--recon-splits", type=str, default="val", help="Comma-separated list: train,val,target")
+
     return ap.parse_args()
 
+
+# =========================================================
+# Main
+# =========================================================
 
 def main() -> None:
     args = parse_args()
@@ -167,32 +217,26 @@ def main() -> None:
     pl.seed_everything(seed, workers=True)
 
     # -------------------------
-    # load arrays
+    # Load arrays
     # -------------------------
-    X_train = np.load(args.train)
-    X_val = np.load(args.val)
+    X_train = _load_2d_array(args.train, "train")
+    X_val = _load_2d_array(args.val, "val")
 
-    if X_train.ndim != 2 or X_val.ndim != 2:
-        raise ValueError(f"Expected 2D arrays. Got train {X_train.shape}, val {X_val.shape}")
     if X_train.shape[1] != X_val.shape[1]:
         raise ValueError(f"Train/val must have same #features. Got {X_train.shape[1]} vs {X_val.shape[1]}")
-    if not np.isfinite(X_train).all() or not np.isfinite(X_val).all():
-        raise ValueError("Non-finite values found in train/val arrays.")
 
     input_len = int(X_train.shape[1])
 
     X_target: Optional[np.ndarray] = None
     if args.target is not None:
-        X_target = np.load(args.target)
-        if X_target.ndim != 2:
-            raise ValueError(f"Expected 2D target array. Got target {X_target.shape}")
+        X_target = _load_2d_array(args.target, "target")
         if X_target.shape[1] != input_len:
-            raise ValueError(f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}")
-        if not np.isfinite(X_target).all():
-            raise ValueError("Non-finite values found in target array.")
+            raise ValueError(
+                f"Target must have same #features as train/val. Got {X_target.shape[1]} vs {input_len}"
+            )
 
     # -------------------------
-    # resolve training knobs (+ overrides)
+    # Resolve training knobs
     # -------------------------
     batch_size = int(args.batch_size if args.batch_size is not None else train_hp.get("batch_size", 256))
     max_epochs = int(args.max_epochs if args.max_epochs is not None else train_hp.get("max_epochs", 50))
@@ -205,6 +249,7 @@ def main() -> None:
     devices: Any = args.devices if args.devices is not None else train_hp.get("devices", "auto")
     strategy = str(args.strategy if args.strategy is not None else train_hp.get("strategy", "auto"))
     precision = str(args.precision if args.precision is not None else train_hp.get("precision", "32-true"))
+
     gradient_clip_val = _none_if_null(train_hp.get("gradient_clip_val", None))
     if gradient_clip_val is not None:
         gradient_clip_val = float(gradient_clip_val)
@@ -212,43 +257,33 @@ def main() -> None:
     devices = _maybe_int(devices)
 
     # -------------------------
-    # build cfg for LitVAE
-    # IMPORTANT: LitVAE reads:
-    #   - cfg.lr / cfg.beta / cfg.weight_decay (flat)
-    #   - cfg.masking.* (nested)
-    #   - cfg.seed (for deterministic masking)
+    # Resolve masking knobs
     # -------------------------
-    # Pull masking knobs from YAML (and ensure null -> None)
     mask_frac = _none_if_null(mask_hp.get("mask_frac", None))
     block_len = _none_if_null(mask_hp.get("block_len", None))
-
-    # If user wrote block_len: null, YAML gives None, which is correct.
-    # But if block_len was accidentally "0" or 0, treat it as None (otherwise it disables masking logic)
     if block_len == 0:
         block_len = None
 
-    # Handle padding - can be None for auto-calculation in FullyConvVAE1D
     padding_val = model_hp.get("padding", 4)
     if padding_val is not None:
         padding_val = int(padding_val)
 
+    # -------------------------
+    # Build cfg for LitVAE
+    # -------------------------
     cfg = SimpleNamespace(
-        # model (flat)
         input_len=input_len,
-        model_type=str(model_hp.get("model_type", "conv")),  # "conv" or "fully_conv"
+        model_type=str(model_hp.get("model_type", "conv")),
         latent_dim=int(model_hp.get("latent_dim", 32)),
         hidden_channels=as_tuple_int(model_hp.get("hidden_channels", [32, 64, 128]), "hidden_channels"),
         kernel_size=int(model_hp.get("kernel_size", 9)),
         stride=int(model_hp.get("stride", 2)),
         padding=padding_val,
         use_batchnorm=bool(model_hp.get("use_batchnorm", False)),
-        # training (flat: LitVAE uses getattr(cfg, "lr"/"beta"/"weight_decay"))
         lr=float(train_hp.get("lr", 1e-3)),
         beta=float(train_hp.get("beta", 0.01)),
         weight_decay=float(train_hp.get("weight_decay", 0.0)),
-        # seed for deterministic masking
         seed=seed,
-        # masking (nested: LitVAE._mask_cfg reads cfg.masking.*)
         masking=SimpleNamespace(
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
@@ -263,21 +298,22 @@ def main() -> None:
     )
 
     # -------------------------
-    # dataloaders
+    # Dataloaders
     # -------------------------
     train_loader = make_loader(X_train, batch_size, shuffle=True, num_workers=num_workers)
     val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
+
     val_dataloaders = [val_loader]
     if X_target is not None:
         target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
         val_dataloaders.append(target_loader)
 
     # -------------------------
-    # module
+    # Module
     # -------------------------
     lit = LitVAE(cfg)
 
-    # HARD FAIL if masking is enabled but no mask_frac/block_len made it through
+    # Validate mask propagation immediately
     mcfg = lit._mask_cfg()
     if mcfg["enabled"] and (mcfg["mask_frac"] is None and mcfg["block_len"] is None):
         raise RuntimeError(
@@ -286,7 +322,7 @@ def main() -> None:
         )
 
     # -------------------------
-    # write resolved config for debugging/plotting
+    # Write resolved config
     # -------------------------
     resolved = {
         "seed": seed,
@@ -320,6 +356,7 @@ def main() -> None:
             "accelerator": accelerator,
             "devices": devices,
             "strategy": strategy,
+            "gradient_clip_val": gradient_clip_val,
         },
         "masking": {
             "enabled": cfg.masking.enabled,
@@ -332,19 +369,19 @@ def main() -> None:
             "gaussian_std": cfg.masking.gaussian_std,
             "constant_value": cfg.masking.constant_value,
         },
-        "_lit_mask_cfg": mcfg,  # what LitVAE actually saw
+        "_lit_mask_cfg": mcfg,
     }
     (outdir / "hparams.resolved.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False))
 
     # -------------------------
-    # callbacks + loggers
+    # Callbacks + loggers
     # -------------------------
     ckpt_dir = outdir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        monitor="val/loss",  # MUST match lit_model.py epoch metric key
+        monitor="val/loss",
         mode="min",
         save_top_k=1,
         filename="vae-{epoch:03d}",
@@ -356,7 +393,7 @@ def main() -> None:
     logger = [tb_logger, csv_logger]
 
     # -------------------------
-    # trainer
+    # Trainer
     # -------------------------
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -376,7 +413,7 @@ def main() -> None:
     trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
 
     # -------------------------
-    # summary + stable best.ckpt
+    # Summary + stable best.ckpt
     # -------------------------
     summary = {
         "best_model_path": ckpt_cb.best_model_path,
@@ -401,18 +438,39 @@ def main() -> None:
     print("TensorBoard logdir:", outdir / "tb")
 
     # -------------------------
-    # optional reconstruction artifacts
+    # Optional reconstruction artifacts
+    # IMPORTANT: dump from BEST checkpoint, not last in-memory model
     # -------------------------
     if args.save_recon:
-        splits = [s.strip() for s in args.recon_splits.split(",")]
-        split_data = {"train": X_train, "val": X_val, "target": X_target}
-        for split in splits:
-            X_split = split_data.get(split)
+        best_lit = LitVAE(cfg)
+        ckpt_obj = torch.load(best_out, map_location="cpu")
+
+        if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj:
+            state_dict = ckpt_obj["state_dict"]
+        else:
+            state_dict = ckpt_obj
+
+        best_lit.load_state_dict(state_dict, strict=True)
+        best_lit.eval()
+
+        if torch.cuda.is_available() and accelerator != "cpu":
+            best_lit = best_lit.to("cuda")
+
+        split_names = [s.strip() for s in args.recon_splits.split(",") if s.strip()]
+        split_to_data: dict[str, Optional[np.ndarray]] = {
+            "train": X_train,
+            "val": X_val,
+            "target": X_target,
+        }
+
+        for split in split_names:
+            X_split = split_to_data.get(split)
             if X_split is None:
                 print(f"Skipping split '{split}' (no data)")
                 continue
+
             dump_recon_artifacts(
-                lit=lit,
+                lit=best_lit,
                 X=X_split,
                 outdir=outdir,
                 split=split,
