@@ -1,4 +1,3 @@
-# src/vae/lit_model.py
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
@@ -18,23 +17,22 @@ class LitVAE(pl.LightningModule):
     Classification version of LitVAE.
 
     Expected model behavior:
-      - input: x_in with shape (B, L) or (B, 1, L)
+      - input: x_in with shape (B, L) or (B, C, L)
       - output: logits with shape (B, 3, L)
       - targets: integer genotype classes in {0,1,2}
 
     Two-pass metrics:
-      (1) clean pass: logits_clean = model(x)
+      (1) clean pass: logits_clean = model(x_clean_in)
           - ce_clean_all = cross-entropy over all positions
-      (2) masked/corrupted pass: x_in, mask = corrupt(x); logits = model(x_in)
+      (2) masked/corrupted pass: x_in, mask = corrupt(x); logits = model(model_in)
           - ce_masked   = CE on masked positions only
           - ce_unmasked = CE on unmasked positions only
           - recon_objective = alpha * ce_masked + (1-alpha) * ce_unmasked
           - total_loss = recon_objective + beta * KL
 
-    Logging:
-      - train_step/* logged per step
-      - train/* logged once per epoch
-      - val/* and target/* logged once per epoch
+    If use_mask_channel=True, model input is (B, 2, L):
+      - channel 0: genotype/corrupted values
+      - channel 1: binary mask indicator
     """
 
     def __init__(self, cfg: Any):
@@ -50,6 +48,7 @@ class LitVAE(pl.LightningModule):
         self.cfg = cfg
 
         model_type = getattr(cfg, "model_type", "conv")
+        in_channels = 2 if self._use_mask_channel() else 1
 
         if model_type == "fully_conv":
             self.model = FullyConvVAE1D(
@@ -60,6 +59,7 @@ class LitVAE(pl.LightningModule):
                 stride=getattr(cfg, "stride", 4),
                 padding=getattr(cfg, "padding", None),
                 use_batchnorm=getattr(cfg, "use_batchnorm", True),
+                in_channels=in_channels,
             )
         else:
             self.model = ConvVAE1D(
@@ -70,16 +70,19 @@ class LitVAE(pl.LightningModule):
                 stride=getattr(cfg, "stride", 2),
                 padding=getattr(cfg, "padding", 4),
                 use_batchnorm=getattr(cfg, "use_batchnorm", False),
+                in_channels=in_channels,
             )
 
-        self.example_input_array = torch.zeros(2, getattr(cfg, "input_len", 128))
+        if self._use_mask_channel():
+            self.example_input_array = torch.zeros(2, 2, getattr(cfg, "input_len", 128))
+        else:
+            self.example_input_array = torch.zeros(2, getattr(cfg, "input_len", 128))
 
         self._train_buf: Dict[str, List[torch.Tensor]] = {}
         self._val_buf: Dict[str, List[torch.Tensor]] = {}
         self._target_buf: Dict[str, List[torch.Tensor]] = {}
 
         # Optional class weights for genotype classes {0,1,2}.
-        # Set externally from the training/debug script via model.set_class_weights(...).
         self.class_weights: Optional[torch.Tensor] = None
 
     # -------------------------
@@ -90,7 +93,7 @@ class LitVAE(pl.LightningModule):
         return x.float()
 
     def _to_2d(self, x: torch.Tensor) -> torch.Tensor:
-        return x.squeeze(1) if x.dim() == 3 else x
+        return x.squeeze(1) if x.dim() == 3 and x.shape[1] == 1 else x
 
     def _assert_finite(self, name: str, t: torch.Tensor) -> None:
         if not torch.isfinite(t).all():
@@ -120,6 +123,39 @@ class LitVAE(pl.LightningModule):
         if self.class_weights is None:
             return None
         return self.class_weights.to(self.device)
+
+    def _use_mask_channel(self) -> bool:
+        m = getattr(self.cfg, "masking", None)
+        if m is not None:
+            return bool(getattr(m, "use_mask_channel", False))
+        return bool(getattr(self.cfg, "use_mask_channel", False))
+
+    def _make_model_input(
+        self,
+        x_values: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Build actual model input.
+
+        Args:
+            x_values: (B, L) float
+            mask:     (B, L) bool or float, True = masked
+
+        Returns:
+            if use_mask_channel=False: (B, L)
+            if use_mask_channel=True:  (B, 2, L)
+                channel 0 = genotype/corrupted values
+                channel 1 = mask indicator in {0,1}
+        """
+        if not self._use_mask_channel():
+            return x_values
+
+        if mask is None:
+            mask = torch.zeros_like(x_values, dtype=torch.bool)
+
+        mask_f = mask.to(dtype=x_values.dtype)
+        return torch.stack([x_values, mask_f], dim=1)
 
     @staticmethod
     def _ce_all(
@@ -184,6 +220,7 @@ class LitVAE(pl.LightningModule):
                 "fill": str(getattr(m, "fill", getattr(m, "fill_value", "zero"))),
                 "gaussian_std": float(getattr(m, "gaussian_std", 0.1)),
                 "constant_value": float(getattr(m, "constant_value", 0.0)),
+                "use_mask_channel": bool(getattr(m, "use_mask_channel", False)),
             }
 
         return {
@@ -196,6 +233,7 @@ class LitVAE(pl.LightningModule):
             "fill": str(getattr(self.cfg, "mask_fill_value", "zero")),
             "gaussian_std": float(getattr(self.cfg, "mask_gaussian_std", 0.1)),
             "constant_value": 0.0,
+            "use_mask_channel": bool(getattr(self.cfg, "use_mask_channel", False)),
         }
 
     def _make_step_seed(self, stage: str, batch_idx: int) -> int:
@@ -250,7 +288,10 @@ class LitVAE(pl.LightningModule):
         class_weights = self._get_class_weights()
 
         # (1) clean pass
-        logits_clean, mu_clean, logvar_clean = self._forward(x)
+        clean_mask = torch.zeros((B, L), dtype=torch.bool, device=self.device)
+        x_clean_in = self._make_model_input(x, clean_mask)
+
+        logits_clean, mu_clean, logvar_clean = self._forward(x_clean_in)
         self._assert_finite("logits_clean", logits_clean)
 
         ce_clean_all = self._ce_all(logits_clean, target, class_weights=class_weights)
@@ -281,7 +322,10 @@ class LitVAE(pl.LightningModule):
 
         self._assert_finite("x_in", x_in)
 
-        logits, mu, logvar = self._forward(x_in)
+        model_in = self._make_model_input(x_in, mask)
+        self._assert_finite("model_in", model_in)
+
+        logits, mu, logvar = self._forward(model_in)
         self._assert_finite("logits", logits)
 
         kl = self._kl_standard_normal(mu, logvar)
@@ -325,7 +369,11 @@ class LitVAE(pl.LightningModule):
         mask_frac = mask.float().mean()
         delta_in_l1 = (x_in - x).abs().mean()
 
-        ratio_masked_over_clean = (ce_mask / (ce_clean_all + eps)) if mask.any() else torch.tensor(0.0, device=self.device)
+        ratio_masked_over_clean = (
+            ce_mask / (ce_clean_all + eps)
+            if mask.any()
+            else torch.tensor(0.0, device=self.device)
+        )
 
         return {
             "loss": loss,

@@ -358,6 +358,7 @@ rule train_vae:
         save_recon=True,
         recon_n=16,
         recon_splits="train,val,target",
+        skip_target_val=True,
     shell:
         r"""
         set -euo pipefail
@@ -369,6 +370,11 @@ rule train_vae:
             RECON_ARGS="--save-recon --recon-n {params.recon_n} --recon-splits {params.recon_splits}"
         fi
 
+        TARGET_VAL_ARGS=""
+        if [ "{params.skip_target_val}" = "True" ]; then
+            TARGET_VAL_ARGS="--no-target-val"
+        fi
+
         python -u "{TRAIN_VAE_SCRIPT}" \
           --train "{input.train}" \
           --val "{input.val}" \
@@ -378,6 +384,7 @@ rule train_vae:
           --accelerator "{params.accelerator}" \
           --devices "{params.devices}" \
           --precision "{params.precision}" \
+          $TARGET_VAL_ARGS \
           $RECON_ARGS
 
         cp "{input.hparams}" "{output.grid_yaml}"
@@ -396,7 +403,6 @@ rule train_vae:
 
         touch "{output.done}"
         """
-
 ##############################################################################
 # RULE vae_diagnostics
 ##############################################################################

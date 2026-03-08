@@ -1,4 +1,3 @@
-# src/vae/model.py
 from __future__ import annotations
 
 import torch
@@ -36,7 +35,7 @@ class ConvVAE1D(nn.Module):
     1D Conv VAE for genotype classification.
 
     Input:
-      x: (B, L) or (B, 1, L)
+      x: (B, L) or (B, C, L)
 
     Output:
       logits: (B, 3, L)
@@ -53,6 +52,7 @@ class ConvVAE1D(nn.Module):
         stride: int = 2,
         padding: int = 4,
         use_batchnorm: bool = False,
+        in_channels: int = 1,
     ):
         super().__init__()
         self.input_len = int(input_len)
@@ -62,17 +62,20 @@ class ConvVAE1D(nn.Module):
         self.s = int(stride)
         self.p = int(padding)
         self.use_bn = bool(use_batchnorm)
+        self.in_channels = int(in_channels)
 
         enc = []
-        in_ch = 1
+        in_ch = self.in_channels
         for out_ch in self.hidden_channels:
             enc.append(nn.Conv1d(in_ch, out_ch, self.k, stride=self.s, padding=self.p))
+            if self.use_bn:
+                enc.append(nn.BatchNorm1d(out_ch))
             enc.append(nn.ELU(inplace=True))
             in_ch = out_ch
         self.enc_conv = nn.Sequential(*enc)
 
         with torch.no_grad():
-            h = self.enc_conv(torch.zeros(2, 1, self.input_len))
+            h = self.enc_conv(torch.zeros(2, self.in_channels, self.input_len))
             self.enc_ch, self.enc_len = h.shape[1], h.shape[2]
             flat_dim = self.enc_ch * self.enc_len
 
@@ -87,18 +90,27 @@ class ConvVAE1D(nn.Module):
         for out_ch in rev[1:]:
             dec.append(
                 nn.ConvTranspose1d(
-                    in_ch, out_ch, self.k, stride=self.s, padding=self.p,
-                    output_padding=self.s - 1
+                    in_ch,
+                    out_ch,
+                    self.k,
+                    stride=self.s,
+                    padding=self.p,
+                    output_padding=self.s - 1,
                 )
             )
+            if self.use_bn:
+                dec.append(nn.BatchNorm1d(out_ch))
             dec.append(nn.ELU(inplace=True))
             in_ch = out_ch
 
-        # final 3 channels = logits for genotype classes 0/1/2
         dec.append(
             nn.ConvTranspose1d(
-                in_ch, 3, self.k, stride=self.s, padding=self.p,
-                output_padding=self.s - 1
+                in_ch,
+                3,
+                self.k,
+                stride=self.s,
+                padding=self.p,
+                output_padding=self.s - 1,
             )
         )
         self.dec_conv = nn.Sequential(*dec)
@@ -146,12 +158,12 @@ class FullyConvVAE1D(nn.Module):
     Fully convolutional VAE for genotype classification.
 
     Input:
-      x: (B, L) or (B, 1, L)
+      x: (B, L) or (B, C, L)
 
     Output:
       logits: (B, 3, L)
-      mu:     (B, C, S)
-      logvar: (B, C, S)
+      mu:     (B, C_latent, S)
+      logvar: (B, C_latent, S)
     """
 
     def __init__(
@@ -163,6 +175,7 @@ class FullyConvVAE1D(nn.Module):
         stride: int = 4,
         padding: Optional[int] = None,
         use_batchnorm: bool = True,
+        in_channels: int = 1,
     ):
         super().__init__()
         self.input_len = int(input_len)
@@ -172,9 +185,10 @@ class FullyConvVAE1D(nn.Module):
         self.s = int(stride)
         self.p = int(padding) if padding is not None else self.k // 2
         self.use_bn = bool(use_batchnorm)
+        self.in_channels = int(in_channels)
 
         enc = []
-        in_ch = 1
+        in_ch = self.in_channels
         for out_ch in self.hidden_channels:
             enc.append(nn.Conv1d(in_ch, out_ch, self.k, stride=self.s, padding=self.p))
             if self.use_bn:
@@ -188,7 +202,7 @@ class FullyConvVAE1D(nn.Module):
         self.conv_logvar = nn.Conv1d(last_ch, self.latent_channels, kernel_size=1)
 
         with torch.no_grad():
-            dummy = torch.zeros(2, 1, self.input_len)
+            dummy = torch.zeros(2, self.in_channels, self.input_len)
             h = self.enc_conv(dummy)
             self.enc_spatial_len = h.shape[2]
             self.latent_dim = self.latent_channels * self.enc_spatial_len
@@ -202,8 +216,12 @@ class FullyConvVAE1D(nn.Module):
         for out_ch in rev[1:]:
             dec.append(
                 nn.ConvTranspose1d(
-                    in_ch, out_ch, self.k, stride=self.s, padding=self.p,
-                    output_padding=self.s - 1
+                    in_ch,
+                    out_ch,
+                    self.k,
+                    stride=self.s,
+                    padding=self.p,
+                    output_padding=self.s - 1,
                 )
             )
             if self.use_bn:
@@ -213,8 +231,12 @@ class FullyConvVAE1D(nn.Module):
 
         dec.append(
             nn.ConvTranspose1d(
-                in_ch, 3, self.k, stride=self.s, padding=self.p,
-                output_padding=self.s - 1
+                in_ch,
+                3,
+                self.k,
+                stride=self.s,
+                padding=self.p,
+                output_padding=self.s - 1,
             )
         )
         self.dec_conv = nn.Sequential(*dec)

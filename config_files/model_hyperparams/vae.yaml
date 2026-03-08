@@ -1,10 +1,10 @@
 model:
   model_type: "fully_conv"
-  latent_dim: 32
-  hidden_channels: [32]
-  kernel_size: 9
+  latent_dim: 128
+  hidden_channels: [64, 128, 256]
+  kernel_size: 17
   stride: 2
-  padding: 4
+  padding: 8
   use_batchnorm: false
 
 training:
@@ -22,15 +22,16 @@ training:
 
 masking:
   enabled: true
-  alpha_masked: 1.0
+  use_mask_channel: true
+  alpha_masked: 0.8
   mode: "contiguous"
   n_blocks: 2
   allow_overlap: false
   mask_frac: null
-  block_len: 100
-  fill: "constant"
+  block_len: 10
+  fill: "zero"
   gaussian_std: 0.0
-  constant_value: -1.0
+  constant_value: 0.0
 
 seed: 0
 
@@ -40,6 +41,8 @@ grid:
     prefix: "vae"
     sep: "__"
   dims:
-    - path: "masking.block_len"
-      values: [5, 10, 15, 20, 25, 30, 35, 40]
-      tag: "blocklen"
+    - path: "masking.n_blocks"
+      values: [1, 2, 3, 4, 5]
+      tag: "nblocks"
+
+  

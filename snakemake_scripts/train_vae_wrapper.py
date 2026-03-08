@@ -171,9 +171,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--train", type=Path, required=True, help=".npy (N,L) train array")
     ap.add_argument("--val", type=Path, required=True, help=".npy (N,L) val array")
     ap.add_argument("--target", type=Path, default=None, help="Optional .npy (N,L) target array (2nd val dataloader)")
+    ap.add_argument("--no-target-val", action="store_true",
+                    help="Do not include target dataset as a validation dataloader")
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed sections")
     ap.add_argument("--outdir", type=Path, required=True)
-
     # Optional overrides
     ap.add_argument("--no-progress-bar", action="store_true")
     ap.add_argument("--accelerator", type=str, default=None)
@@ -341,7 +342,7 @@ def main() -> None:
     val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
 
     val_dataloaders = [val_loader]
-    if X_target is not None:
+    if X_target is not None and not args.no_target_val:
         target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
         val_dataloaders.append(target_loader)
 
@@ -396,6 +397,7 @@ def main() -> None:
             "gradient_clip_val": gradient_clip_val,
             "overfit_one_batch": overfit_one_batch,
             "overfit_n": overfit_n,
+            "no_target_val": bool(args.no_target_val),
         },
         "masking": {
             "enabled": cfg.masking.enabled,

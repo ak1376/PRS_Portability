@@ -355,6 +355,7 @@ def main() -> None:
             fill=str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
             gaussian_std=float(mask_hp.get("gaussian_std", 0.1)),
             constant_value=float(mask_hp.get("constant_value", 0.0)),
+            use_mask_channel=bool(mask_hp.get("use_mask_channel", False)),
         ),
     )
 
@@ -421,6 +422,7 @@ def main() -> None:
             "fill": cfg.masking.fill,
             "gaussian_std": cfg.masking.gaussian_std,
             "constant_value": cfg.masking.constant_value,
+            "use_mask_channel": cfg.masking.use_mask_channel,
         },
     }
     (outdir / "hparams.resolved.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False))
@@ -459,6 +461,7 @@ def main() -> None:
         "fill": str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
         "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
         "constant_value": float(mask_hp.get("constant_value", 0.0)),
+        "use_mask_channel": bool(mask_hp.get("use_mask_channel", False)),
     }
 
     diag_cb = ReconDiagnosticsCallback(
