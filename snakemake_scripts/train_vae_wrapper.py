@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -58,6 +60,37 @@ def _none_if_null(x: Any) -> Any:
     return x
 
 
+def _atomic_savez_compressed(out_path: Path, **arrays: Any) -> None:
+    """
+    Write .npz atomically:
+      1) write to temp file in same directory
+      2) verify readable
+      3) atomically replace destination
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=out_path.stem + ".tmp.",
+        suffix=".npz",
+        dir=str(out_path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        np.savez_compressed(tmp_path, **arrays)
+
+        # Verify archive integrity before promoting it
+        with np.load(tmp_path) as chk:
+            for k in chk.files:
+                _ = chk[k]
+
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 # =========================================================
 # Data helpers
 # =========================================================
@@ -100,18 +133,24 @@ def dump_recon_artifacts(
     seed: int,
 ) -> None:
     """
-    Save x_true, x_masked, mask, recon for up to `n` samples.
+    Save reconstruction artifacts for up to `n` samples.
 
-    Output format:
-      outdir/recon/{split}_recon.npz with keys:
-        - x_true
-        - x_masked
-        - mask
-        - recon
-        - used_n_blocks
-        - used_block_len
-        - target_mask_frac
-        - realized_mask_frac
+    Output:
+      outdir/recon/{split}_recon.npz
+
+    Keys saved:
+      - x_true               : (N, L) true genotype classes
+      - x_masked             : (N, L) masked/corrupted input values
+      - mask                 : (N, L) boolean mask, True = masked
+      - recon                : (N, 3, L) raw logits (kept for backward compatibility)
+      - pred                 : (N, L) argmax predicted genotype class
+      - prob_0               : (N, L) P(genotype = 0)
+      - prob_1               : (N, L) P(genotype = 1)
+      - prob_2               : (N, L) P(genotype = 2)
+      - used_n_blocks        : scalar
+      - used_block_len       : scalar
+      - target_mask_frac     : scalar
+      - realized_mask_frac   : scalar
     """
     if X.shape[0] == 0:
         return
@@ -121,12 +160,11 @@ def dump_recon_artifacts(
 
     n_use = min(int(n), int(X.shape[0]))
     X_sub = X[:n_use]
-
     x_true = torch.from_numpy(X_sub).float().to(device)
 
     x_in, mask, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac = make_mask_and_apply(
         x_true,
-        enabled=bool(mask_cfg["enabled"]),
+        enabled=bool(mask_cfg.get("enabled", False)),
         constraint_mode=str(mask_cfg.get("constraint_mode", "frac_and_blocks")),
         n_blocks=mask_cfg.get("n_blocks", None),
         block_len=mask_cfg.get("block_len", None),
@@ -144,35 +182,53 @@ def dump_recon_artifacts(
     out = lit(model_in)
 
     if isinstance(out, torch.Tensor):
-        recon = out
+        logits = out
     elif isinstance(out, (tuple, list)):
-        recon = out[0]
+        logits = out[0]
     elif isinstance(out, dict):
-        if "recon" in out:
-            recon = out["recon"]
-        elif "logits" in out:
-            recon = out["logits"]
+        if "logits" in out:
+            logits = out["logits"]
+        elif "recon" in out:
+            logits = out["recon"]
         else:
             raise RuntimeError(f"Unexpected dict output keys from model: {list(out.keys())}")
     else:
         raise RuntimeError(f"Unexpected output type from LitVAE forward: {type(out)}")
 
+    if logits.ndim != 3 or logits.shape[1] != 3:
+        raise RuntimeError(f"Expected logits with shape (B, 3, L), got {tuple(logits.shape)}")
+
+    probs = torch.softmax(logits, dim=1)
+    pred = torch.argmax(probs, dim=1)
+
     recon_dir = outdir / "recon"
     recon_dir.mkdir(parents=True, exist_ok=True)
-
     out_path = recon_dir / f"{split}_recon.npz"
-    np.savez_compressed(
+
+    _atomic_savez_compressed(
         out_path,
-        x_true=x_true.detach().cpu().numpy(),
-        x_masked=x_in.detach().cpu().numpy(),
-        mask=mask.detach().cpu().numpy(),
-        recon=recon.detach().cpu().numpy(),
+        x_true=x_true.detach().cpu().numpy().astype(np.int64),
+        x_masked=x_in.detach().cpu().numpy().astype(np.float32),
+        mask=mask.detach().cpu().numpy().astype(np.bool_),
+
+        # backward-compatible
+        recon=logits.detach().cpu().numpy().astype(np.float32),
+
+        # preferred newer format
+        pred=pred.detach().cpu().numpy().astype(np.int64),
+        prob_0=probs[:, 0, :].detach().cpu().numpy().astype(np.float32),
+        prob_1=probs[:, 1, :].detach().cpu().numpy().astype(np.float32),
+        prob_2=probs[:, 2, :].detach().cpu().numpy().astype(np.float32),
+
+        # masking metadata
         used_n_blocks=np.array(used_n_blocks, dtype=np.int64),
         used_block_len=np.array(used_block_len, dtype=np.int64),
         target_mask_frac=np.array(target_mask_frac, dtype=np.float32),
         realized_mask_frac=np.array(realized_mask_frac, dtype=np.float32),
     )
+
     print(f"Saved reconstruction artifacts to {out_path}")
+
 
 # =========================================================
 # CLI
@@ -187,6 +243,7 @@ def parse_args() -> argparse.Namespace:
                     help="Do not include target dataset as a validation dataloader")
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed sections")
     ap.add_argument("--outdir", type=Path, required=True)
+
     # Optional overrides
     ap.add_argument("--no-progress-bar", action="store_true")
     ap.add_argument("--accelerator", type=str, default=None)
@@ -411,8 +468,57 @@ def main() -> None:
 
         else:
             raise RuntimeError(f"Unknown constraint_mode: {mode}")
+
     # -------------------------
-    # Write resolved config
+    # Callbacks + loggers
+    # -------------------------
+    ckpt_dir = outdir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(ckpt_dir),
+        monitor="val/loss",
+        mode="min",
+        save_top_k=1,
+        filename="vae-{epoch:03d}",
+    )
+    lr_cb = LearningRateMonitor(logging_interval="epoch")
+
+    tb_logger = TensorBoardLogger(save_dir=str(outdir), name="tb")
+    csv_logger = CSVLogger(save_dir=str(outdir), name="logs")
+    logger = [tb_logger, csv_logger]
+
+    # -------------------------
+    # Trainer
+    # -------------------------
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
+        precision=precision,
+        gradient_clip_val=gradient_clip_val,
+        callbacks=[ckpt_cb, lr_cb],
+        logger=logger,
+        log_every_n_steps=log_every_n_steps,
+        default_root_dir=str(outdir),
+        enable_progress_bar=(not args.no_progress_bar),
+        enable_model_summary=False,
+    )
+
+    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
+
+    # Make sure all ranks finish training before rank 0 touches shared outputs
+    trainer.strategy.barrier("post_fit_barrier")
+
+    if not trainer.is_global_zero:
+        return
+
+    print(f"[rank0] trainer.global_rank={getattr(trainer, 'global_rank', 'NA')}")
+    print(f"[rank0] writing shared outputs under {outdir}")
+
+    # -------------------------
+    # Write resolved config (rank 0 only)
     # -------------------------
     resolved = {
         "seed": seed,
@@ -471,45 +577,6 @@ def main() -> None:
     (outdir / "hparams.resolved.yaml").write_text(yaml.safe_dump(resolved, sort_keys=False))
 
     # -------------------------
-    # Callbacks + loggers
-    # -------------------------
-    ckpt_dir = outdir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir),
-        monitor="val/loss",
-        mode="min",
-        save_top_k=1,
-        filename="vae-{epoch:03d}",
-    )
-    lr_cb = LearningRateMonitor(logging_interval="epoch")
-
-    tb_logger = TensorBoardLogger(save_dir=str(outdir), name="tb")
-    csv_logger = CSVLogger(save_dir=str(outdir), name="logs")
-    logger = [tb_logger, csv_logger]
-
-    # -------------------------
-    # Trainer
-    # -------------------------
-    trainer = pl.Trainer(
-        max_epochs=max_epochs,
-        accelerator=accelerator,
-        devices=devices,
-        strategy=strategy,
-        precision=precision,
-        gradient_clip_val=gradient_clip_val,
-        callbacks=[ckpt_cb, lr_cb],
-        logger=logger,
-        log_every_n_steps=log_every_n_steps,
-        default_root_dir=str(outdir),
-        enable_progress_bar=(not args.no_progress_bar),
-        enable_model_summary=False,
-    )
-
-    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
-
-    # -------------------------
     # Summary + stable best.ckpt
     # -------------------------
     summary = {
@@ -537,6 +604,7 @@ def main() -> None:
     # -------------------------
     # Optional reconstruction artifacts
     # IMPORTANT: dump from BEST checkpoint, not last in-memory model
+    # rank 0 only
     # -------------------------
     if args.save_recon:
         best_lit = LitVAE(cfg)
