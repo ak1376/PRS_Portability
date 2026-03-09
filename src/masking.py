@@ -17,12 +17,18 @@ class MaskingConfig:
 
     # geometry
     mode: str = "contiguous"
-    n_blocks: int = 1
     allow_overlap: bool = True
 
-    # length control
-    mask_frac: Optional[float] = None
+    # choose which two define the third:
+    #   - "blocks_and_len"  : derive mask_frac
+    #   - "frac_and_blocks" : derive block_len
+    #   - "frac_and_len"    : derive n_blocks
+    constraint_mode: str = "frac_and_blocks"
+
+    # geometry parameters
+    n_blocks: Optional[int] = 1
     block_len: Optional[int] = None
+    mask_frac: Optional[float] = None
 
     # fill / corruption
     fill: str = "gaussian"        # gaussian | zero | mean | constant | mask_token
@@ -37,52 +43,112 @@ class MaskingConfig:
     # numerics / misc
     seed: Optional[int] = None
 
+    # validation tolerance if all 3 are given
+    consistency_tolerance: int = 1
+
 
 # =============================================================================
 # Utilities
 # =============================================================================
 
-def resolve_block_len(
-    L: int,
-    *,
-    block_len: Optional[int],
-    mask_frac: Optional[float],
-    n_blocks: int,
-) -> int:
-    """
-    Resolve the per-block length given either:
-      - explicit block_len (per block), OR
-      - mask_frac interpreted as TOTAL fraction masked per sample.
-
-    If mask_frac is used:
-      total_to_mask = round(mask_frac * L)
-      per_block_len = round(total_to_mask / n_blocks)
-
-    Returns an int in [0, L].
-    """
-    if L <= 0:
-        return 0
-
-    n_blocks = int(n_blocks)
-    if n_blocks <= 0:
-        return 0
-
-    if block_len is not None:
-        bl = int(block_len)
-        return max(0, min(bl, L))
-
-    if mask_frac is None:
-        return 0
-
+def _validate_mask_frac(mask_frac: float) -> float:
     mf = float(mask_frac)
     if not (0.0 < mf <= 1.0):
         raise ValueError(f"mask_frac must be in (0,1]. Got {mask_frac!r}")
+    return mf
 
-    total = int(round(mf * L))
-    total = max(1, min(total, L))
-    per_block = int(round(total / n_blocks))
-    per_block = max(1, min(per_block, L))
-    return per_block
+
+def _validate_positive_int(name: str, value: Optional[int]) -> int:
+    if value is None:
+        raise ValueError(f"{name} must not be None")
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0. Got {value!r}")
+    return value
+
+
+def resolve_mask_geometry(
+    L: int,
+    *,
+    constraint_mode: str,
+    n_blocks: Optional[int],
+    block_len: Optional[int],
+    mask_frac: Optional[float],
+    consistency_tolerance: int = 1,
+) -> Tuple[int, int, float]:
+    """
+    Resolve contiguous masking geometry.
+
+    Returns:
+        resolved_n_blocks
+        resolved_block_len
+        target_mask_frac
+
+    Notes
+    -----
+    For contiguous masking, only two of:
+      - n_blocks
+      - block_len
+      - mask_frac
+    are free. The third is derived.
+
+    We define target_total = round(mask_frac * L).
+    """
+    if L <= 0:
+        return 0, 0, 0.0
+
+    mode = str(constraint_mode).lower()
+
+    # If all three are provided, require approximate consistency.
+    if n_blocks is not None and block_len is not None and mask_frac is not None:
+        nb = _validate_positive_int("n_blocks", n_blocks)
+        bl = _validate_positive_int("block_len", block_len)
+        mf = _validate_mask_frac(mask_frac)
+
+        expected_total = nb * bl
+        target_total = int(round(mf * L))
+
+        if abs(expected_total - target_total) > int(consistency_tolerance):
+            raise ValueError(
+                "mask_frac, n_blocks, and block_len are inconsistent for the given L. "
+                f"Got n_blocks={nb}, block_len={bl}, mask_frac={mf}, L={L}, "
+                f"so nb*bl={expected_total} but round(mask_frac*L)={target_total}. "
+                "Specify only two, or make them consistent."
+            )
+
+    if mode == "blocks_and_len":
+        nb = _validate_positive_int("n_blocks", n_blocks)
+        bl = _validate_positive_int("block_len", block_len)
+        bl = min(bl, L)
+        target_total = min(nb * bl, L)
+        target_frac = target_total / L
+        return nb, bl, target_frac
+
+    elif mode == "frac_and_blocks":
+        mf = _validate_mask_frac(mask_frac)
+        nb = _validate_positive_int("n_blocks", n_blocks)
+
+        target_total = max(1, min(int(round(mf * L)), L))
+        bl = max(1, int(round(target_total / nb)))
+        bl = min(bl, L)
+
+        return nb, bl, mf
+
+    elif mode == "frac_and_len":
+        mf = _validate_mask_frac(mask_frac)
+        bl = _validate_positive_int("block_len", block_len)
+        bl = min(bl, L)
+
+        target_total = max(1, min(int(round(mf * L)), L))
+        nb = max(1, int(round(target_total / bl)))
+
+        return nb, bl, mf
+
+    else:
+        raise ValueError(
+            f"Unknown constraint_mode={constraint_mode!r}. "
+            "Use one of: blocks_and_len, frac_and_blocks, frac_and_len."
+        )
 
 
 # =============================================================================
@@ -101,11 +167,6 @@ def random_multi_contiguous_block_mask(
 ) -> torch.Tensor:
     """
     Bool mask (B, L) with `n_blocks` contiguous True blocks per sample.
-
-    - Each block starts at a random index in [0, L-1].
-    - Each block masks [start, min(start+block_len, L)) (truncate at end).
-    - If allow_overlap=True, blocks may overlap (realized masked fraction may be < expected).
-    - If allow_overlap=False, we attempt (best-effort) to place non-overlapping blocks.
 
     Returns:
         mask: torch.bool tensor, shape (B, L)
@@ -126,39 +187,42 @@ def random_multi_contiguous_block_mask(
 
     g = None
     if seed is not None:
-        # Generator must live on the same device as sampling ops for determinism.
         g = torch.Generator(device=dev if dev is not None else "cpu")
         g.manual_seed(int(seed))
 
     if allow_overlap:
-        # Vectorized path: sample (B, n_blocks) starts and OR them together.
         starts = torch.randint(low=0, high=L, size=(B, n_blocks), generator=g, device=dev)
         ends = torch.clamp(starts + block_len, max=L)
 
-        ar = torch.arange(L, device=dev).view(1, 1, L)   # (1,1,L)
-        s = starts.unsqueeze(-1)                          # (B,n_blocks,1)
-        e = ends.unsqueeze(-1)                            # (B,n_blocks,1)
+        ar = torch.arange(L, device=dev).view(1, 1, L)
+        s = starts.unsqueeze(-1)
+        e = ends.unsqueeze(-1)
 
-        blocks = (ar >= s) & (ar < e)                     # (B,n_blocks,L)
-        return blocks.any(dim=1)                          # (B,L)
+        blocks = (ar >= s) & (ar < e)
+        return blocks.any(dim=1)
 
-    # Best-effort non-overlap (loop per sample)
+    # Non-overlapping placement
     mask = torch.zeros((B, L), dtype=torch.bool, device=dev)
-    max_tries = 100
+
+    # If impossible to fit all blocks without overlap, cap the effective number.
+    max_nonoverlap_blocks = max(1, L // block_len)
+    target_blocks = min(n_blocks, max_nonoverlap_blocks)
+
+    max_tries = 500
 
     for i in range(B):
         placed = 0
         tries = 0
-        while placed < n_blocks and tries < max_tries:
-            start = int(torch.randint(0, L, (1,), generator=g, device=dev).item())
-            end = min(start + block_len, L)
+        while placed < target_blocks and tries < max_tries:
+            start = int(torch.randint(0, L - block_len + 1, (1,), generator=g, device=dev).item())
+            end = start + block_len
 
             if not mask[i, start:end].any():
                 mask[i, start:end] = True
                 placed += 1
 
             tries += 1
-        # If we fail to place all blocks without overlap, we keep what we placed.
+
     return mask
 
 
@@ -180,16 +244,6 @@ def apply_mask(
     Apply boolean mask to x by replacing masked positions with a fill strategy.
 
     Supports x shaped (B, L) or (B, 1, L). Mask must be (B, L).
-
-    Fill strategies:
-      - "gaussian": N(0, gaussian_std^2) on masked positions
-      - "zero": 0 on masked positions
-      - "mean": per-SNP batch mean (detached) on masked positions
-      - "constant": constant_value on masked positions
-      - "mask_token": mask_token_value on masked positions
-
-    Returns:
-        x_masked: same shape as x
     """
     if x.dim() == 3:
         x2 = x.squeeze(1)
@@ -248,7 +302,8 @@ def make_mask_and_apply(
     x: torch.Tensor,
     *,
     enabled: bool,
-    n_blocks: int,
+    constraint_mode: str,
+    n_blocks: Optional[int],
     block_len: Optional[int],
     mask_frac: Optional[float],
     allow_overlap: bool,
@@ -257,14 +312,18 @@ def make_mask_and_apply(
     gaussian_std: float,
     constant_value: float,
     mask_token_value: float = -1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    consistency_tolerance: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, float, float]:
     """
     Convenience helper for your Lightning model.
 
     Returns:
-      x_in: masked/corrupted input (same shape as x)
-      mask: (B,L) bool tensor
-      used_block_len: the resolved per-block length actually used
+      x_in                : masked/corrupted input (same shape as x)
+      mask                : (B,L) bool tensor
+      used_n_blocks       : resolved number of blocks
+      used_block_len      : resolved block length
+      target_mask_frac    : requested/implied target fraction
+      realized_mask_frac  : actual realized mean fraction over batch
     """
     if x.dim() == 3:
         B, _, L = x.shape
@@ -277,18 +336,26 @@ def make_mask_and_apply(
 
     if not enabled:
         mask = torch.zeros((B, L), dtype=torch.bool, device=dev)
-        return x, mask, 0
+        return x, mask, 0, 0, 0.0, 0.0
 
-    used_block_len = resolve_block_len(L, block_len=block_len, mask_frac=mask_frac, n_blocks=n_blocks)
-    if used_block_len <= 0:
+    used_n_blocks, used_block_len, target_mask_frac = resolve_mask_geometry(
+        L,
+        constraint_mode=constraint_mode,
+        n_blocks=n_blocks,
+        block_len=block_len,
+        mask_frac=mask_frac,
+        consistency_tolerance=consistency_tolerance,
+    )
+
+    if used_n_blocks <= 0 or used_block_len <= 0:
         mask = torch.zeros((B, L), dtype=torch.bool, device=dev)
-        return x, mask, 0
+        return x, mask, 0, 0, 0.0, 0.0
 
     mask = random_multi_contiguous_block_mask(
         B,
         L,
         block_len=used_block_len,
-        n_blocks=int(n_blocks),
+        n_blocks=used_n_blocks,
         seed=seed,
         device=dev,
         allow_overlap=bool(allow_overlap),
@@ -304,4 +371,6 @@ def make_mask_and_apply(
         seed=seed,
     )
 
-    return x_in, mask, used_block_len
+    realized_mask_frac = float(mask.float().mean().item())
+
+    return x_in, mask, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac

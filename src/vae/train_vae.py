@@ -101,15 +101,13 @@ def compute_class_weights(X: np.ndarray) -> torch.Tensor:
 @torch.no_grad()
 def _model_predict_classes(
     lit: LitVAE,
-    x: torch.Tensor,
+    x_values: torch.Tensor,
+    mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Run LitVAE's underlying model and return:
-      - pred_classes: (B, L) integer predicted genotype classes
-      - probs:        (B, 3, L) probabilities
-    """
     lit.eval()
-    out = lit.model(x)
+
+    model_in = lit._make_model_input(x_values, mask)
+    out = lit.model(model_in)
 
     if isinstance(out, torch.Tensor):
         logits = out
@@ -166,20 +164,23 @@ def dump_recon_artifacts(
     split_offset = {"train": 11_111, "val": 22_222, "target": 33_333}.get(split_name, 0)
     dump_seed = int(seed) + int(split_offset)
 
-    x_masked_t, mask_t, _ = make_mask_and_apply(
+    x_masked_t, mask_t, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac = make_mask_and_apply(
         x_true_t,
         enabled=mask_cfg.get("enabled", False),
-        n_blocks=mask_cfg.get("n_blocks", 1),
-        block_len=mask_cfg.get("block_len"),
-        mask_frac=mask_cfg.get("mask_frac"),
+        constraint_mode=mask_cfg.get("constraint_mode", "frac_and_blocks"),
+        n_blocks=mask_cfg.get("n_blocks", None),
+        block_len=mask_cfg.get("block_len", None),
+        mask_frac=mask_cfg.get("mask_frac", None),
         allow_overlap=mask_cfg.get("allow_overlap", True),
         seed=dump_seed,
         fill=mask_cfg.get("fill", "zero"),
         gaussian_std=mask_cfg.get("gaussian_std", 0.1),
         constant_value=mask_cfg.get("constant_value", 0.0),
+        mask_token_value=mask_cfg.get("mask_token_value", -1.0),
+        consistency_tolerance=mask_cfg.get("consistency_tolerance", 1),
     )
 
-    pred_t, probs_t = _model_predict_classes(lit, x_masked_t)
+    pred_t, probs_t = _model_predict_classes(lit, x_masked_t, mask_t)
 
     x_masked = x_masked_t.detach().cpu().numpy().astype(np.float32)
     mask = mask_t.detach().cpu().numpy().astype(np.bool_)
@@ -348,13 +349,16 @@ def main() -> None:
         masking=SimpleNamespace(
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
-            n_blocks=int(mask_hp.get("n_blocks", 1)),
+            constraint_mode=str(mask_hp.get("constraint_mode", "frac_and_blocks")),
+            n_blocks=mask_hp.get("n_blocks", None),
             allow_overlap=bool(mask_hp.get("allow_overlap", True)),
             mask_frac=mask_hp.get("mask_frac", None),
             block_len=mask_hp.get("block_len", None),
             fill=str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
             gaussian_std=float(mask_hp.get("gaussian_std", 0.1)),
             constant_value=float(mask_hp.get("constant_value", 0.0)),
+            mask_token_value=float(mask_hp.get("mask_token_value", -1.0)),
+            consistency_tolerance=int(mask_hp.get("consistency_tolerance", 1)),
             use_mask_channel=bool(mask_hp.get("use_mask_channel", False)),
         ),
     )
@@ -415,6 +419,7 @@ def main() -> None:
         "masking": {
             "enabled": cfg.masking.enabled,
             "alpha_masked": cfg.masking.alpha_masked,
+            "constraint_mode": cfg.masking.constraint_mode,
             "n_blocks": cfg.masking.n_blocks,
             "allow_overlap": cfg.masking.allow_overlap,
             "mask_frac": cfg.masking.mask_frac,
@@ -422,6 +427,8 @@ def main() -> None:
             "fill": cfg.masking.fill,
             "gaussian_std": cfg.masking.gaussian_std,
             "constant_value": cfg.masking.constant_value,
+            "mask_token_value": cfg.masking.mask_token_value,
+            "consistency_tolerance": cfg.masking.consistency_tolerance,
             "use_mask_channel": cfg.masking.use_mask_channel,
         },
     }
@@ -454,13 +461,16 @@ def main() -> None:
 
     mask_cfg_dict = {
         "enabled": bool(mask_hp.get("enabled", False)),
-        "n_blocks": int(mask_hp.get("n_blocks", 1)),
+        "constraint_mode": str(mask_hp.get("constraint_mode", "frac_and_blocks")),
+        "n_blocks": mask_hp.get("n_blocks", None),
         "block_len": mask_hp.get("block_len"),
         "mask_frac": mask_hp.get("mask_frac"),
         "allow_overlap": bool(mask_hp.get("allow_overlap", True)),
         "fill": str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
         "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
         "constant_value": float(mask_hp.get("constant_value", 0.0)),
+        "mask_token_value": float(mask_hp.get("mask_token_value", -1.0)),
+        "consistency_tolerance": int(mask_hp.get("consistency_tolerance", 1)),
         "use_mask_channel": bool(mask_hp.get("use_mask_channel", False)),
     }
 

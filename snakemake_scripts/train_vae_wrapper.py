@@ -108,6 +108,10 @@ def dump_recon_artifacts(
         - x_masked
         - mask
         - recon
+        - used_n_blocks
+        - used_block_len
+        - target_mask_frac
+        - realized_mask_frac
     """
     if X.shape[0] == 0:
         return
@@ -120,20 +124,25 @@ def dump_recon_artifacts(
 
     x_true = torch.from_numpy(X_sub).float().to(device)
 
-    x_in, mask, _ = make_mask_and_apply(
+    x_in, mask, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac = make_mask_and_apply(
         x_true,
         enabled=bool(mask_cfg["enabled"]),
-        n_blocks=int(mask_cfg["n_blocks"]),
-        block_len=mask_cfg["block_len"],
-        mask_frac=mask_cfg["mask_frac"],
-        allow_overlap=bool(mask_cfg["allow_overlap"]),
+        constraint_mode=str(mask_cfg.get("constraint_mode", "frac_and_blocks")),
+        n_blocks=mask_cfg.get("n_blocks", None),
+        block_len=mask_cfg.get("block_len", None),
+        mask_frac=mask_cfg.get("mask_frac", None),
+        allow_overlap=bool(mask_cfg.get("allow_overlap", True)),
         seed=int(seed),
-        fill=str(mask_cfg["fill"]),
-        gaussian_std=float(mask_cfg["gaussian_std"]),
-        constant_value=float(mask_cfg["constant_value"]),
+        fill=str(mask_cfg.get("fill", "gaussian")),
+        gaussian_std=float(mask_cfg.get("gaussian_std", 0.1)),
+        constant_value=float(mask_cfg.get("constant_value", 0.0)),
+        mask_token_value=float(mask_cfg.get("mask_token_value", -1.0)),
+        consistency_tolerance=int(mask_cfg.get("consistency_tolerance", 1)),
     )
 
-    out = lit(x_in)
+    model_in = lit._make_model_input(x_in, mask)
+    out = lit(model_in)
+
     if isinstance(out, torch.Tensor):
         recon = out
     elif isinstance(out, (tuple, list)):
@@ -158,9 +167,12 @@ def dump_recon_artifacts(
         x_masked=x_in.detach().cpu().numpy(),
         mask=mask.detach().cpu().numpy(),
         recon=recon.detach().cpu().numpy(),
+        used_n_blocks=np.array(used_n_blocks, dtype=np.int64),
+        used_block_len=np.array(used_block_len, dtype=np.int64),
+        target_mask_frac=np.array(target_mask_frac, dtype=np.float32),
+        realized_mask_frac=np.array(realized_mask_frac, dtype=np.float32),
     )
     print(f"Saved reconstruction artifacts to {out_path}")
-
 
 # =========================================================
 # CLI
@@ -301,6 +313,22 @@ def main() -> None:
     if padding_val is not None:
         padding_val = int(padding_val)
 
+    constraint_mode = str(mask_hp.get("constraint_mode", "frac_and_blocks"))
+
+    n_blocks = _none_if_null(mask_hp.get("n_blocks", None))
+    if n_blocks is not None:
+        n_blocks = int(n_blocks)
+
+    mask_frac = _none_if_null(mask_hp.get("mask_frac", None))
+    if mask_frac is not None:
+        mask_frac = float(mask_frac)
+
+    block_len = _none_if_null(mask_hp.get("block_len", None))
+    if block_len is not None:
+        block_len = int(block_len)
+    if block_len == 0:
+        block_len = None
+
     # -------------------------
     # Build cfg for LitVAE
     # -------------------------
@@ -320,13 +348,17 @@ def main() -> None:
         masking=SimpleNamespace(
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
-            n_blocks=int(mask_hp.get("n_blocks", 1)),
+            constraint_mode=str(mask_hp.get("constraint_mode", "frac_and_blocks")),
+            n_blocks=_none_if_null(mask_hp.get("n_blocks", None)),
             allow_overlap=bool(mask_hp.get("allow_overlap", True)),
             mask_frac=mask_frac,
             block_len=block_len,
             fill=str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
             gaussian_std=float(mask_hp.get("gaussian_std", 0.1)),
             constant_value=float(mask_hp.get("constant_value", 0.0)),
+            mask_token_value=float(mask_hp.get("mask_token_value", -1.0)),
+            consistency_tolerance=int(mask_hp.get("consistency_tolerance", 1)),
+            use_mask_channel=bool(mask_hp.get("use_mask_channel", False)),
         ),
     )
 
@@ -353,12 +385,32 @@ def main() -> None:
 
     # Validate mask propagation immediately
     mcfg = lit._mask_cfg()
-    if mcfg["enabled"] and (mcfg["mask_frac"] is None and mcfg["block_len"] is None):
-        raise RuntimeError(
-            "Masking enabled but both mask_frac and block_len are None. "
-            "Your YAML masking section is not being propagated correctly."
-        )
+    if mcfg["enabled"]:
+        mode = str(mcfg.get("constraint_mode", "frac_and_blocks"))
 
+        if mode == "frac_and_blocks":
+            if mcfg["mask_frac"] is None or mcfg["n_blocks"] is None:
+                raise RuntimeError(
+                    "Masking enabled with constraint_mode='frac_and_blocks' "
+                    "but mask_frac or n_blocks is missing."
+                )
+
+        elif mode == "frac_and_len":
+            if mcfg["mask_frac"] is None or mcfg["block_len"] is None:
+                raise RuntimeError(
+                    "Masking enabled with constraint_mode='frac_and_len' "
+                    "but mask_frac or block_len is missing."
+                )
+
+        elif mode == "blocks_and_len":
+            if mcfg["n_blocks"] is None or mcfg["block_len"] is None:
+                raise RuntimeError(
+                    "Masking enabled with constraint_mode='blocks_and_len' "
+                    "but n_blocks or block_len is missing."
+                )
+
+        else:
+            raise RuntimeError(f"Unknown constraint_mode: {mode}")
     # -------------------------
     # Write resolved config
     # -------------------------
@@ -402,6 +454,7 @@ def main() -> None:
         "masking": {
             "enabled": cfg.masking.enabled,
             "alpha_masked": cfg.masking.alpha_masked,
+            "constraint_mode": cfg.masking.constraint_mode,
             "n_blocks": cfg.masking.n_blocks,
             "allow_overlap": cfg.masking.allow_overlap,
             "mask_frac": cfg.masking.mask_frac,
@@ -409,6 +462,9 @@ def main() -> None:
             "fill": cfg.masking.fill,
             "gaussian_std": cfg.masking.gaussian_std,
             "constant_value": cfg.masking.constant_value,
+            "mask_token_value": cfg.masking.mask_token_value,
+            "consistency_tolerance": cfg.masking.consistency_tolerance,
+            "use_mask_channel": cfg.masking.use_mask_channel,
         },
         "_lit_mask_cfg": mcfg,
     }

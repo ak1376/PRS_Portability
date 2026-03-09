@@ -213,19 +213,23 @@ class LitVAE(pl.LightningModule):
             return {
                 "enabled": bool(getattr(m, "enabled", False)),
                 "alpha_masked": float(getattr(m, "alpha_masked", 1.0)),
-                "n_blocks": int(getattr(m, "n_blocks", 1)),
+                "constraint_mode": str(getattr(m, "constraint_mode", "frac_and_blocks")),
+                "n_blocks": getattr(m, "n_blocks", None),
                 "block_len": getattr(m, "block_len", None),
                 "mask_frac": getattr(m, "mask_frac", None),
                 "allow_overlap": bool(getattr(m, "allow_overlap", True)),
                 "fill": str(getattr(m, "fill", getattr(m, "fill_value", "zero"))),
                 "gaussian_std": float(getattr(m, "gaussian_std", 0.1)),
                 "constant_value": float(getattr(m, "constant_value", 0.0)),
+                "mask_token_value": float(getattr(m, "mask_token_value", -1.0)),
+                "consistency_tolerance": int(getattr(m, "consistency_tolerance", 1)),
                 "use_mask_channel": bool(getattr(m, "use_mask_channel", False)),
             }
 
         return {
             "enabled": bool(getattr(self.cfg, "mask_enabled", False)),
             "alpha_masked": float(getattr(self.cfg, "alpha_masked", 1.0)),
+            "constraint_mode": "blocks_and_len",
             "n_blocks": 1,
             "block_len": int(getattr(self.cfg, "mask_block_len", 0)) or None,
             "mask_frac": None,
@@ -233,6 +237,8 @@ class LitVAE(pl.LightningModule):
             "fill": str(getattr(self.cfg, "mask_fill_value", "zero")),
             "gaussian_std": float(getattr(self.cfg, "mask_gaussian_std", 0.1)),
             "constant_value": 0.0,
+            "mask_token_value": -1.0,
+            "consistency_tolerance": 1,
             "use_mask_channel": bool(getattr(self.cfg, "use_mask_channel", False)),
         }
 
@@ -303,10 +309,11 @@ class LitVAE(pl.LightningModule):
         seed = self._make_step_seed(stage, batch_idx)
 
         if mcfg["enabled"] and (mcfg["block_len"] is not None or mcfg["mask_frac"] is not None):
-            x_in, mask, used_block_len = make_mask_and_apply(
+            x_in, mask, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac = make_mask_and_apply(
                 x,
                 enabled=True,
-                n_blocks=int(mcfg["n_blocks"]),
+                constraint_mode=str(mcfg["constraint_mode"]),
+                n_blocks=mcfg["n_blocks"],
                 block_len=mcfg["block_len"],
                 mask_frac=mcfg["mask_frac"],
                 allow_overlap=bool(mcfg["allow_overlap"]),
@@ -314,11 +321,16 @@ class LitVAE(pl.LightningModule):
                 fill=str(mcfg["fill"]),
                 gaussian_std=float(mcfg["gaussian_std"]),
                 constant_value=float(mcfg["constant_value"]),
+                mask_token_value=float(mcfg["mask_token_value"]),
+                consistency_tolerance=int(mcfg["consistency_tolerance"]),
             )
         else:
             x_in = x
             mask = torch.zeros((B, L), dtype=torch.bool, device=self.device)
+            used_n_blocks = 0
             used_block_len = 0
+            target_mask_frac = 0.0
+            realized_mask_frac = 0.0
 
         self._assert_finite("x_in", x_in)
 
@@ -366,7 +378,11 @@ class LitVAE(pl.LightningModule):
         loss = recon_objective + beta * kl
         self._assert_finite("loss", loss)
 
-        mask_frac = mask.float().mean()
+        mask_frac_tensor = torch.tensor(float(realized_mask_frac), device=self.device)
+        target_mask_frac_tensor = torch.tensor(float(target_mask_frac), device=self.device)
+        used_n_blocks_tensor = torch.tensor(float(used_n_blocks), device=self.device)
+        used_block_len_tensor = torch.tensor(float(used_block_len), device=self.device)
+
         delta_in_l1 = (x_in - x).abs().mean()
 
         ratio_masked_over_clean = (
@@ -389,9 +405,11 @@ class LitVAE(pl.LightningModule):
             "acc_clean_all": acc_clean_all,
             "kl_clean": kl_clean,
             "ratio_masked_over_clean": ratio_masked_over_clean,
-            "mask_frac": mask_frac,
+            "mask_frac": mask_frac_tensor,
+            "target_mask_frac": target_mask_frac_tensor,
             "delta_in_l1": delta_in_l1,
-            "used_block_len": torch.tensor(float(used_block_len), device=self.device),
+            "used_n_blocks": used_n_blocks_tensor,
+            "used_block_len": used_block_len_tensor,
             "x_max": x.max(),
             "x_in_max": x_in.max(),
         }
@@ -426,7 +444,7 @@ class LitVAE(pl.LightningModule):
                 add_dataloader_idx=False,
             )
 
-        for k in ["mask_frac", "delta_in_l1", "used_block_len", "x_max", "x_in_max"]:
+        for k in ["mask_frac", "target_mask_frac", "delta_in_l1", "used_n_blocks", "used_block_len", "x_max", "x_in_max"]:
             self.log(
                 f"debug/{k}",
                 out[k],
@@ -439,7 +457,7 @@ class LitVAE(pl.LightningModule):
         self._buf_append(
             self._train_buf,
             out,
-            keys=step_keys + ["mask_frac", "delta_in_l1"],
+            keys=step_keys + ["mask_frac", "target_mask_frac", "delta_in_l1", "used_n_blocks", "used_block_len"],
         )
 
         return out["loss"]
@@ -458,7 +476,7 @@ class LitVAE(pl.LightningModule):
             "ce_corrupt_all", "ce_masked", "ce_unmasked", "ce_clean_all",
             "acc_corrupt_all", "acc_masked", "acc_unmasked", "acc_clean_all",
             "ratio_masked_over_clean",
-            "mask_frac", "delta_in_l1",
+            "mask_frac", "target_mask_frac", "delta_in_l1", "used_n_blocks", "used_block_len",
         ]
         buf = self._val_buf if prefix == "val" else self._target_buf
         self._buf_append(buf, out, keys=keys)

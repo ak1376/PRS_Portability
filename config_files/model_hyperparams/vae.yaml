@@ -9,7 +9,7 @@ model:
 
 training:
   batch_size: 64
-  max_epochs: 100
+  max_epochs: 10
   lr: 5e-4
   beta: 1e-5
   weight_decay: 0.0
@@ -25,18 +25,19 @@ masking:
   use_mask_channel: true
   alpha_masked: 0.8
   mode: "contiguous"
-  n_blocks: 2
+  constraint_mode: "frac_and_len" # frac_and_blocks, frac_and_len, block_and_len
+  n_blocks: null
   allow_overlap: false
-  mask_frac: null
-  block_len: 10
-  fill: "zero"
+  mask_frac: 0.05
+  block_len: 5
+  fill: "constant"
   gaussian_std: 0.0
-  constant_value: 0.0
+  constant_value: -1.0
 
 seed: 0
 
 grid:
-  enabled: true
+  enabled: false
   name:
     prefix: "vae"
     sep: "__"
