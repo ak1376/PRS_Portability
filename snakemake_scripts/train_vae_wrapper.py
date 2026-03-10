@@ -266,6 +266,34 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--recon-n", type=int, default=64, help="Number of samples to include in recon artifacts")
     ap.add_argument("--recon-splits", type=str, default="val", help="Comma-separated list: train,val,target")
 
+    ap.add_argument(
+        "--compute-clean-metrics-train",
+        dest="compute_clean_metrics_train",
+        action="store_true",
+        help="Enable clean-pass metrics during training",
+    )
+    ap.add_argument(
+        "--no-compute-clean-metrics-train",
+        dest="compute_clean_metrics_train",
+        action="store_false",
+        help="Disable clean-pass metrics during training",
+    )
+    ap.set_defaults(compute_clean_metrics_train=None)
+
+    ap.add_argument(
+        "--compute-clean-metrics-val",
+        dest="compute_clean_metrics_val",
+        action="store_true",
+        help="Enable clean-pass metrics during validation",
+    )
+    ap.add_argument(
+        "--no-compute-clean-metrics-val",
+        dest="compute_clean_metrics_val",
+        action="store_false",
+        help="Disable clean-pass metrics during validation",
+    )
+    ap.set_defaults(compute_clean_metrics_val=None)
+
     return ap.parse_args()
 
 
@@ -308,6 +336,18 @@ def main() -> None:
     # -------------------------
     # Resolve training knobs
     # -------------------------
+
+    compute_clean_metrics_train = (
+        args.compute_clean_metrics_train
+        if args.compute_clean_metrics_train is not None
+        else bool(train_hp.get("compute_clean_metrics_train", False))
+    )
+
+    compute_clean_metrics_val = (
+        args.compute_clean_metrics_val
+        if args.compute_clean_metrics_val is not None
+        else bool(train_hp.get("compute_clean_metrics_val", True))
+    )
     batch_size = int(args.batch_size if args.batch_size is not None else train_hp.get("batch_size", 256))
     max_epochs = int(args.max_epochs if args.max_epochs is not None else train_hp.get("max_epochs", 50))
     log_every_n_steps = int(
@@ -402,6 +442,13 @@ def main() -> None:
         beta=float(train_hp.get("beta", 0.01)),
         weight_decay=float(train_hp.get("weight_decay", 0.0)),
         seed=seed,
+        training=SimpleNamespace(
+            lr=float(train_hp.get("lr", 1e-3)),
+            beta=float(train_hp.get("beta", 0.01)),
+            weight_decay=float(train_hp.get("weight_decay", 0.0)),
+            compute_clean_metrics_train=compute_clean_metrics_train,
+            compute_clean_metrics_val=compute_clean_metrics_val,
+        ),
         masking=SimpleNamespace(
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
@@ -556,6 +603,8 @@ def main() -> None:
             "overfit_one_batch": overfit_one_batch,
             "overfit_n": overfit_n,
             "no_target_val": bool(args.no_target_val),
+            "compute_clean_metrics_train": cfg.training.compute_clean_metrics_train,
+            "compute_clean_metrics_val": cfg.training.compute_clean_metrics_val,
         },
         "masking": {
             "enabled": cfg.masking.enabled,

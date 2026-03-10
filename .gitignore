@@ -9,3 +9,4 @@ config_files/generated_vae
 debug_output/
 ld_usage_results/
 test_ld_usage_masked_imputation.py
+logs/

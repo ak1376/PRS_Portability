@@ -202,6 +202,7 @@ rule simulate:
     shell:
         r"""
         set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
 
         python -u "{SIM_SCRIPT}" \
           --simulation-dir "{SIM_BASEDIR}/{wildcards.sid}/rep{wildcards.rep}" \
@@ -350,6 +351,9 @@ rule train_vae:
         grid_yaml=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/hparams.grid.yaml",
         recon_dir=directory(f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/recon"),
         done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/.train_done",
+    threads: 4
+    resources:
+        gpu=1
     params:
         outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
         accelerator="gpu",

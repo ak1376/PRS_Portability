@@ -19,6 +19,8 @@ training:
   num_workers: 0
   overfit_one_batch: false
   overfit_n: 64
+  compute_clean_metrics_train: false
+  compute_clean_metrics_val: true
 
 masking:
   enabled: true
@@ -42,9 +44,12 @@ grid:
     prefix: "vae"
     sep: "__"
   dims:
-    - path: "model.latent_dim"
-      values: [8, 16]
-      tag: "latdim"
+    - path: "masking.mask_frac"
+      values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+      tag: "maskfrac"
+    # - path: "model.latent_dim"
+    #   values: [8, 16]
+    #   tag: "latdim"
 
 
   

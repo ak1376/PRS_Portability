@@ -130,6 +130,21 @@ class LitVAE(pl.LightningModule):
             return bool(getattr(m, "use_mask_channel", False))
         return bool(getattr(self.cfg, "use_mask_channel", False))
 
+    def _compute_clean_metrics_train(self) -> bool:
+        t = self._training_cfg()
+        return bool(getattr(t, "compute_clean_metrics_train", False))
+
+    def _compute_clean_metrics_val(self) -> bool:
+        t = self._training_cfg()
+        return bool(getattr(t, "compute_clean_metrics_val", True))
+
+    def _should_compute_clean_metrics(self, stage: str) -> bool:
+        if stage == "train":
+            return self._compute_clean_metrics_train()
+        if stage in {"val", "target"}:
+            return self._compute_clean_metrics_val()
+        return False
+
     def _make_model_input(
         self,
         x_values: torch.Tensor,
@@ -293,16 +308,23 @@ class LitVAE(pl.LightningModule):
         eps = 1e-12
         class_weights = self._get_class_weights()
 
-        # (1) clean pass
-        clean_mask = torch.zeros((B, L), dtype=torch.bool, device=self.device)
-        x_clean_in = self._make_model_input(x, clean_mask)
+        # (1) optional clean pass
+        do_clean = self._should_compute_clean_metrics(stage)
 
-        logits_clean, mu_clean, logvar_clean = self._forward(x_clean_in)
-        self._assert_finite("logits_clean", logits_clean)
+        if do_clean:
+            clean_mask = torch.zeros((B, L), dtype=torch.bool, device=self.device)
+            x_clean_in = self._make_model_input(x, clean_mask)
 
-        ce_clean_all = self._ce_all(logits_clean, target, class_weights=class_weights)
-        acc_clean_all = (logits_clean.argmax(dim=1) == target).float().mean()
-        kl_clean = self._kl_standard_normal(mu_clean, logvar_clean)
+            logits_clean, mu_clean, logvar_clean = self._forward(x_clean_in)
+            self._assert_finite("logits_clean", logits_clean)
+
+            ce_clean_all = self._ce_all(logits_clean, target, class_weights=class_weights)
+            acc_clean_all = (logits_clean.argmax(dim=1) == target).float().mean()
+            kl_clean = self._kl_standard_normal(mu_clean, logvar_clean)
+        else:
+            ce_clean_all = torch.tensor(float("nan"), device=self.device)
+            acc_clean_all = torch.tensor(float("nan"), device=self.device)
+            kl_clean = torch.tensor(float("nan"), device=self.device)
 
         # (2) masked/corrupted pass
         mcfg = self._mask_cfg()
@@ -385,11 +407,10 @@ class LitVAE(pl.LightningModule):
 
         delta_in_l1 = (x_in - x).abs().mean()
 
-        ratio_masked_over_clean = (
-            ce_mask / (ce_clean_all + eps)
-            if mask.any()
-            else torch.tensor(0.0, device=self.device)
-        )
+        if mask.any() and do_clean:
+            ratio_masked_over_clean = ce_mask / (ce_clean_all + eps)
+        else:
+            ratio_masked_over_clean = torch.tensor(float("nan"), device=self.device)
 
         return {
             "loss": loss,
@@ -429,10 +450,13 @@ class LitVAE(pl.LightningModule):
 
         step_keys = [
             "loss", "kl", "recon_objective",
-            "ce_corrupt_all", "ce_masked", "ce_unmasked", "ce_clean_all",
-            "acc_corrupt_all", "acc_masked", "acc_unmasked", "acc_clean_all",
-            "ratio_masked_over_clean",
+            "ce_corrupt_all", "ce_masked", "ce_unmasked",
+            "acc_corrupt_all", "acc_masked", "acc_unmasked",
         ]
+
+        if self._should_compute_clean_metrics("train"):
+            step_keys += ["ce_clean_all", "acc_clean_all", "kl_clean", "ratio_masked_over_clean"]
+
         for k in step_keys:
             self.log(
                 f"train_step/{k}",
@@ -473,11 +497,14 @@ class LitVAE(pl.LightningModule):
 
         keys = [
             "loss", "kl", "recon_objective",
-            "ce_corrupt_all", "ce_masked", "ce_unmasked", "ce_clean_all",
-            "acc_corrupt_all", "acc_masked", "acc_unmasked", "acc_clean_all",
-            "ratio_masked_over_clean",
+            "ce_corrupt_all", "ce_masked", "ce_unmasked",
+            "acc_corrupt_all", "acc_masked", "acc_unmasked",
             "mask_frac", "target_mask_frac", "delta_in_l1", "used_n_blocks", "used_block_len",
         ]
+
+        if self._should_compute_clean_metrics(stage):
+            keys += ["ce_clean_all", "acc_clean_all", "kl_clean", "ratio_masked_over_clean"]
+            
         buf = self._val_buf if prefix == "val" else self._target_buf
         self._buf_append(buf, out, keys=keys)
 
