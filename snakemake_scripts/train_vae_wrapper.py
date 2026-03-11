@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# /sietch_colab/akapoor/PRS_Portability/src/vae/train_vae_wrapper.py
 from __future__ import annotations
 
 import argparse
@@ -13,7 +12,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -23,6 +22,65 @@ import yaml
 
 from src.masking import make_mask_and_apply
 from src.vae.lit_model import LitVAE
+
+
+class EpochMaskedDataset(Dataset):
+    def __init__(self, x_true: np.ndarray, masked_dir: Path, split: str = "train"):
+        self.x_true = torch.from_numpy(x_true).float()
+        self.masked_dir = Path(masked_dir)
+        self.split = split
+        self.current_epoch = 0
+        self.x_masked: Optional[torch.Tensor] = None
+        self.mask: Optional[torch.Tensor] = None
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int):
+        self.current_epoch = int(epoch)
+
+        if self.split == "train":
+            x_masked_path = self.masked_dir / f"train_masked_epoch{epoch}.npy"
+            mask_path = self.masked_dir / f"train_mask_epoch{epoch}.npy"
+        elif self.split == "val":
+            x_masked_path = self.masked_dir / "val_masked.npy"
+            mask_path = self.masked_dir / "val_mask.npy"
+        elif self.split == "target":
+            x_masked_path = self.masked_dir / "target_masked.npy"
+            mask_path = self.masked_dir / "target_mask.npy"
+        else:
+            raise ValueError(f"Unknown split: {self.split}")
+
+        if not x_masked_path.exists():
+            raise FileNotFoundError(f"Missing masked input file: {x_masked_path}")
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Missing mask file: {mask_path}")
+
+        self.x_masked = torch.from_numpy(np.load(x_masked_path)).float()
+        self.mask = torch.from_numpy(np.load(mask_path)).bool()
+
+        if self.x_masked.shape != self.x_true.shape:
+            raise ValueError(
+                f"x_masked shape {tuple(self.x_masked.shape)} != x_true shape {tuple(self.x_true.shape)}"
+            )
+        if self.mask.shape != self.x_true.shape:
+            raise ValueError(
+                f"mask shape {tuple(self.mask.shape)} != x_true shape {tuple(self.x_true.shape)}"
+            )
+
+    def __len__(self):
+        return self.x_true.shape[0]
+
+    def __getitem__(self, idx):
+        assert self.x_masked is not None
+        assert self.mask is not None
+        return self.x_true[idx], self.x_masked[idx], self.mask[idx]
+
+
+class ReloadTrainMaskCallback(pl.Callback):
+    def on_train_epoch_start(self, trainer, pl_module):
+        loader = trainer.train_dataloader
+        ds = getattr(loader, "dataset", None)
+        if ds is not None and hasattr(ds, "set_epoch"):
+            ds.set_epoch(trainer.current_epoch)
 
 
 # =========================================================
@@ -61,12 +119,6 @@ def _none_if_null(x: Any) -> Any:
 
 
 def _atomic_savez_compressed(out_path: Path, **arrays: Any) -> None:
-    """
-    Write .npz atomically:
-      1) write to temp file in same directory
-      2) verify readable
-      3) atomically replace destination
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, tmp_name = tempfile.mkstemp(
@@ -80,7 +132,6 @@ def _atomic_savez_compressed(out_path: Path, **arrays: Any) -> None:
     try:
         np.savez_compressed(tmp_path, **arrays)
 
-        # Verify archive integrity before promoting it
         with np.load(tmp_path) as chk:
             for k in chk.files:
                 _ = chk[k]
@@ -132,26 +183,6 @@ def dump_recon_artifacts(
     mask_cfg: Dict[str, Any],
     seed: int,
 ) -> None:
-    """
-    Save reconstruction artifacts for up to `n` samples.
-
-    Output:
-      outdir/recon/{split}_recon.npz
-
-    Keys saved:
-      - x_true               : (N, L) true genotype classes
-      - x_masked             : (N, L) masked/corrupted input values
-      - mask                 : (N, L) boolean mask, True = masked
-      - recon                : (N, 3, L) raw logits (kept for backward compatibility)
-      - pred                 : (N, L) argmax predicted genotype class
-      - prob_0               : (N, L) P(genotype = 0)
-      - prob_1               : (N, L) P(genotype = 1)
-      - prob_2               : (N, L) P(genotype = 2)
-      - used_n_blocks        : scalar
-      - used_block_len       : scalar
-      - target_mask_frac     : scalar
-      - realized_mask_frac   : scalar
-    """
     if X.shape[0] == 0:
         return
 
@@ -210,17 +241,11 @@ def dump_recon_artifacts(
         x_true=x_true.detach().cpu().numpy().astype(np.int64),
         x_masked=x_in.detach().cpu().numpy().astype(np.float32),
         mask=mask.detach().cpu().numpy().astype(np.bool_),
-
-        # backward-compatible
         recon=logits.detach().cpu().numpy().astype(np.float32),
-
-        # preferred newer format
         pred=pred.detach().cpu().numpy().astype(np.int64),
         prob_0=probs[:, 0, :].detach().cpu().numpy().astype(np.float32),
         prob_1=probs[:, 1, :].detach().cpu().numpy().astype(np.float32),
         prob_2=probs[:, 2, :].detach().cpu().numpy().astype(np.float32),
-
-        # masking metadata
         used_n_blocks=np.array(used_n_blocks, dtype=np.int64),
         used_block_len=np.array(used_block_len, dtype=np.int64),
         target_mask_frac=np.array(target_mask_frac, dtype=np.float32),
@@ -243,6 +268,12 @@ def parse_args() -> argparse.Namespace:
                     help="Do not include target dataset as a validation dataloader")
     ap.add_argument("--hparams", type=Path, required=True, help="YAML with model/training/masking/seed sections")
     ap.add_argument("--outdir", type=Path, required=True)
+    ap.add_argument(
+        "--masked-dir",
+        type=Path,
+        default=None,
+        help="Directory containing precomputed masked inputs and masks",
+    )
 
     # Optional overrides
     ap.add_argument("--no-progress-bar", action="store_true")
@@ -255,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log-every-n-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=None)
 
-    # Overfit debugging (CLI override of YAML)
+    # Overfit debugging
     ap.add_argument("--overfit-one-batch", action="store_true",
                     help="Train on one repeated batch only")
     ap.add_argument("--overfit-n", type=int, default=None,
@@ -336,7 +367,6 @@ def main() -> None:
     # -------------------------
     # Resolve training knobs
     # -------------------------
-
     compute_clean_metrics_train = (
         args.compute_clean_metrics_train
         if args.compute_clean_metrics_train is not None
@@ -348,6 +378,7 @@ def main() -> None:
         if args.compute_clean_metrics_val is not None
         else bool(train_hp.get("compute_clean_metrics_val", True))
     )
+
     batch_size = int(args.batch_size if args.batch_size is not None else train_hp.get("batch_size", 256))
     max_epochs = int(args.max_epochs if args.max_epochs is not None else train_hp.get("max_epochs", 50))
     log_every_n_steps = int(
@@ -364,13 +395,11 @@ def main() -> None:
     if gradient_clip_val is not None:
         gradient_clip_val = float(gradient_clip_val)
 
-    # YAML defaults
     yaml_overfit_one_batch = bool(train_hp.get("overfit_one_batch", False))
     yaml_overfit_n = train_hp.get("overfit_n", None)
     if yaml_overfit_n is not None:
         yaml_overfit_n = int(yaml_overfit_n)
 
-    # CLI overrides YAML if provided
     overfit_one_batch = bool(args.overfit_one_batch or yaml_overfit_one_batch)
     overfit_n = int(args.overfit_n) if args.overfit_n is not None else yaml_overfit_n
 
@@ -410,17 +439,13 @@ def main() -> None:
     if padding_val is not None:
         padding_val = int(padding_val)
 
-    constraint_mode = str(mask_hp.get("constraint_mode", "frac_and_blocks"))
-
     n_blocks = _none_if_null(mask_hp.get("n_blocks", None))
     if n_blocks is not None:
         n_blocks = int(n_blocks)
 
-    mask_frac = _none_if_null(mask_hp.get("mask_frac", None))
     if mask_frac is not None:
         mask_frac = float(mask_frac)
 
-    block_len = _none_if_null(mask_hp.get("block_len", None))
     if block_len is not None:
         block_len = int(block_len)
     if block_len == 0:
@@ -453,7 +478,7 @@ def main() -> None:
             enabled=bool(mask_hp.get("enabled", False)),
             alpha_masked=float(mask_hp.get("alpha_masked", 1.0)),
             constraint_mode=str(mask_hp.get("constraint_mode", "frac_and_blocks")),
-            n_blocks=_none_if_null(mask_hp.get("n_blocks", None)),
+            n_blocks=n_blocks,
             allow_overlap=bool(mask_hp.get("allow_overlap", True)),
             mask_frac=mask_frac,
             block_len=block_len,
@@ -469,25 +494,63 @@ def main() -> None:
     # -------------------------
     # Dataloaders
     # -------------------------
-    train_loader = make_loader(
-        X_train,
-        batch_size,
-        shuffle=(not overfit_one_batch),
-        num_workers=num_workers,
-    )
-    val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
+    if args.masked_dir is not None:
+        train_ds = EpochMaskedDataset(X_train, args.masked_dir, split="train")
+        val_ds = EpochMaskedDataset(X_val, args.masked_dir, split="val")
 
-    val_dataloaders = [val_loader]
-    if X_target is not None and not args.no_target_val:
-        target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
-        val_dataloaders.append(target_loader)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=(not overfit_one_batch),
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=(num_workers > 0),
+        )
+
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=(num_workers > 0),
+        )
+
+        val_dataloaders = [val_loader]
+
+        if X_target is not None and not args.no_target_val:
+            target_ds = EpochMaskedDataset(X_target, args.masked_dir, split="target")
+            target_loader = DataLoader(
+                target_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=(num_workers > 0),
+            )
+            val_dataloaders.append(target_loader)
+    else:
+        train_loader = make_loader(
+            X_train,
+            batch_size,
+            shuffle=(not overfit_one_batch),
+            num_workers=num_workers,
+        )
+        val_loader = make_loader(X_val, batch_size, shuffle=False, num_workers=num_workers)
+
+        val_dataloaders = [val_loader]
+        if X_target is not None and not args.no_target_val:
+            target_loader = make_loader(X_target, batch_size, shuffle=False, num_workers=num_workers)
+            val_dataloaders.append(target_loader)
 
     # -------------------------
     # Module
     # -------------------------
     lit = LitVAE(cfg)
 
-    # Validate mask propagation immediately
     mcfg = lit._mask_cfg()
     if mcfg["enabled"]:
         mode = str(mcfg.get("constraint_mode", "frac_and_blocks"))
@@ -535,6 +598,10 @@ def main() -> None:
     csv_logger = CSVLogger(save_dir=str(outdir), name="logs")
     logger = [tb_logger, csv_logger]
 
+    callbacks = [ckpt_cb, lr_cb]
+    if args.masked_dir is not None:
+        callbacks.append(ReloadTrainMaskCallback())
+
     # -------------------------
     # Trainer
     # -------------------------
@@ -545,7 +612,7 @@ def main() -> None:
         strategy=strategy,
         precision=precision,
         gradient_clip_val=gradient_clip_val,
-        callbacks=[ckpt_cb, lr_cb],
+        callbacks=callbacks,
         logger=logger,
         log_every_n_steps=log_every_n_steps,
         default_root_dir=str(outdir),
@@ -555,7 +622,6 @@ def main() -> None:
 
     trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_dataloaders)
 
-    # Make sure all ranks finish training before rank 0 touches shared outputs
     trainer.strategy.barrier("post_fit_barrier")
 
     if not trainer.is_global_zero:
@@ -565,7 +631,7 @@ def main() -> None:
     print(f"[rank0] writing shared outputs under {outdir}")
 
     # -------------------------
-    # Write resolved config (rank 0 only)
+    # Write resolved config
     # -------------------------
     resolved = {
         "seed": seed,
@@ -573,6 +639,7 @@ def main() -> None:
             "train": str(args.train),
             "val": str(args.val),
             "target": (str(args.target) if args.target is not None else None),
+            "masked_dir": (str(args.masked_dir) if args.masked_dir is not None else None),
             "input_len": input_len,
             "n_train": int(X_train.shape[0]),
             "n_val": int(X_val.shape[0]),
@@ -652,8 +719,6 @@ def main() -> None:
 
     # -------------------------
     # Optional reconstruction artifacts
-    # IMPORTANT: dump from BEST checkpoint, not last in-memory model
-    # rank 0 only
     # -------------------------
     if args.save_recon:
         best_lit = LitVAE(cfg)

@@ -33,6 +33,10 @@ class LitVAE(pl.LightningModule):
     If use_mask_channel=True, model input is (B, 2, L):
       - channel 0: genotype/corrupted values
       - channel 1: binary mask indicator
+
+    Batch formats supported:
+      - (x_true,)
+      - (x_true, x_masked, mask)
     """
 
     def __init__(self, cfg: Any):
@@ -82,15 +86,20 @@ class LitVAE(pl.LightningModule):
         self._val_buf: Dict[str, List[torch.Tensor]] = {}
         self._target_buf: Dict[str, List[torch.Tensor]] = {}
 
-        # Optional class weights for genotype classes {0,1,2}.
         self.class_weights: Optional[torch.Tensor] = None
 
     # -------------------------
     # helpers
     # -------------------------
-    def _unpack_batch(self, batch: Any) -> torch.Tensor:
-        x = batch[0] if isinstance(batch, (tuple, list)) else batch
-        return x.float()
+    def _unpack_batch(self, batch: Any):
+        if isinstance(batch, (tuple, list)):
+            if len(batch) == 1:
+                return batch[0].float(), None, None
+            elif len(batch) == 3:
+                return batch[0].float(), batch[1].float(), batch[2].bool()
+            else:
+                raise ValueError(f"Unexpected batch length: {len(batch)}")
+        return batch.float(), None, None
 
     def _to_2d(self, x: torch.Tensor) -> torch.Tensor:
         return x.squeeze(1) if x.dim() == 3 and x.shape[1] == 1 else x
@@ -106,10 +115,6 @@ class LitVAE(pl.LightningModule):
             raise RuntimeError(f"Targets must be in {{0,1,2}}. Found invalid values: {vals[:10]}")
 
     def set_class_weights(self, class_weights: torch.Tensor | None) -> None:
-        """
-        Store global class weights for genotype classes {0,1,2}.
-        Expected shape: (3,)
-        """
         if class_weights is None:
             self.class_weights = None
             return
@@ -150,19 +155,6 @@ class LitVAE(pl.LightningModule):
         x_values: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Build actual model input.
-
-        Args:
-            x_values: (B, L) float
-            mask:     (B, L) bool or float, True = masked
-
-        Returns:
-            if use_mask_channel=False: (B, L)
-            if use_mask_channel=True:  (B, 2, L)
-                channel 0 = genotype/corrupted values
-                channel 1 = mask indicator in {0,1}
-        """
         if not self._use_mask_channel():
             return x_values
 
@@ -178,27 +170,18 @@ class LitVAE(pl.LightningModule):
         target: torch.Tensor,
         class_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        logits: (B, 3, L)
-        target: (B, L)
-        """
         if class_weights is not None:
             class_weights = class_weights.to(device=logits.device, dtype=logits.dtype)
         return F.cross_entropy(logits, target, weight=class_weights, reduction="mean")
 
     @staticmethod
     def _masked_accuracy(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B, 3, L)
-        target: (B, L)
-        mask:   (B, L) bool
-        """
         if mask.dtype != torch.bool:
             mask = mask.bool()
         if not mask.any():
             return torch.tensor(0.0, device=logits.device)
 
-        pred = logits.argmax(dim=1)  # (B, L)
+        pred = logits.argmax(dim=1)
         return (pred[mask] == target[mask]).float().mean()
 
     def _kl_standard_normal(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -296,7 +279,8 @@ class LitVAE(pl.LightningModule):
     # core step
     # -------------------------
     def _shared_step(self, batch: Any, batch_idx: int, stage: str) -> Dict[str, torch.Tensor]:
-        x = self._unpack_batch(batch).to(self.device)   # raw 0/1/2 genotypes as float
+        x, x_masked_precomp, mask_precomp = self._unpack_batch(batch)
+        x = x.to(self.device)
         x = self._to_2d(x)
         self._assert_finite("x", x)
 
@@ -330,7 +314,26 @@ class LitVAE(pl.LightningModule):
         mcfg = self._mask_cfg()
         seed = self._make_step_seed(stage, batch_idx)
 
-        if mcfg["enabled"] and (mcfg["block_len"] is not None or mcfg["mask_frac"] is not None):
+        if x_masked_precomp is not None and mask_precomp is not None:
+            x_in = x_masked_precomp.to(self.device)
+            x_in = self._to_2d(x_in)
+
+            mask = mask_precomp.to(self.device)
+            mask = self._to_2d(mask).bool()
+
+            self._assert_finite("x_masked_precomp", x_in)
+
+            if x_in.shape != x.shape:
+                raise RuntimeError(f"Precomputed x_in shape {tuple(x_in.shape)} != x shape {tuple(x.shape)}")
+            if mask.shape != x.shape:
+                raise RuntimeError(f"Precomputed mask shape {tuple(mask.shape)} != x shape {tuple(x.shape)}")
+
+            used_n_blocks = 0
+            used_block_len = 0
+            realized_mask_frac = float(mask.float().mean().item())
+            target_mask_frac = realized_mask_frac
+
+        elif mcfg["enabled"] and (mcfg["block_len"] is not None or mcfg["mask_frac"] is not None):
             x_in, mask, used_n_blocks, used_block_len, target_mask_frac, realized_mask_frac = make_mask_and_apply(
                 x,
                 enabled=True,
@@ -504,7 +507,7 @@ class LitVAE(pl.LightningModule):
 
         if self._should_compute_clean_metrics(stage):
             keys += ["ce_clean_all", "acc_clean_all", "kl_clean", "ratio_masked_over_clean"]
-            
+
         buf = self._val_buf if prefix == "val" else self._target_buf
         self._buf_append(buf, out, keys=keys)
 

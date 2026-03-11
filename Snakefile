@@ -92,6 +92,38 @@ else:
     exp_yaml_path(exp).write_text(yaml.safe_dump(cfg, sort_keys=False))
     EXP_NAMES = [exp]
 
+def get_vae_hparams(exp: str) -> dict:
+    p = exp_yaml_path(exp)
+    return yaml.safe_load(p.read_text()) or {}
+
+
+def get_max_epochs(exp: str) -> int:
+    hp = get_vae_hparams(exp)
+    train_hp = hp.get("training", {}) or {}
+    return int(train_hp.get("max_epochs", 50))
+
+
+def train_masked_epoch_outputs(wc):
+    n = get_max_epochs(wc.exp)
+    return expand(
+        f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_masked_epoch{{epoch}}.npy",
+        exp=wc.exp,
+        sid=wc.sid,
+        rep=wc.rep,
+        epoch=range(n),
+    )
+
+
+def train_mask_epoch_outputs(wc):
+    n = get_max_epochs(wc.exp)
+    return expand(
+        f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_mask_epoch{{epoch}}.npy",
+        exp=wc.exp,
+        sid=wc.sid,
+        rep=wc.rep,
+        epoch=range(n),
+    )
+
 ##############################################################################
 # Scripts + experiment config
 ##############################################################################
@@ -100,6 +132,7 @@ BUILD_INPUTS = "snakemake_scripts/build_genotypes_for_vae.py"
 GWAS_SCRIPT = "snakemake_scripts/run_gwas.py"
 TRAIN_VAE_SCRIPT = "snakemake_scripts/train_vae_wrapper.py"
 PLOT_WRAPPER = "snakemake_scripts/plot_vae_diagnostics.py"
+PRECOMPUTE_MASKS = "snakemake_scripts/precompute_vae_masks.py"
 
 EXP_CFG = "config_files/experiment_config_IM_symmetric.json"
 CFG = json.loads(Path(EXP_CFG).read_text())
@@ -334,6 +367,120 @@ rule gwas:
         """
 
 ##############################################################################
+# RULE precompute_vae_eval_masks: fixed val/target masks
+##############################################################################
+rule precompute_vae_eval_masks:
+    input:
+        val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
+        target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
+        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+    output:
+        val_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_masked.npy",
+        val_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_mask.npy",
+        target_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_masked.npy",
+        target_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_mask.npy",
+    params:
+        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+        mkdir -p "{params.outdir}"
+
+        python -u "{PRECOMPUTE_MASKS}" \
+          --val "{input.val}" \
+          --target "{input.target}" \
+          --hparams "{input.hparams}" \
+          --outdir "{params.outdir}" \
+          --eval-only
+
+        test -f "{output.val_masked}"
+        test -f "{output.val_mask}"
+        test -f "{output.target_masked}"
+        test -f "{output.target_mask}"
+        """
+        
+##############################################################################
+# RULE precompute_vae_train_mask_epoch: one train mask pair per epoch
+##############################################################################
+rule precompute_vae_train_mask_epoch:
+    input:
+        train=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
+        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+    output:
+        masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_masked_epoch{{epoch}}.npy",
+        mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_mask_epoch{{epoch}}.npy",
+    params:
+        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+        mkdir -p "{params.outdir}"
+
+        python -u "{PRECOMPUTE_MASKS}" \
+          --train "{input.train}" \
+          --hparams "{input.hparams}" \
+          --outdir "{params.outdir}" \
+          --train-epoch "{wildcards.epoch}"
+
+        test -f "{output.masked}"
+        test -f "{output.mask}"
+        """
+
+##############################################################################
+# RULE precompute_vae_mask_metadata
+##############################################################################
+rule precompute_vae_mask_metadata:
+    input:
+        train=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
+        val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
+        target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
+        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+    output:
+        metadata=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/mask_metadata.yaml",
+    params:
+        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
+        mkdir -p "{params.outdir}"
+
+        python -u "{PRECOMPUTE_MASKS}" \
+          --train "{input.train}" \
+          --val "{input.val}" \
+          --target "{input.target}" \
+          --hparams "{input.hparams}" \
+          --outdir "{params.outdir}" \
+          --write-metadata-only
+
+        test -f "{output.metadata}"
+        """
+
+##############################################################################
+# RULE precompute_vae_masks: collector rule
+##############################################################################
+rule precompute_vae_masks:
+    input:
+        val_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_masked.npy",
+        val_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_mask.npy",
+        target_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_masked.npy",
+        target_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_mask.npy",
+        metadata=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/mask_metadata.yaml",
+        train_masked=train_masked_epoch_outputs,
+        train_masks=train_mask_epoch_outputs,
+    output:
+        done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/.done",
+    shell:
+        r"""
+        set -euo pipefail
+        echo ok > "{output.done}"
+        """
+##############################################################################
 # RULE train_vae
 ##############################################################################
 rule train_vae:
@@ -342,6 +489,7 @@ rule train_vae:
         val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
         hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+        masked_done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/.done",
     output:
         best_ckpt=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
         summary=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/train_summary.json",
@@ -356,6 +504,7 @@ rule train_vae:
         gpu=1
     params:
         outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
+        masked_dir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
         accelerator="gpu",
         devices="1",
         precision="32-true",
@@ -384,6 +533,7 @@ rule train_vae:
           --val "{input.val}" \
           --target "{input.target}" \
           --hparams "{input.hparams}" \
+          --masked-dir "{params.masked_dir}" \
           --outdir "{params.outdir}" \
           --accelerator "{params.accelerator}" \
           --devices "{params.devices}" \
@@ -399,6 +549,9 @@ rule train_vae:
         test -f "{output.resolved}"
         test -f "{output.grid_yaml}"
         test -d "{output.logs_dir}"
+        test -f "{params.masked_dir}/train_masked_epoch0.npy"
+        test -f "{params.masked_dir}/train_mask_epoch0.npy"
+        test -f "{params.masked_dir}/mask_metadata.yaml"
 
         if [ "{params.save_recon}" = "True" ]; then
             test -d "{output.recon_dir}"
@@ -407,6 +560,7 @@ rule train_vae:
 
         touch "{output.done}"
         """
+        
 ##############################################################################
 # RULE vae_diagnostics
 ##############################################################################

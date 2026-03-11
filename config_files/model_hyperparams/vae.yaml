@@ -19,7 +19,7 @@ training:
   num_workers: 0
   overfit_one_batch: false
   overfit_n: 64
-  compute_clean_metrics_train: false
+  compute_clean_metrics_train: true
   compute_clean_metrics_val: true
 
 masking:

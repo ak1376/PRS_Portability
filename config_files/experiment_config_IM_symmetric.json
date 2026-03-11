@@ -4,8 +4,8 @@
   "recombination_rate": 1.2e-8,
   "demographic_model": "IM_symmetric",
   "num_samples": {
-    "YRI": 5000,
-    "CEU": 5000
+    "YRI": 500,
+    "CEU": 500
   },
   "discovery": "CEU",
   "seed": 295,
