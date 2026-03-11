@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 from pathlib import Path
@@ -92,38 +93,6 @@ else:
     exp_yaml_path(exp).write_text(yaml.safe_dump(cfg, sort_keys=False))
     EXP_NAMES = [exp]
 
-def get_vae_hparams(exp: str) -> dict:
-    p = exp_yaml_path(exp)
-    return yaml.safe_load(p.read_text()) or {}
-
-
-def get_max_epochs(exp: str) -> int:
-    hp = get_vae_hparams(exp)
-    train_hp = hp.get("training", {}) or {}
-    return int(train_hp.get("max_epochs", 50))
-
-
-def train_masked_epoch_outputs(wc):
-    n = get_max_epochs(wc.exp)
-    return expand(
-        f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_masked_epoch{{epoch}}.npy",
-        exp=wc.exp,
-        sid=wc.sid,
-        rep=wc.rep,
-        epoch=range(n),
-    )
-
-
-def train_mask_epoch_outputs(wc):
-    n = get_max_epochs(wc.exp)
-    return expand(
-        f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_mask_epoch{{epoch}}.npy",
-        exp=wc.exp,
-        sid=wc.sid,
-        rep=wc.rep,
-        epoch=range(n),
-    )
-
 ##############################################################################
 # Scripts + experiment config
 ##############################################################################
@@ -154,11 +123,13 @@ SIM_BASEDIR = f"experiments/{MODEL}/simulations"
 GENO_BASEDIR = f"experiments/{MODEL}/processed_data"
 GWAS_BASEDIR = f"experiments/{MODEL}/gwas"
 VAE_BASEDIR = f"experiments/{MODEL}/vae"
+MASK_BASEDIR = f"experiments/{MODEL}/masked_inputs_shared"
 
 Path(SIM_BASEDIR).mkdir(parents=True, exist_ok=True)
 Path(GENO_BASEDIR).mkdir(parents=True, exist_ok=True)
 Path(GWAS_BASEDIR).mkdir(parents=True, exist_ok=True)
 Path(VAE_BASEDIR).mkdir(parents=True, exist_ok=True)
+Path(MASK_BASEDIR).mkdir(parents=True, exist_ok=True)
 
 Path(f"{SIM_BASEDIR}/config.json").write_text(json.dumps(CFG, indent=2))
 
@@ -177,6 +148,124 @@ SUBSET_SNPS = int(VAE_DATA.get("subset_snps", 10000))
 ##############################################################################
 GWAS_CFG = CFG.get("gwas", {}) or {}
 DISCOVERY_POP = GWAS_CFG.get("discovery_pop", "CEU")
+
+##############################################################################
+# Helpers for VAE/mask configs
+##############################################################################
+def get_vae_hparams(exp: str) -> dict:
+    p = exp_yaml_path(exp)
+    return yaml.safe_load(p.read_text()) or {}
+
+
+def _none_if_null(x):
+    if x is None:
+        return None
+    if isinstance(x, str) and x.strip().lower() in {"none", "null", ""}:
+        return None
+    return x
+
+
+def _resolved_mask_bundle_for_exp(exp: str) -> dict:
+    """
+    Match the normalization logic used by precompute_vae_masks.py so that
+    experiments which produce identical masks share the same mask key.
+    """
+    hp = get_vae_hparams(exp)
+    train_hp = hp.get("training", {}) or {}
+    mask_hp = hp.get("masking", {}) or {}
+
+    seed = int(hp.get("seed", 0))
+    max_epochs = int(train_hp.get("max_epochs", 50))
+
+    mask_frac = _none_if_null(mask_hp.get("mask_frac", None))
+    if mask_frac is not None:
+        mask_frac = float(mask_frac)
+
+    block_len = _none_if_null(mask_hp.get("block_len", None))
+    if block_len is not None:
+        block_len = int(block_len)
+    if block_len == 0:
+        block_len = None
+
+    n_blocks = _none_if_null(mask_hp.get("n_blocks", None))
+    if n_blocks is not None:
+        n_blocks = int(n_blocks)
+
+    mask_cfg = {
+        "enabled": bool(mask_hp.get("enabled", False)),
+        "alpha_masked": float(mask_hp.get("alpha_masked", 1.0)),
+        "constraint_mode": str(mask_hp.get("constraint_mode", "frac_and_blocks")),
+        "n_blocks": n_blocks,
+        "allow_overlap": bool(mask_hp.get("allow_overlap", True)),
+        "mask_frac": mask_frac,
+        "block_len": block_len,
+        "fill": str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
+        "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
+        "constant_value": float(mask_hp.get("constant_value", 0.0)),
+        "mask_token_value": float(mask_hp.get("mask_token_value", -1.0)),
+        "consistency_tolerance": int(mask_hp.get("consistency_tolerance", 1)),
+        "use_mask_channel": bool(mask_hp.get("use_mask_channel", False)),
+    }
+
+    return {
+        "seed": seed,
+        "max_epochs": max_epochs,
+        "mask_cfg": mask_cfg,
+    }
+
+
+def get_max_epochs(exp: str) -> int:
+    return int(_resolved_mask_bundle_for_exp(exp)["max_epochs"])
+
+
+def get_mask_key(exp: str) -> str:
+    bundle = _resolved_mask_bundle_for_exp(exp)
+    s = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(s.encode()).hexdigest()[:12]
+
+
+EXP_TO_MASKKEY = {exp: get_mask_key(exp) for exp in EXP_NAMES}
+
+MASKKEY_TO_EXPS: dict[str, list[str]] = {}
+for exp, maskkey in EXP_TO_MASKKEY.items():
+    MASKKEY_TO_EXPS.setdefault(maskkey, []).append(exp)
+
+MASKKEY_TO_CANONICAL_EXP = {maskkey: exps[0] for maskkey, exps in MASKKEY_TO_EXPS.items()}
+MASKKEY_TO_MAX_EPOCHS = {
+    maskkey: get_max_epochs(MASKKEY_TO_CANONICAL_EXP[maskkey])
+    for maskkey in MASKKEY_TO_EXPS
+}
+MASK_KEYS = list(MASKKEY_TO_EXPS.keys())
+
+
+def shared_mask_dir_from_maskkey(maskkey: str, sid, rep) -> str:
+    return f"{MASK_BASEDIR}/{maskkey}/{sid}/rep{rep}"
+
+
+def shared_mask_dir_from_exp(exp: str, sid, rep) -> str:
+    return shared_mask_dir_from_maskkey(EXP_TO_MASKKEY[exp], sid, rep)
+
+
+def shared_train_masked_epoch_outputs(wc):
+    n = MASKKEY_TO_MAX_EPOCHS[wc.maskkey]
+    return expand(
+        f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/train_masked_epoch{{epoch}}.npy",
+        maskkey=wc.maskkey,
+        sid=wc.sid,
+        rep=wc.rep,
+        epoch=range(n),
+    )
+
+
+def shared_train_mask_epoch_outputs(wc):
+    n = MASKKEY_TO_MAX_EPOCHS[wc.maskkey]
+    return expand(
+        f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/train_mask_epoch{{epoch}}.npy",
+        maskkey=wc.maskkey,
+        sid=wc.sid,
+        rep=wc.rep,
+        epoch=range(n),
+    )
 
 ##############################################################################
 # RULE all
@@ -367,20 +456,20 @@ rule gwas:
         """
 
 ##############################################################################
-# RULE precompute_vae_eval_masks: fixed val/target masks
+# RULE precompute_shared_vae_eval_masks: fixed val/target masks
 ##############################################################################
-rule precompute_vae_eval_masks:
+rule precompute_shared_vae_eval_masks:
     input:
         val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
-        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+        hparams=lambda wc: str(exp_yaml_path(MASKKEY_TO_CANONICAL_EXP[wc.maskkey])),
     output:
-        val_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_masked.npy",
-        val_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_mask.npy",
-        target_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_masked.npy",
-        target_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_mask.npy",
+        val_masked=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/val_masked.npy",
+        val_mask=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/val_mask.npy",
+        target_masked=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/target_masked.npy",
+        target_mask=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/target_mask.npy",
     params:
-        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+        outdir=lambda wc: shared_mask_dir_from_maskkey(wc.maskkey, wc.sid, wc.rep),
     threads: 1
     shell:
         r"""
@@ -400,19 +489,19 @@ rule precompute_vae_eval_masks:
         test -f "{output.target_masked}"
         test -f "{output.target_mask}"
         """
-        
+
 ##############################################################################
-# RULE precompute_vae_train_mask_epoch: one train mask pair per epoch
+# RULE precompute_shared_vae_train_mask_epoch: one train mask pair per epoch
 ##############################################################################
-rule precompute_vae_train_mask_epoch:
+rule precompute_shared_vae_train_mask_epoch:
     input:
         train=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
-        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+        hparams=lambda wc: str(exp_yaml_path(MASKKEY_TO_CANONICAL_EXP[wc.maskkey])),
     output:
-        masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_masked_epoch{{epoch}}.npy",
-        mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/train_mask_epoch{{epoch}}.npy",
+        masked=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/train_masked_epoch{{epoch}}.npy",
+        mask=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/train_mask_epoch{{epoch}}.npy",
     params:
-        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+        outdir=lambda wc: shared_mask_dir_from_maskkey(wc.maskkey, wc.sid, wc.rep),
     threads: 1
     shell:
         r"""
@@ -431,18 +520,18 @@ rule precompute_vae_train_mask_epoch:
         """
 
 ##############################################################################
-# RULE precompute_vae_mask_metadata
+# RULE precompute_shared_vae_mask_metadata
 ##############################################################################
-rule precompute_vae_mask_metadata:
+rule precompute_shared_vae_mask_metadata:
     input:
         train=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_train.npy",
         val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
-        hparams=lambda wc: str(exp_yaml_path(wc.exp)),
+        hparams=lambda wc: str(exp_yaml_path(MASKKEY_TO_CANONICAL_EXP[wc.maskkey])),
     output:
-        metadata=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/mask_metadata.yaml",
+        metadata=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/mask_metadata.yaml",
     params:
-        outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+        outdir=lambda wc: shared_mask_dir_from_maskkey(wc.maskkey, wc.sid, wc.rep),
     threads: 1
     shell:
         r"""
@@ -462,24 +551,25 @@ rule precompute_vae_mask_metadata:
         """
 
 ##############################################################################
-# RULE precompute_vae_masks: collector rule
+# RULE precompute_shared_vae_masks: collector rule for shared masks
 ##############################################################################
-rule precompute_vae_masks:
+rule precompute_shared_vae_masks:
     input:
-        val_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_masked.npy",
-        val_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/val_mask.npy",
-        target_masked=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_masked.npy",
-        target_mask=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/target_mask.npy",
-        metadata=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/mask_metadata.yaml",
-        train_masked=train_masked_epoch_outputs,
-        train_masks=train_mask_epoch_outputs,
+        val_masked=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/val_masked.npy",
+        val_mask=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/val_mask.npy",
+        target_masked=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/target_masked.npy",
+        target_mask=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/target_mask.npy",
+        metadata=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/mask_metadata.yaml",
+        train_masked=shared_train_masked_epoch_outputs,
+        train_masks=shared_train_mask_epoch_outputs,
     output:
-        done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/.done",
+        done=f"{MASK_BASEDIR}/{{maskkey}}/{{sid}}/rep{{rep}}/.done",
     shell:
         r"""
         set -euo pipefail
         echo ok > "{output.done}"
         """
+        
 ##############################################################################
 # RULE train_vae
 ##############################################################################
@@ -489,7 +579,7 @@ rule train_vae:
         val=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/discovery_val.npy",
         target=f"{GENO_BASEDIR}/{{sid}}/rep{{rep}}/target.npy",
         hparams=lambda wc: str(exp_yaml_path(wc.exp)),
-        masked_done=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/masked_inputs/.done",
+        masked_done=lambda wc: f"{MASK_BASEDIR}/{EXP_TO_MASKKEY[wc.exp]}/{wc.sid}/rep{wc.rep}/.done",
     output:
         best_ckpt=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/checkpoints/best.ckpt",
         summary=f"{VAE_BASEDIR}/{{exp}}/{{sid}}/rep{{rep}}/train_summary.json",
@@ -504,7 +594,7 @@ rule train_vae:
         gpu=1
     params:
         outdir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}",
-        masked_dir=lambda wc: f"{VAE_BASEDIR}/{wc.exp}/{wc.sid}/rep{wc.rep}/masked_inputs",
+        masked_dir=lambda wc: f"{MASK_BASEDIR}/{EXP_TO_MASKKEY[wc.exp]}/{wc.sid}/rep{wc.rep}",
         accelerator="gpu",
         devices="1",
         precision="32-true",
@@ -560,7 +650,7 @@ rule train_vae:
 
         touch "{output.done}"
         """
-        
+
 ##############################################################################
 # RULE vae_diagnostics
 ##############################################################################
