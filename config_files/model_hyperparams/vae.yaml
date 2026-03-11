@@ -30,7 +30,7 @@ masking:
   constraint_mode: "frac_and_len" # frac_and_blocks, frac_and_len, block_and_len
   n_blocks: null
   allow_overlap: false
-  mask_frac: 0.05
+  mask_frac: 0.8
   block_len: 5
   fill: "constant"
   gaussian_std: 0.0
@@ -44,12 +44,15 @@ grid:
     prefix: "vae_maskfrac"
     sep: "__"
   dims:
-    - path: "masking.mask_frac"
-      values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-      tag: "maskfrac"
+    # - path: "masking.mask_frac"
+    #   values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    #   tag: "maskfrac"
     # - path: "model.latent_dim"
-    #   values: [8, 16]
+    #   values: [8, 16, 32, 64, 128, 256]
     #   tag: "latdim"
+    - path : "masking.block_len"
+      values: [5, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
+      tag: "blocklen"
 
 
   
