@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=vae_grid
-#SBATCH --output=logs/vae_grid_%A_%a.out
-#SBATCH --error=logs/vae_grid_%A_%a.err
-#SBATCH --time=2:00:00
+#SBATCH --job-name=vae_diag
+#SBATCH --output=logs/vae_diag_%A_%a.out
+#SBATCH --error=logs/vae_diag_%A_%a.err
+#SBATCH --time=4:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
-#SBATCH --partition=kerngpu,gpu,gpulong
+#SBATCH --partition=kern
 #SBATCH --account=kernlab
-#SBATCH --gres=gpu:1
 #SBATCH --requeue
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=akapoor@uoregon.edu
@@ -18,7 +17,7 @@ ROOT="/projects/kernlab/akapoor/PRS_Portability"
 SNAKEFILE="$ROOT/Snakefile"
 CFG="${CFG_PATH:-$ROOT/config_files/experiment_config_IM_symmetric.json}"
 VAE_YAML="${VAE_YAML_PATH:-$ROOT/config_files/model_hyperparams/vae.yaml}"
-MAX_CONCURRENT="${MAX_CONCURRENT:-4}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
 
 mkdir -p "$ROOT/logs"
 cd "$ROOT"
@@ -32,7 +31,6 @@ echo "VAE_YAML=$VAE_YAML"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unset}"
 echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset}"
 echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset}"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "EXP_NAME=${EXP_NAME:-unset}"
 
 MODEL=$(python - <<'PY' "$CFG"
@@ -115,11 +113,11 @@ echo "NUM_EXPS=$NUM_EXPS"
 echo "EXP_NAMES=${EXP_NAMES[*]}"
 
 # -------------------------------------------------------------------
-# Submit mode: no EXP_NAME and no array task yet -> submit one array/job per experiment
+# Submit mode: no EXP_NAME and no array task yet -> submit one array per experiment
 # -------------------------------------------------------------------
 if [[ -z "${EXP_NAME:-}" && -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   for exp in "${EXP_NAMES[@]}"; do
-    echo "Submitting experiment '$exp' as array 0-${LAST_TASK}%${MAX_CONCURRENT}"
+    echo "Submitting diagnostics for experiment '$exp' as array 0-${LAST_TASK}%${MAX_CONCURRENT}"
     sbatch \
       --export=ALL,EXP_NAME="$exp",CFG_PATH="$CFG",VAE_YAML_PATH="$VAE_YAML",MAX_CONCURRENT="$MAX_CONCURRENT" \
       --array=0-"$LAST_TASK"%${MAX_CONCURRENT} \
@@ -152,7 +150,7 @@ fi
 SID=$(( IDX / NUM_REPS ))
 REP=$(( IDX % NUM_REPS ))
 
-TARGET="experiments/${MODEL}/vae/${EXP_NAME}/${SID}/rep${REP}/.train_done"
+TARGET="experiments/${MODEL}/vae/${EXP_NAME}/${SID}/rep${REP}/diagnostics/.done"
 
 echo "Resolved:"
 echo "  EXP_NAME=$EXP_NAME"
@@ -175,4 +173,4 @@ snakemake \
   --cores "${SLURM_CPUS_PER_TASK:-1}" \
   "$TARGET"
 
-echo "Finished EXP_NAME=$EXP_NAME array task IDX=$IDX SID=$SID REP=$REP"
+echo "Finished diagnostics EXP_NAME=$EXP_NAME IDX=$IDX SID=$SID REP=$REP"
