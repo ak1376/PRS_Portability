@@ -39,9 +39,9 @@ masking:
 seed: 0
 
 grid:
-  enabled: false
+  enabled: true
   name:
-    prefix: "vae"
+    prefix: "vae_maskfrac"
     sep: "__"
   dims:
     - path: "masking.mask_frac"

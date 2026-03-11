@@ -55,7 +55,6 @@ print(int(cfg.get("num_replicates", 1)))
 PY
 )
 
-# Build experiment names AND max_epochs for each experiment from the base VAE yaml.
 mapfile -t EXP_AND_EPOCHS < <(python - <<'PY' "$VAE_YAML"
 from pathlib import Path
 import itertools
@@ -131,9 +130,6 @@ echo "NUM_REPS=$NUM_REPS"
 echo "NUM_EXPS=$NUM_EXPS"
 printf 'EXP_AND_EPOCHS:\n%s\n' "${EXP_AND_EPOCHS[@]}"
 
-# -------------------------------------------------------------------
-# Submit mode: no EXP_NAME and no array task yet -> submit one array per experiment
-# -------------------------------------------------------------------
 if [[ -z "${EXP_NAME:-}" && -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   for line in "${EXP_AND_EPOCHS[@]}"; do
     exp=$(printf '%s\n' "$line" | cut -f1)
@@ -151,9 +147,6 @@ if [[ -z "${EXP_NAME:-}" && -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 0
 fi
 
-# -------------------------------------------------------------------
-# Safety checks
-# -------------------------------------------------------------------
 if [[ -z "${EXP_NAME:-}" ]]; then
   echo "ERROR: EXP_NAME is not set inside array task"
   exit 1
@@ -179,18 +172,85 @@ if [[ "$IDX" -lt 0 || "$IDX" -ge "$NUM_TASKS" ]]; then
   exit 1
 fi
 
-# Decode IDX -> (SID, REP, EPOCH)
 PER_SID=$(( NUM_REPS * MAX_EPOCHS ))
 SID=$(( IDX / PER_SID ))
 REM=$(( IDX % PER_SID ))
 REP=$(( REM / MAX_EPOCHS ))
 EPOCH=$(( REM % MAX_EPOCHS ))
 
-TARGET_MASKED="experiments/${MODEL}/vae/${EXP_NAME}/${SID}/rep${REP}/masked_inputs/train_masked_epoch${EPOCH}.npy"
-TARGET_MASK="experiments/${MODEL}/vae/${EXP_NAME}/${SID}/rep${REP}/masked_inputs/train_mask_epoch${EPOCH}.npy"
+MASKKEY=$(python - <<'PY' "$ROOT" "$EXP_NAME"
+import json
+import hashlib
+import sys
+from pathlib import Path
+import yaml
+
+root = Path(sys.argv[1])
+exp = sys.argv[2]
+
+gen_yaml = root / "config_files" / "generated_vae" / f"{exp}.yaml"
+hp = yaml.safe_load(gen_yaml.read_text()) or {}
+
+def _none_if_null(x):
+    if x is None:
+        return None
+    if isinstance(x, str) and x.strip().lower() in {"none", "null", ""}:
+        return None
+    return x
+
+train_hp = hp.get("training", {}) or {}
+mask_hp = hp.get("masking", {}) or {}
+
+seed = int(hp.get("seed", 0))
+max_epochs = int(train_hp.get("max_epochs", 50))
+
+mask_frac = _none_if_null(mask_hp.get("mask_frac", None))
+if mask_frac is not None:
+    mask_frac = float(mask_frac)
+
+block_len = _none_if_null(mask_hp.get("block_len", None))
+if block_len is not None:
+    block_len = int(block_len)
+if block_len == 0:
+    block_len = None
+
+n_blocks = _none_if_null(mask_hp.get("n_blocks", None))
+if n_blocks is not None:
+    n_blocks = int(n_blocks)
+
+mask_cfg = {
+    "enabled": bool(mask_hp.get("enabled", False)),
+    "alpha_masked": float(mask_hp.get("alpha_masked", 1.0)),
+    "constraint_mode": str(mask_hp.get("constraint_mode", "frac_and_blocks")),
+    "n_blocks": n_blocks,
+    "allow_overlap": bool(mask_hp.get("allow_overlap", True)),
+    "mask_frac": mask_frac,
+    "block_len": block_len,
+    "fill": str(mask_hp.get("fill", mask_hp.get("fill_value", "gaussian"))),
+    "gaussian_std": float(mask_hp.get("gaussian_std", 0.1)),
+    "constant_value": float(mask_hp.get("constant_value", 0.0)),
+    "mask_token_value": float(mask_hp.get("mask_token_value", -1.0)),
+    "consistency_tolerance": int(mask_hp.get("consistency_tolerance", 1)),
+    "use_mask_channel": bool(mask_hp.get("use_mask_channel", False)),
+}
+
+bundle = {
+    "seed": seed,
+    "max_epochs": max_epochs,
+    "mask_cfg": mask_cfg,
+}
+
+s = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+print(hashlib.sha1(s.encode()).hexdigest()[:12])
+PY
+)
+
+TARGET_MASKED="experiments/${MODEL}/masked_inputs_shared/${MASKKEY}/${SID}/rep${REP}/train_masked_epoch${EPOCH}.npy"
+TARGET_MASK="experiments/${MODEL}/masked_inputs_shared/${MASKKEY}/${SID}/rep${REP}/train_mask_epoch${EPOCH}.npy"
 
 echo "Resolved:"
 echo "  EXP_NAME=$EXP_NAME"
+echo "  MASKKEY=$MASKKEY"
 echo "  IDX=$IDX"
 echo "  SID=$SID"
 echo "  REP=$REP"

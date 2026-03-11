@@ -607,6 +607,9 @@ rule train_vae:
         set -euo pipefail
         export PYTHONPATH="{workflow.basedir}:${{PYTHONPATH:-}}"
         mkdir -p "{params.outdir}"
+        mkdir -p "{params.outdir}/logs"
+        mkdir -p "{params.outdir}/checkpoints"
+        mkdir -p "{params.outdir}/recon"
 
         RECON_ARGS=""
         if [ "{params.save_recon}" = "True" ]; then
